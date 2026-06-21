@@ -772,36 +772,44 @@ function ModelSettings({
   const active = models.find((model) => model.active);
   return (
     <section className="model-settings" aria-label="Generation models">
-      <div className="setting-row">
+      <div className="model-heading">
         <span>
           <strong>Answer model</strong>
           <small>{active ? `${active.displayName} · ${active.quantization || "GGUF"}` : "No generation model selected."}</small>
         </span>
         <button type="button" onClick={onUnload} disabled={busy || !active}>Unload</button>
       </div>
-      <label className="settings-field compact">
-        <span><strong>Local GGUF path</strong><small>Use ignored repo samples or any local GGUF file.</small></span>
-        <input value={draft.sourcePath} onChange={(event) => onDraft({ ...draft, sourcePath: event.target.value })} />
-      </label>
-      <label className="settings-field compact">
-        <span><strong>Display name</strong><small>Shown in diagnostics and benchmark reports.</small></span>
-        <input value={draft.displayName} onChange={(event) => onDraft({ ...draft, displayName: event.target.value })} />
-      </label>
-      <div className="modal-actions">
-        <span>Imports copy and hash the GGUF into app data.</span>
-        <button type="button" onClick={onImport} disabled={busy || !draft.sourcePath.trim()}><Archive /> Import local</button>
-      </div>
-      <label className="settings-field compact">
-        <span><strong>Hugging Face repo</strong><small>Explicit download only; no background network use.</small></span>
-        <input value={draft.repository} onChange={(event) => onDraft({ ...draft, repository: event.target.value })} />
-      </label>
-      <label className="settings-field compact">
-        <span><strong>HF filename</strong><small>Example: Qwen3.5-4B-Q4_K_M.gguf.</small></span>
-        <input value={draft.filename} onChange={(event) => onDraft({ ...draft, filename: event.target.value })} />
-      </label>
-      <div className="modal-actions">
-        <span>Downloaded models are stored below local app data.</span>
-        <button type="button" onClick={onDownload} disabled={busy || !draft.repository.trim() || !draft.filename.trim()}><Sparkle /> Download HF</button>
+      <div className="model-source-grid">
+        <div className="model-source">
+          <span className="model-source-heading">
+            <strong>Local GGUF</strong>
+            <small>Import ignored repo samples or any local GGUF file.</small>
+          </span>
+          <label>
+            <span>Path</span>
+            <input value={draft.sourcePath} onChange={(event) => onDraft({ ...draft, sourcePath: event.target.value })} />
+          </label>
+          <label>
+            <span>Display name</span>
+            <input value={draft.displayName} onChange={(event) => onDraft({ ...draft, displayName: event.target.value })} />
+          </label>
+          <button type="button" onClick={onImport} disabled={busy || !draft.sourcePath.trim()}><Archive /> Import local</button>
+        </div>
+        <div className="model-source">
+          <span className="model-source-heading">
+            <strong>Hugging Face</strong>
+            <small>Download one explicit file into local app data.</small>
+          </span>
+          <label>
+            <span>Repository</span>
+            <input value={draft.repository} onChange={(event) => onDraft({ ...draft, repository: event.target.value })} />
+          </label>
+          <label>
+            <span>Filename</span>
+            <input value={draft.filename} onChange={(event) => onDraft({ ...draft, filename: event.target.value })} />
+          </label>
+          <button type="button" onClick={onDownload} disabled={busy || !draft.repository.trim() || !draft.filename.trim()}><Sparkle /> Download HF</button>
+        </div>
       </div>
       {models.length > 0 && (
         <div className="model-list">
