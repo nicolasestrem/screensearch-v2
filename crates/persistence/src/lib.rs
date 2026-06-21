@@ -1453,10 +1453,12 @@ mod tests {
         CapturedFrame, ChunkId, IndexedChunk, NewCapture, OcrBlock, SearchEvent,
     };
     use screensearch_model_runtime::{FakeEmbeddingEngine, FakeOcrEngine, FakeTextGenerator};
-    use screensearch_ports::{ArchiveRepository, AssetStore, CaptureSource, EmbeddingEngine};
+    use screensearch_ports::{
+        ArchiveRepository, AssetStore, CaptureSource, EmbeddingEngine, PortError,
+    };
     use tempfile::TempDir;
 
-    use super::{FileAssetStore, LibSqlArchive, timestamp};
+    use super::{FileAssetStore, LibSqlArchive, MAX_JOB_ATTEMPTS, timestamp};
 
     struct TestCapture;
 
@@ -1741,5 +1743,173 @@ mod tests {
             events.last(),
             Some(Ok(SearchEvent::Completed { .. }))
         ));
+    }
+
+    /// Embedding provider that returns a vector whose length contradicts its advertised
+    /// dimension, used to exercise the analysis-pipeline failure path.
+    struct MissizedEmbeddingEngine;
+
+    #[async_trait::async_trait]
+    impl EmbeddingEngine for MissizedEmbeddingEngine {
+        fn model_id(&self) -> &'static str {
+            "missized-embedding-test"
+        }
+
+        fn dimensions(&self) -> usize {
+            384
+        }
+
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, PortError> {
+            Ok(vec![0.1; 8])
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_job_reschedules_with_backoff_and_defers_claim() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        repository.enqueue_capture(capture(1, 0, 1)).await.unwrap();
+
+        let job = repository.claim_job("retry-worker").await.unwrap().unwrap();
+        assert_eq!(job.attempt, 0);
+        repository
+            .fail_job(&job, "transient ocr failure")
+            .await
+            .unwrap();
+
+        let mut rows = repository
+            .connection()
+            .query(
+                "SELECT status, attempt FROM analysis_job WHERE id = ?",
+                params![job.id.to_string()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "pending");
+        assert_eq!(row.get::<i64>(1).unwrap(), 1);
+        drop(rows);
+
+        // The rescheduled job is deferred by next_run_at and is not immediately claimable.
+        assert!(
+            repository
+                .claim_job("retry-worker")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let metrics = repository.queue_metrics().await.unwrap();
+        assert_eq!(metrics.pending, 1);
+        assert_eq!(metrics.dead_letter_count, 0);
+    }
+
+    #[tokio::test]
+    async fn fail_job_dead_letters_after_max_attempts() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        repository.enqueue_capture(capture(1, 0, 1)).await.unwrap();
+        let mut job = repository.claim_job("retry-worker").await.unwrap().unwrap();
+
+        // Drive attempts deterministically: the first attempts reschedule, the final one
+        // reaches MAX_JOB_ATTEMPTS and dead-letters the job.
+        for attempt in 0..MAX_JOB_ATTEMPTS {
+            job.attempt = attempt;
+            repository
+                .fail_job(&job, "persistent analysis failure")
+                .await
+                .unwrap();
+        }
+
+        let mut rows = repository
+            .connection()
+            .query(
+                "SELECT status, attempt FROM analysis_job WHERE id = ?",
+                params![job.id.to_string()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "dead");
+        assert_eq!(row.get::<i64>(1).unwrap(), i64::from(MAX_JOB_ATTEMPTS));
+        drop(rows);
+
+        let metrics = repository.queue_metrics().await.unwrap();
+        assert_eq!(metrics.dead_letter_count, 1);
+        assert_eq!(metrics.pending, 0);
+        // A dead-lettered job is never handed back to a worker.
+        assert!(
+            repository
+                .claim_job("retry-worker")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_analysis_rejects_wrong_embedding_dimension() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        repository.enqueue_capture(capture(1, 0, 1)).await.unwrap();
+        let job = repository
+            .claim_job("dimension-worker")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = repository
+            .complete_analysis(AnalysisResult {
+                job_id: job.id,
+                capture_id: job.capture_id,
+                blocks: Vec::new(),
+                chunks: vec![IndexedChunk {
+                    id: ChunkId::new(),
+                    capture_id: job.capture_id,
+                    text: "mismatched embedding".to_owned(),
+                    source_reading_order: 0,
+                    model_id: "fastembed-all-minilm-l6-v2-q-384-v1".to_owned(),
+                    embedding: vec![0.1; 8],
+                }],
+                ocr_model_id: "dimension-ocr".to_owned(),
+            })
+            .await;
+
+        assert!(matches!(result, Err(PortError::InvalidData(_))));
+
+        // The transaction rolled back, so the job remains claimable work, not completed.
+        let mut rows = repository
+            .connection()
+            .query(
+                "SELECT status FROM analysis_job WHERE id = ?",
+                params![job.id.to_string()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "running");
+    }
+
+    #[tokio::test]
+    async fn process_one_fails_job_on_embedding_dimension_mismatch() {
+        use screensearch_application::AnalysisService;
+
+        let repository = Arc::new(LibSqlArchive::in_memory().await.unwrap());
+        repository.migrate().await.unwrap();
+        repository.enqueue_capture(capture(1, 0, 1)).await.unwrap();
+
+        let analysis = AnalysisService::new(
+            repository.clone(),
+            Arc::new(FakeOcrEngine),
+            Arc::new(MissizedEmbeddingEngine),
+            "dimension-worker",
+        );
+
+        let result = analysis.process_one().await;
+        assert!(matches!(result, Err(PortError::InvalidData(_))));
+
+        // The service routed the failure through fail_job: the job is rescheduled, not dead.
+        let metrics = repository.queue_metrics().await.unwrap();
+        assert_eq!(metrics.pending, 1);
+        assert_eq!(metrics.dead_letter_count, 0);
     }
 }
