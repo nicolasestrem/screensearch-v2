@@ -53,6 +53,11 @@ stops capture, and the shell never opens the archive database.
 - The poller and toggle are best-effort: if the daemon is unreachable they degrade to
   `Daemon offline` rather than panicking, and `try_state::<TrayHandles>()` avoids any
   teardown-race panic.
+- Toggling capture from the tray fires a **native notification** (`tauri-plugin-notification`,
+  "ScreenSearch paused/resumed") and refreshes the tray tooltip/status immediately rather than
+  waiting for the next poll, so feedback is visible even when the window is hidden. Windows toast
+  notifications require a registered application id, so they appear in packaged builds and may be
+  suppressed under `tauri dev` — the tray tooltip/menu remain the dev-mode at-a-glance signal.
 
 ### Hide-to-tray (`main.rs`, `on_window_event`)
 
@@ -87,6 +92,7 @@ re-shown by the tray (**Open** / left-click) or the global hotkey. The daemon is
 
 | Keys | Context | Action |
 |---|---|---|
+| `Enter` | search field | Run the search (the command bar also has a visible **Search** submit button) |
 | `Ctrl`/`Cmd`+`K` | anywhere in the window | Focus and select the search field |
 | `Arrow Up` / `Arrow Down` | evidence timeline (not while typing) | Move the selected result up/down; focus and scroll it into view; reset the detail tab to *Extracted text* |
 | `Home` / `End` | evidence timeline (not while typing) | Select the first / last result |

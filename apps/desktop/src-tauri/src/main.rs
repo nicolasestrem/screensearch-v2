@@ -21,6 +21,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use tauri_plugin_notification::NotificationExt;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,7 +92,13 @@ struct CaptureAsset {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+// `rename_all` on a tagged enum renames the variant tags ("citation", …); the per-variant
+// `rename_all_fields` renames the struct-variant fields so the UI receives camelCase keys.
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 #[allow(clippy::large_enum_variant)]
 enum SearchUiEvent {
     Citation {
@@ -451,49 +458,70 @@ fn apply_shortcut(app: &AppHandle, shortcut: &Shortcut) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-/// Flips the daemon capture-pause state from the tray menu (best effort).
-///
-/// The tray poller and the in-window health poll both reflect the new state within a few seconds,
-/// so no immediate menu mutation is needed here.
-fn toggle_pause() {
+/// Flips the daemon capture-pause state from the tray menu, then notifies and refreshes the tray.
+fn toggle_pause(app: &AppHandle) {
+    let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Ok(status) = fetch_health().await {
-            let _ = request(request_envelope::Body::SetCapturePaused(
-                SetCapturePausedRequest {
-                    paused: !status.capture_paused,
-                },
-            ))
-            .await;
+        let Ok(status) = fetch_health().await else {
+            return;
+        };
+        let target = !status.capture_paused;
+        if request(request_envelope::Body::SetCapturePaused(
+            SetCapturePausedRequest { paused: target },
+        ))
+        .await
+        .is_ok()
+        {
+            notify_capture_state(&app, target);
+            refresh_tray(&app).await;
         }
     });
+}
+
+/// Shows a native notification when capture is paused or resumed.
+///
+/// Best effort: Windows toast notifications require a registered application id, so they appear in
+/// packaged builds but may be suppressed in `tauri dev`.
+fn notify_capture_state(app: &AppHandle, paused: bool) {
+    let (title, body) = if paused {
+        ("ScreenSearch paused", "Screen capture is paused.")
+    } else {
+        ("ScreenSearch resumed", "Screen capture is active.")
+    };
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
+/// Reflects current daemon capture state in the tray tooltip, status line, and pause label.
+async fn refresh_tray(app: &AppHandle) {
+    let (status_line, pause_label) = match fetch_health().await {
+        Ok(status) => {
+            let state = match status.capture_state.as_str() {
+                "paused" => "Paused",
+                "backpressured" => "Catching up",
+                _ => "Capturing",
+            };
+            let label = if status.capture_paused {
+                "Resume capture"
+            } else {
+                "Pause capture"
+            };
+            (format!("{state} · {} queued", status.queue_depth), label)
+        }
+        Err(_) => ("Daemon offline".to_owned(), "Pause capture"),
+    };
+    let tooltip = format!("ScreenSearch V2 — {status_line}");
+    if let Some(handles) = app.try_state::<TrayHandles>() {
+        let _ = handles.icon.set_tooltip(Some(tooltip.as_str()));
+        let _ = handles.status_item.set_text(&status_line);
+        let _ = handles.pause_item.set_text(pause_label);
+    }
 }
 
 /// Polls daemon health every few seconds and reflects capture state in the tray.
 fn spawn_health_poll(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
-            let (status_line, pause_label) = match fetch_health().await {
-                Ok(status) => {
-                    let state = match status.capture_state.as_str() {
-                        "paused" => "Paused",
-                        "backpressured" => "Catching up",
-                        _ => "Capturing",
-                    };
-                    let label = if status.capture_paused {
-                        "Resume capture"
-                    } else {
-                        "Pause capture"
-                    };
-                    (format!("{state} · {} queued", status.queue_depth), label)
-                }
-                Err(_) => ("Daemon offline".to_owned(), "Pause capture"),
-            };
-            let tooltip = format!("ScreenSearch V2 — {status_line}");
-            if let Some(handles) = app.try_state::<TrayHandles>() {
-                let _ = handles.icon.set_tooltip(Some(tooltip.as_str()));
-                let _ = handles.status_item.set_text(&status_line);
-                let _ = handles.pause_item.set_text(pause_label);
-            }
+            refresh_tray(&app).await;
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
     });
@@ -531,7 +559,7 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => summon_main_window(app),
-            "pause" => toggle_pause(),
+            "pause" => toggle_pause(app),
             "quit" => app.exit(0),
             _ => {}
         })
@@ -564,6 +592,7 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
@@ -600,4 +629,55 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("run ScreenSearch V2 desktop application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NormalizedRect, SearchUiEvent};
+
+    #[test]
+    fn citation_event_serializes_with_camel_case_fields() {
+        let event = SearchUiEvent::Citation {
+            capture_id: "cap".to_owned(),
+            chunk_id: "chunk".to_owned(),
+            excerpt: "text".to_owned(),
+            score: 0.5,
+            captured_at: "2026-06-21T15:43:13.785+00:00".to_owned(),
+            application: "App".to_owned(),
+            window_title: "Title".to_owned(),
+            width: 100,
+            height: 50,
+            bounds: vec![NormalizedRect {
+                x: 0.1,
+                y: 0.2,
+                width: 0.3,
+                height: 0.4,
+            }],
+            match_kind: "hybrid".to_owned(),
+            ocr_model_id: "ocr".to_owned(),
+            embedding_model_id: "embed".to_owned(),
+        };
+        let value = serde_json::to_value(&event).expect("serialize citation event");
+        assert_eq!(value["kind"], "citation");
+        assert_eq!(value["captureId"], "cap");
+        assert_eq!(value["chunkId"], "chunk");
+        assert_eq!(value["capturedAt"], "2026-06-21T15:43:13.785+00:00");
+        assert_eq!(value["windowTitle"], "Title");
+        assert_eq!(value["matchKind"], "hybrid");
+        assert_eq!(value["ocrModelId"], "ocr");
+        assert_eq!(value["embeddingModelId"], "embed");
+        // The UI reads camelCase, so snake_case keys must never be emitted.
+        assert!(value.get("captured_at").is_none());
+        assert!(value.get("chunk_id").is_none());
+        assert!(value.get("capture_id").is_none());
+    }
+
+    #[test]
+    fn completed_event_serializes_with_camel_case_fields() {
+        let value = serde_json::to_value(SearchUiEvent::Completed { citation_count: 3 })
+            .expect("serialize completed event");
+        assert_eq!(value["kind"], "completed");
+        assert_eq!(value["citationCount"], 3);
+        assert!(value.get("citation_count").is_none());
+    }
 }

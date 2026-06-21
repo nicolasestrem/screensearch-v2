@@ -210,7 +210,12 @@ export function App() {
             onChange={(event) => setQuery(event.target.value)}
             placeholder="Search your screen memory…"
           />
-          <kbd>Ctrl K</kbd>
+          <div className="search-actions">
+            <kbd>Ctrl K</kbd>
+            <button type="submit" className="search-submit" disabled={!query.trim() || search.isPending}>
+              {search.isPending ? "Searching…" : "Search"}
+            </button>
+          </div>
         </form>
         <div className="top-actions">
           <button

@@ -211,3 +211,24 @@ P2 turns the verified evidence/retrieval engine into a native-feeling utility: i
 ### Remaining boundary
 
 Patch-plan item 14 stays **open**: the native tray, global hotkey, and hide-to-tray runtime still require a manual Windows `npm run tauri dev` session against a running daemon to satisfy the spec §18 "Verify tray pause/resume and global hotkey" check; `cargo test` only compiles the shell. Model-worker isolation, GGUF model selection, security/packaging, and release-hardware soak remain open.
+
+## 2026-06-21 — P2 shell follow-ups from live Windows testing
+
+### Fixed
+
+- **Search citations rendered with `undefined` fields in the real shell** (timestamps, images, selection, and React keys all broken; one bad timestamp previously blanked the window). Root cause: `SearchUiEvent` in `apps/desktop/src-tauri/src/main.rs` used `#[serde(tag = "kind", rename_all = "camelCase")]`, but on a tagged enum `rename_all` renames only the variant tags, not the struct-variant fields — so real citations serialized with snake_case keys (`captured_at`, `chunk_id`, `capture_id`, `window_title`, `match_kind`, `ocr_model_id`, `embedding_model_id`) while the UI reads camelCase. Single-word fields (`application`, `score`, `excerpt`) matched, so it half-rendered; preview data (hand-written camelCase) hid it entirely. Fixed by adding `rename_all_fields = "camelCase"`, and locked with two `serde_json` contract tests asserting the citation/completed events emit camelCase keys and never snake_case. The instrumentation added in the prior entry (`safeDate` logging) surfaced the exact `undefined` value that pinpointed this.
+
+### Added
+
+- A visible **Search** submit button in the command bar next to the `Ctrl K` hint (`apps/desktop/src/App.tsx`, `styles.css`); Enter already submitted the form, but the click affordance was missing and Ctrl+K (focus) is not a discoverable submit on Windows. The button is `type="submit"`, disabled when the query is empty or a search is in flight.
+- **Native notifications on capture pause/resume** plus an immediate tray refresh, so toggling capture from the tray gives feedback even when the window is hidden (`tauri-plugin-notification`, `notification:default` capability, `notify_capture_state`/`refresh_tray` in `main.rs`). The tray tooltip/status now update instantly on toggle rather than only on the 3-second poll. Windows toast notifications require a registered application id, so they appear reliably in packaged builds and may be suppressed in `tauri dev`; the tray tooltip/menu remain the dev-mode at-a-glance signal.
+
+### Verification evidence
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` — all clean/green, including the two new `screensearch-desktop` serialization tests.
+- `npm run lint` and `npm run build` (`apps/desktop`) — clean.
+- Browser QA: the Search button is a form submit, disabled on empty query and enabled when filled; the preview UI renders with zero console warnings/errors.
+
+### Remaining boundary
+
+Unchanged: patch-plan item 14 stays open pending the manual Windows tray/hotkey runtime check (spec §18). The pause/resume notification is best confirmed in a packaged build.

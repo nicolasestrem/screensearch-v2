@@ -70,6 +70,10 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
 .command-search input { min-width: 0; border: 0; outline: 0; color: var(--text); background: transparent; }
 .command-search input::placeholder { color: var(--faint); }
 kbd { border: 1px solid #454641; border-radius: 4px; padding: 3px 7px; color: #b8b7b1; background: #242525; font-family: inherit; font-size: 11px; box-shadow: inset 0 -1px #111; }
+.search-actions { display: flex; align-items: center; gap: 8px; }
+.search-submit { height: 28px; border: 1px solid #6c5d2f; border-radius: 6px; padding: 0 14px; color: #18160e; background: var(--accent); font-size: 12px; font-weight: 600; white-space: nowrap; }
+.search-submit:hover:not(:disabled) { background: #eccb6e; }
+.search-submit:disabled { border-color: #3a3b38; color: var(--faint); background: #242525; cursor: default; }
 
 .top-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; min-width: 0; }
 .pause-button, .filter-button, .modal-content button {
