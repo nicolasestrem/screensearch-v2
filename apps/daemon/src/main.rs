@@ -660,13 +660,23 @@ impl RequestHandler for DaemonHandler {
                 }))
             }
             request_envelope::Body::UnloadGenerationModel(_)
-            | request_envelope::Body::WorkerUnload(_) => Ok(single_response(ResponseEnvelope {
-                request_id,
-                terminal: true,
-                body: Some(response_envelope::Body::UnloadGenerationModel(
-                    UnloadGenerationModelResponse { unloaded: true },
-                )),
-            })),
+            | request_envelope::Body::WorkerUnload(_) => {
+                if let Err(error) = self.repository.clear_active_generation_model().await {
+                    return Ok(single_response(error_response(
+                        request_id,
+                        "model_unload_failed",
+                        &error.to_string(),
+                        false,
+                    )));
+                }
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::UnloadGenerationModel(
+                        UnloadGenerationModelResponse { unloaded: true },
+                    )),
+                }))
+            }
             request_envelope::Body::WorkerHealth(_)
             | request_envelope::Body::WorkerOcr(_)
             | request_envelope::Body::WorkerEmbedding(_)
@@ -769,7 +779,7 @@ async fn import_generation_model(
     select: bool,
     repository: &Arc<LibSqlArchive>,
 ) -> Result<GenerationModel, anyhow::Error> {
-    let source = PathBuf::from(source_path);
+    let source = resolve_model_source_path(source_path)?;
     let filename = source
         .file_name()
         .and_then(|value| value.to_str())
@@ -796,6 +806,39 @@ async fn import_generation_model(
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     Ok(model)
+}
+
+fn resolve_model_source_path(source_path: &str) -> Result<PathBuf, anyhow::Error> {
+    let trimmed = source_path.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("source model path is required");
+    }
+    let raw = PathBuf::from(trimmed);
+    if raw.is_absolute() || raw.exists() {
+        return Ok(raw);
+    }
+
+    let mut roots = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        roots.push(current_dir);
+    }
+    roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        roots.push(parent.to_path_buf());
+    }
+
+    for root in roots {
+        for ancestor in root.ancestors() {
+            let candidate = ancestor.join(&raw);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Ok(raw)
 }
 
 async fn download_generation_model(

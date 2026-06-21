@@ -100,6 +100,9 @@ pub trait ArchiveRepository: Send + Sync {
     /// Marks one generation model active and deactivates all others.
     async fn select_generation_model(&self, model_id: &str) -> Result<(), PortError>;
 
+    /// Clears the active generation model selection.
+    async fn clear_active_generation_model(&self) -> Result<(), PortError>;
+
     /// Returns the active generation model, if one is selected.
     async fn active_generation_model(&self) -> Result<Option<GenerationModel>, PortError>;
 

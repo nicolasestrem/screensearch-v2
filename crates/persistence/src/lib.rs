@@ -1127,6 +1127,18 @@ impl ArchiveRepository for LibSqlArchive {
         Ok(())
     }
 
+    async fn clear_active_generation_model(&self) -> Result<(), PortError> {
+        let _write_guard = self.write_gate.lock().await;
+        self.connection()
+            .execute(
+                "UPDATE generation_model SET active = 0 WHERE active = 1",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
     async fn active_generation_model(&self) -> Result<Option<GenerationModel>, PortError> {
         let mut rows = self
             .connection()

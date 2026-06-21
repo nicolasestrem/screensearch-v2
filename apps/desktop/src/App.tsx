@@ -627,7 +627,10 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
     mutationFn: (modelId: string) => api.deleteGenerationModel(modelId),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["generation-models"] }),
   });
-  const unloadModel = useMutation({ mutationFn: api.unloadGenerationModel });
+  const unloadModel = useMutation({
+    mutationFn: api.unloadGenerationModel,
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["generation-models"] }),
+  });
   const modalError = settings.error || save.error || deleteAll.error || saveHotkey.error
     || models.error || importModel.error || downloadModel.error || selectModel.error || deleteModel.error || unloadModel.error;
 
@@ -695,6 +698,9 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
               models={models.data ?? []}
               draft={modelDraft}
               busy={importModel.isPending || downloadModel.isPending || selectModel.isPending || deleteModel.isPending || unloadModel.isPending}
+              importPending={importModel.isPending}
+              downloadPending={downloadModel.isPending}
+              unloadPending={unloadModel.isPending}
               onDraft={setModelDraft}
               onImport={() => importModel.mutate()}
               onDownload={() => downloadModel.mutate()}
@@ -752,6 +758,9 @@ function ModelSettings({
   models,
   draft,
   busy,
+  importPending,
+  downloadPending,
+  unloadPending,
   onDraft,
   onImport,
   onDownload,
@@ -762,6 +771,9 @@ function ModelSettings({
   models: GenerationModel[];
   draft: { sourcePath: string; repository: string; filename: string; displayName: string };
   busy: boolean;
+  importPending: boolean;
+  downloadPending: boolean;
+  unloadPending: boolean;
   onDraft: (draft: { sourcePath: string; repository: string; filename: string; displayName: string }) => void;
   onImport: () => void;
   onDownload: () => void;
@@ -777,7 +789,7 @@ function ModelSettings({
           <strong>Answer model</strong>
           <small>{active ? `${active.displayName} · ${active.quantization || "GGUF"}` : "No generation model selected."}</small>
         </span>
-        <button type="button" onClick={onUnload} disabled={busy || !active}>Unload</button>
+        <button type="button" onClick={onUnload} disabled={busy || !active}>{unloadPending ? "Unloading..." : "Unload"}</button>
       </div>
       <div className="model-source-grid">
         <div className="model-source">
@@ -793,7 +805,7 @@ function ModelSettings({
             <span>Display name</span>
             <input value={draft.displayName} onChange={(event) => onDraft({ ...draft, displayName: event.target.value })} />
           </label>
-          <button type="button" onClick={onImport} disabled={busy || !draft.sourcePath.trim()}><Archive /> Import local</button>
+          <button type="button" onClick={onImport} disabled={busy || !draft.sourcePath.trim()}><Archive /> {importPending ? "Importing..." : "Import local"}</button>
         </div>
         <div className="model-source">
           <span className="model-source-heading">
@@ -808,7 +820,7 @@ function ModelSettings({
             <span>Filename</span>
             <input value={draft.filename} onChange={(event) => onDraft({ ...draft, filename: event.target.value })} />
           </label>
-          <button type="button" onClick={onDownload} disabled={busy || !draft.repository.trim() || !draft.filename.trim()}><Sparkle /> Download HF</button>
+          <button type="button" onClick={onDownload} disabled={busy || !draft.repository.trim() || !draft.filename.trim()}><Sparkle /> {downloadPending ? "Downloading..." : "Download HF"}</button>
         </div>
       </div>
       {models.length > 0 && (
