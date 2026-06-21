@@ -1,6 +1,10 @@
 //! Supervised model-worker process entry point.
 
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 use anyhow::Context;
 use futures::{StreamExt, stream};
@@ -18,12 +22,20 @@ use screensearch_ipc::{
 use screensearch_model_runtime::{FastEmbedEngine, LlamaCppTextGenerator};
 use screensearch_ports::{EmbeddingEngine, OcrEngine, TextGenerator};
 use screensearch_windows::WindowsOcrEngine;
+use tokio::sync::Mutex;
 use tracing::info;
 
 struct WorkerHandler {
     model_root: PathBuf,
     ocr: Arc<WindowsOcrEngine>,
     embeddings: Arc<FastEmbedEngine>,
+    generation: Mutex<Option<CachedGenerator>>,
+}
+
+struct CachedGenerator {
+    model_id: String,
+    relative_path: String,
+    generator: LlamaCppTextGenerator,
 }
 
 #[async_trait::async_trait]
@@ -44,17 +56,28 @@ impl RequestHandler for WorkerHandler {
         };
 
         match body {
-            request_envelope::Body::WorkerHealth(_) => Ok(single_response(ResponseEnvelope {
-                request_id,
-                terminal: true,
-                body: Some(response_envelope::Body::WorkerHealth(
-                    WorkerHealthResponse {
-                        status: "ready".to_owned(),
-                        active_generation_model_id: String::new(),
-                        generation_loaded: false,
-                    },
-                )),
-            })),
+            request_envelope::Body::WorkerHealth(_) => {
+                let generation = self.generation.lock().await;
+                let generation_loaded = generation
+                    .as_ref()
+                    .and_then(|cached| cached.generator.is_loaded().ok())
+                    .unwrap_or(false);
+                let active_generation_model_id = generation
+                    .as_ref()
+                    .map(|cached| cached.model_id.clone())
+                    .unwrap_or_default();
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::WorkerHealth(
+                        WorkerHealthResponse {
+                            status: "ready".to_owned(),
+                            active_generation_model_id,
+                            generation_loaded,
+                        },
+                    )),
+                }))
+            }
             request_envelope::Body::WorkerOcr(command) => {
                 let asset = AssetRef {
                     content_hash: String::new(),
@@ -110,8 +133,28 @@ impl RequestHandler for WorkerHandler {
                 }))
             }
             request_envelope::Body::WorkerGeneration(command) => {
-                let generator =
-                    LlamaCppTextGenerator::new(self.model_root.join(command.model_relative_path));
+                validate_model_relative_path(&command.model_relative_path)?;
+                let generator = {
+                    let mut generation = self.generation.lock().await;
+                    let reload = generation.as_ref().is_none_or(|cached| {
+                        cached.relative_path != command.model_relative_path
+                            || cached.model_id != command.model_id
+                    });
+                    if reload {
+                        *generation = Some(CachedGenerator {
+                            model_id: command.model_id.clone(),
+                            relative_path: command.model_relative_path.clone(),
+                            generator: LlamaCppTextGenerator::new(
+                                self.model_root.join(&command.model_relative_path),
+                            ),
+                        });
+                    }
+                    generation
+                        .as_ref()
+                        .expect("generation cache initialized")
+                        .generator
+                        .clone()
+                };
                 let tokens = generator
                     .generate(command.prompt)
                     .await
@@ -150,13 +193,23 @@ impl RequestHandler for WorkerHandler {
                 });
                 Ok(Box::pin(responses.chain(completed)))
             }
-            request_envelope::Body::WorkerUnload(_) => Ok(single_response(ResponseEnvelope {
-                request_id,
-                terminal: true,
-                body: Some(response_envelope::Body::WorkerUnload(
-                    WorkerUnloadResponse { unloaded: true },
-                )),
-            })),
+            request_envelope::Body::WorkerUnload(_) => {
+                let mut generation = self.generation.lock().await;
+                if let Some(cached) = generation.as_ref() {
+                    cached
+                        .generator
+                        .unload()
+                        .map_err(|error| IpcError::Handler(error.to_string()))?;
+                }
+                *generation = None;
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::WorkerUnload(
+                        WorkerUnloadResponse { unloaded: true },
+                    )),
+                }))
+            }
             _ => Ok(single_response(error_response(
                 request_id,
                 "wrong_endpoint",
@@ -165,6 +218,21 @@ impl RequestHandler for WorkerHandler {
             ))),
         }
     }
+}
+
+fn validate_model_relative_path(relative_path: &str) -> Result<(), IpcError> {
+    let path = Path::new(relative_path);
+    if relative_path.trim().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(IpcError::Handler(
+            "model path escapes model root".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -186,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
         model_root: model_root.clone(),
         ocr: Arc::new(WindowsOcrEngine::new(asset_root)),
         embeddings: Arc::new(FastEmbedEngine::new(model_root)),
+        generation: Mutex::new(None),
     });
     info!(pipe = %pipe_name, "model worker ready");
     serve(&pipe_name, handler)

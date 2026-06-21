@@ -191,10 +191,15 @@ impl TextGenerator for FakeTextGenerator {
 }
 
 /// Local GGUF generator backed by llama.cpp.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LlamaCppTextGenerator {
     model_path: PathBuf,
-    generation_gate: Arc<Mutex<()>>,
+    model: Arc<Mutex<Option<LoadedLlamaModel>>>,
+}
+
+struct LoadedLlamaModel {
+    backend: LlamaBackend,
+    model: LlamaModel,
 }
 
 impl LlamaCppTextGenerator {
@@ -202,8 +207,26 @@ impl LlamaCppTextGenerator {
     pub fn new(model_path: impl Into<PathBuf>) -> Self {
         Self {
             model_path: model_path.into(),
-            generation_gate: Arc::new(Mutex::new(())),
+            model: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Returns whether this generator currently has a GGUF model loaded.
+    pub fn is_loaded(&self) -> Result<bool, PortError> {
+        Ok(self
+            .model
+            .lock()
+            .map_err(|_| PortError::Internal("generation lock was poisoned".to_owned()))?
+            .is_some())
+    }
+
+    /// Drops any loaded GGUF model and releases its memory.
+    pub fn unload(&self) -> Result<(), PortError> {
+        *self
+            .model
+            .lock()
+            .map_err(|_| PortError::Internal("generation lock was poisoned".to_owned()))? = None;
+        Ok(())
     }
 }
 
@@ -216,7 +239,7 @@ impl TextGenerator for LlamaCppTextGenerator {
             ));
         }
         let model_path = self.model_path.clone();
-        let generation_gate = self.generation_gate.clone();
+        let model = self.model.clone();
         let (send, receive) = tokio::sync::mpsc::channel(32);
         tokio::task::spawn_blocking(move || {
             let result = generate_gguf(
@@ -227,7 +250,7 @@ impl TextGenerator for LlamaCppTextGenerator {
                         PortError::Transient("generation consumer disconnected".to_owned())
                     })
                 },
-                &generation_gate,
+                &model,
             );
             if let Err(error) = result {
                 let _ = send.blocking_send(Err(error));
@@ -241,23 +264,29 @@ fn generate_gguf(
     model_path: &std::path::Path,
     prompt: &str,
     mut emit: impl FnMut(String) -> Result<(), PortError>,
-    generation_gate: &Mutex<()>,
+    model_cache: &Mutex<Option<LoadedLlamaModel>>,
 ) -> Result<(), PortError> {
-    let _guard = generation_gate
+    let mut cached = model_cache
         .lock()
         .map_err(|_| PortError::Internal("generation lock was poisoned".to_owned()))?;
-    let backend = LlamaBackend::init()
-        .map_err(|error| PortError::Internal(format!("initialize llama.cpp: {error}")))?;
-    let model = LlamaModel::load_from_file(&backend, model_path, &LlamaModelParams::default())
-        .map_err(|error| PortError::Unavailable(format!("load local GGUF model: {error}")))?;
+    if cached.is_none() {
+        let backend = LlamaBackend::init()
+            .map_err(|error| PortError::Internal(format!("initialize llama.cpp: {error}")))?;
+        let model = LlamaModel::load_from_file(&backend, model_path, &LlamaModelParams::default())
+            .map_err(|error| PortError::Unavailable(format!("load local GGUF model: {error}")))?;
+        *cached = Some(LoadedLlamaModel { backend, model });
+    }
+    let cached = cached.as_mut().expect("llama model initialized");
     let context_parameters = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(2_048))
         .with_n_threads(2)
         .with_n_threads_batch(2);
-    let mut context = model
-        .new_context(&backend, context_parameters)
+    let mut context = cached
+        .model
+        .new_context(&cached.backend, context_parameters)
         .map_err(|error| PortError::Internal(format!("create llama.cpp context: {error}")))?;
-    let tokens = model
+    let tokens = cached
+        .model
         .str_to_token(prompt, AddBos::Always)
         .map_err(|error| PortError::InvalidData(format!("tokenize generation prompt: {error}")))?;
     let maximum_prompt_tokens = 1_792_usize;
@@ -291,10 +320,11 @@ fn generate_gguf(
     for position in (batch.n_tokens()..).take(256) {
         let token = sampler.sample(&context, batch.n_tokens() - 1);
         sampler.accept(token);
-        if model.is_eog_token(token) {
+        if cached.model.is_eog_token(token) {
             break;
         }
-        let piece = model
+        let piece = cached
+            .model
             .token_to_piece(token, &mut decoder, true, None)
             .map_err(|error| PortError::Internal(format!("decode generated token: {error}")))?;
         if !piece.is_empty() {

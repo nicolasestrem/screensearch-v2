@@ -597,7 +597,17 @@ impl SearchService {
             match generator.generate(prompt).await {
                 Ok(mut tokens) => {
                     while let Some(token) = tokens.next().await {
-                        yield SearchEvent::Token(token?);
+                        match token {
+                            Ok(text) => yield SearchEvent::Token(text),
+                            Err(error) => {
+                                yield SearchEvent::Completed {
+                                    citation_count,
+                                    answer_status: "generation_failed".to_owned(),
+                                    answer_message: Some(error.to_string()),
+                                };
+                                return;
+                            }
+                        }
                     }
                     yield SearchEvent::Completed {
                         citation_count,

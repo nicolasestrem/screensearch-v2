@@ -26,8 +26,8 @@ use screensearch_ipc::{
         HealthResponse, NormalizedRect, ProcessJobsResponse, ResponseEnvelope, SearchCompleted,
         SearchEvent as IpcSearchEvent, SetCapturePausedResponse, Token,
         UnloadGenerationModelResponse, UpdateArchiveSettingsResponse, WorkerEmbeddingRequest,
-        WorkerGenerationRequest, WorkerOcrRequest, request_envelope, response_envelope,
-        search_event, worker_generation_event,
+        WorkerGenerationRequest, WorkerHealthRequest, WorkerOcrRequest, WorkerUnloadRequest,
+        request_envelope, response_envelope, search_event, worker_generation_event,
     },
 };
 use screensearch_persistence::{FileAssetStore, LibSqlArchive};
@@ -36,7 +36,7 @@ use screensearch_ports::{
 };
 use screensearch_windows::WindowsGraphicsCaptureSource;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 struct DaemonHandler {
@@ -156,32 +156,60 @@ impl EmbeddingEngine for WorkerModelClient {
 impl TextGenerator for WorkerModelClient {
     async fn generate(&self, prompt: String) -> Result<TokenStream, PortError> {
         let model = self.repository.active_generation_model().await?;
-        let model_relative_path = model.map_or_else(
-            || "generator/model.gguf".to_owned(),
-            |model| format!("generator/{}", model.relative_path),
+        let (model_id, model_relative_path) = model.map_or_else(
+            || ("bundled-generator".to_owned(), "generator/model.gguf".to_owned()),
+            |model| (model.id, format!("generator/{}", model.relative_path)),
         );
         let pipe_name = self.pipe_name.clone();
-        Ok(Box::pin(try_stream! {
-            let responses = IpcClient::new(pipe_name)
-                .request(screensearch_ipc::v1::RequestEnvelope {
-                    request_id: uuid::Uuid::now_v7().to_string(),
-                    body: Some(request_envelope::Body::WorkerGeneration(WorkerGenerationRequest {
-                        model_id: String::new(),
+        let (send, mut receive) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let request_id = uuid::Uuid::now_v7().to_string();
+            let request = screensearch_ipc::v1::RequestEnvelope {
+                request_id,
+                body: Some(request_envelope::Body::WorkerGeneration(
+                    WorkerGenerationRequest {
+                        model_id,
                         model_relative_path,
                         prompt,
-                    })),
-                })
-                .await
-                .map_err(|error| PortError::Unavailable(format!("model worker: {error}")))?;
-            for response in responses {
-                match response.body {
-                    Some(response_envelope::Body::WorkerGeneration(event)) => match event.event {
-                        Some(worker_generation_event::Event::Token(token)) => yield token.text,
-                        Some(worker_generation_event::Event::Completed(_)) | None => {}
                     },
-                    Some(response_envelope::Body::Error(error)) => Err(PortError::Unavailable(error.message))?,
-                    _ => {}
-                }
+                )),
+            };
+            let result = IpcClient::new(pipe_name)
+                .request_each(request, |response| {
+                    match response.body {
+                        Some(response_envelope::Body::WorkerGeneration(event)) => {
+                            if let Some(worker_generation_event::Event::Token(token)) = event.event
+                            {
+                                send.send(Ok(token.text)).map_err(|_| {
+                                    IpcError::Handler(
+                                        "generation token consumer disconnected".to_owned(),
+                                    )
+                                })?;
+                            }
+                        }
+                        Some(response_envelope::Body::Error(error)) => {
+                            send.send(Err(PortError::Unavailable(error.message))).map_err(
+                                |_| {
+                                    IpcError::Handler(
+                                        "generation error consumer disconnected".to_owned(),
+                                    )
+                                },
+                            )?;
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                })
+                .await;
+            if let Err(error) = result {
+                let _ = send.send(Err(PortError::Unavailable(format!(
+                    "model worker: {error}"
+                ))));
+            }
+        });
+        Ok(Box::pin(try_stream! {
+            while let Some(token) = receive.recv().await {
+                yield token?;
             }
         }))
     }
@@ -189,6 +217,57 @@ impl TextGenerator for WorkerModelClient {
 
 fn worker_error(error: &IpcError) -> PortError {
     PortError::Transient(format!("model worker: {error}"))
+}
+
+async fn unload_model_worker() -> Result<(), anyhow::Error> {
+    let responses = IpcClient::new(DEFAULT_WORKER_PIPE_NAME)
+        .request(screensearch_ipc::v1::RequestEnvelope {
+            request_id: uuid::Uuid::now_v7().to_string(),
+            body: Some(request_envelope::Body::WorkerUnload(WorkerUnloadRequest {})),
+        })
+        .await
+        .context("request model worker unload")?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::WorkerUnload(_)) => return Ok(()),
+            Some(response_envelope::Body::Error(error)) => anyhow::bail!(error.message),
+            _ => {}
+        }
+    }
+    anyhow::bail!("model worker returned no unload response")
+}
+
+async fn wait_for_model_worker_ready(timeout: Duration) -> Result<(), anyhow::Error> {
+    let started = std::time::Instant::now();
+    let mut last_error = None;
+    while started.elapsed() < timeout {
+        match IpcClient::new(DEFAULT_WORKER_PIPE_NAME)
+            .request(screensearch_ipc::v1::RequestEnvelope {
+                request_id: uuid::Uuid::now_v7().to_string(),
+                body: Some(request_envelope::Body::WorkerHealth(WorkerHealthRequest {})),
+            })
+            .await
+        {
+            Ok(responses) => {
+                for response in responses {
+                    match response.body {
+                        Some(response_envelope::Body::WorkerHealth(_)) => return Ok(()),
+                        Some(response_envelope::Body::Error(error)) => {
+                            last_error = Some(error.message);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    anyhow::bail!(
+        "model worker did not become ready within {}s: {}",
+        timeout.as_secs(),
+        last_error.unwrap_or_else(|| "no response".to_owned())
+    )
 }
 
 #[async_trait::async_trait]
@@ -669,6 +748,14 @@ impl RequestHandler for DaemonHandler {
                         false,
                     )));
                 }
+                if let Err(error) = unload_model_worker().await {
+                    return Ok(single_response(error_response(
+                        request_id,
+                        "model_unload_failed",
+                        &error.to_string(),
+                        true,
+                    )));
+                }
                 Ok(single_response(ResponseEnvelope {
                     request_id,
                     terminal: true,
@@ -788,8 +875,7 @@ async fn import_generation_model(
     let model_id = model_id(display_name, &filename);
     let relative_path = format!("{model_id}/{filename}");
     let target = model_root.join(&relative_path);
-    let byte_length = copy_hashing(&source, &target).await?;
-    let content_hash = hash_file(&target).await?;
+    let (byte_length, content_hash) = copy_and_hash(&source, &target).await?;
     let model = generation_model_from_file(
         model_id,
         display_name,
@@ -854,6 +940,7 @@ async fn download_generation_model(
     if hf_repository.is_empty() || filename.is_empty() {
         anyhow::bail!("Hugging Face repository and filename are required");
     }
+    validate_plain_filename(filename)?;
     let model_id = model_id(display_name, filename);
     let relative_path = format!("{model_id}/{filename}");
     let target = model_root.join(&relative_path);
@@ -862,19 +949,18 @@ async fn download_generation_model(
     }
     let temporary = target.with_extension("download");
     let url = format!("https://huggingface.co/{hf_repository}/resolve/main/{filename}");
-    let mut response = reqwest::get(url).await?.error_for_status()?;
-    let mut output = tokio::fs::File::create(&temporary).await?;
-    let mut hasher = blake3::Hasher::new();
-    let mut byte_length = 0_u64;
-    while let Some(chunk) = response.chunk().await? {
-        hasher.update(&chunk);
-        output.write_all(&chunk).await?;
-        byte_length = byte_length.saturating_add(chunk.len() as u64);
-    }
-    output.flush().await?;
-    drop(output);
+    let (byte_length, content_hash) = match download_and_hash(&url, &temporary).await {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+    };
     let _ = tokio::fs::remove_file(&target).await;
-    tokio::fs::rename(&temporary, &target).await?;
+    if let Err(error) = tokio::fs::rename(&temporary, &target).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error.into());
+    }
     let model = generation_model_from_file(
         model_id,
         display_name,
@@ -882,7 +968,7 @@ async fn download_generation_model(
         Some(hf_repository.to_owned()),
         filename,
         relative_path,
-        hasher.finalize().to_hex().to_string(),
+        content_hash,
         byte_length,
         select,
     );
@@ -948,13 +1034,41 @@ fn generation_model_from_file(
     }
 }
 
-async fn copy_hashing(source: &Path, target: &Path) -> Result<u64, anyhow::Error> {
+fn validate_plain_filename(filename: &str) -> Result<(), anyhow::Error> {
+    if Path::new(filename).file_name().and_then(|value| value.to_str()) != Some(filename) {
+        anyhow::bail!("filename must be a plain file name without path separators");
+    }
+    Ok(())
+}
+
+async fn copy_and_hash(source: &Path, target: &Path) -> Result<(u64, String), anyhow::Error> {
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let temporary = target.with_extension("import");
+    let result = copy_to_temporary_and_hash(source, &temporary).await;
+    let (byte_length, content_hash) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+    };
+    let _ = tokio::fs::remove_file(target).await;
+    if let Err(error) = tokio::fs::rename(&temporary, target).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error.into());
+    }
+    Ok((byte_length, content_hash))
+}
+
+async fn copy_to_temporary_and_hash(
+    source: &Path,
+    temporary: &Path,
+) -> Result<(u64, String), anyhow::Error> {
     let mut input = tokio::fs::File::open(source).await?;
-    let mut output = tokio::fs::File::create(&temporary).await?;
+    let mut output = tokio::fs::File::create(temporary).await?;
+    let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     let mut byte_length = 0_u64;
     loop {
@@ -962,28 +1076,32 @@ async fn copy_hashing(source: &Path, target: &Path) -> Result<u64, anyhow::Error
         if read == 0 {
             break;
         }
-        output.write_all(&buffer[..read]).await?;
+        let chunk = &buffer[..read];
+        output.write_all(chunk).await?;
+        hasher.update(chunk);
         byte_length = byte_length.saturating_add(read as u64);
     }
     output.flush().await?;
     drop(output);
-    let _ = tokio::fs::remove_file(target).await;
-    tokio::fs::rename(&temporary, target).await?;
-    Ok(byte_length)
+    Ok((byte_length, hasher.finalize().to_hex().to_string()))
 }
 
-async fn hash_file(path: &Path) -> Result<String, anyhow::Error> {
-    let mut input = tokio::fs::File::open(path).await?;
+async fn download_and_hash(
+    url: &str,
+    temporary: &Path,
+) -> Result<(u64, String), anyhow::Error> {
+    let mut response = reqwest::get(url).await?.error_for_status()?;
+    let mut output = tokio::fs::File::create(temporary).await?;
     let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = input.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
+    let mut byte_length = 0_u64;
+    while let Some(chunk) = response.chunk().await? {
+        hasher.update(&chunk);
+        output.write_all(&chunk).await?;
+        byte_length = byte_length.saturating_add(chunk.len() as u64);
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    output.flush().await?;
+    drop(output);
+    Ok((byte_length, hasher.finalize().to_hex().to_string()))
 }
 
 fn model_id(display_name: &str, filename: &str) -> String {
@@ -1005,7 +1123,9 @@ fn model_id(display_name: &str, filename: &str) -> String {
     while id.contains("--") {
         id = id.replace("--", "-");
     }
-    id.trim_matches('-').chars().take(96).collect()
+    let slug = id.trim_matches('-').chars().take(72).collect::<String>();
+    let slug = if slug.is_empty() { "model" } else { &slug };
+    format!("{slug}-{}", uuid::Uuid::now_v7().simple())
 }
 
 fn infer_architecture(filename: &str) -> Option<String> {
@@ -1084,6 +1204,9 @@ async fn main() -> anyhow::Result<()> {
     let generator_root = model_root.join("generator");
     let mut model_worker = spawn_model_worker(&data_directory, &asset_root, &model_root)
         .context("launch model worker")?;
+    wait_for_model_worker_ready(Duration::from_secs(30))
+        .await
+        .context("wait for model worker readiness")?;
     let worker_client = Arc::new(WorkerModelClient {
         repository: repository.clone(),
         pipe_name: DEFAULT_WORKER_PIPE_NAME.to_owned(),
@@ -1259,6 +1382,21 @@ fn spawn_model_worker(
 }
 
 fn workspace_debug_worker_path(binary_dir: &Path, worker_name: &str) -> PathBuf {
+    for ancestor in binary_dir.ancestors() {
+        if ancestor.file_name().and_then(|name| name.to_str()) == Some("debug")
+            && ancestor
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                == Some("target")
+        {
+            return ancestor.join(worker_name);
+        }
+        let candidate = ancestor.join("target").join("debug").join(worker_name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
     binary_dir.join(worker_name)
 }
 
