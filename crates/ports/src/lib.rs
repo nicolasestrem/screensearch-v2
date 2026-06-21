@@ -5,8 +5,9 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use futures::Stream;
 use screensearch_domain::{
-    AnalysisJob, AnalysisResult, AssetRef, CaptureDisposition, CaptureId, CapturedFrame,
-    NewCapture, OcrBlock, SearchHit,
+    AnalysisJob, AnalysisResult, ArchiveSettings, AssetCleanupTask, AssetRef, CaptureDisposition,
+    CaptureId, CapturedFrame, DeleteCaptures, DeletionSummary, NewCapture, OcrBlock, QueueMetrics,
+    SearchHit, StorageMetrics,
 };
 use thiserror::Error;
 
@@ -25,6 +26,9 @@ pub trait CaptureSource: Send + Sync {
 pub trait AssetStore: Send + Sync {
     /// Writes bytes idempotently and returns their content-addressed location.
     async fn put(&self, bytes: &[u8], media_type: &str) -> Result<AssetRef, PortError>;
+
+    /// Removes an unreferenced asset idempotently.
+    async fn delete(&self, asset: &AssetRef) -> Result<(), PortError>;
 }
 
 /// Transactional archive and hybrid-search boundary.
@@ -47,6 +51,36 @@ pub trait ArchiveRepository: Send + Sync {
 
     /// Resolves an immutable asset by its authorized capture identifier.
     async fn capture_asset(&self, capture_id: CaptureId) -> Result<Option<AssetRef>, PortError>;
+
+    /// Returns content-free queue health for backpressure and diagnostics.
+    async fn queue_metrics(&self) -> Result<QueueMetrics, PortError>;
+
+    /// Loads versioned user-controlled archive policy.
+    async fn archive_settings(&self) -> Result<ArchiveSettings, PortError>;
+
+    /// Replaces archive policy and exclusion rules atomically.
+    async fn update_archive_settings(&self, settings: ArchiveSettings) -> Result<(), PortError>;
+
+    /// Returns content-free archive size and indexing measurements.
+    async fn storage_metrics(&self) -> Result<StorageMetrics, PortError>;
+
+    /// Applies age and asset-budget retention to eligible captures.
+    async fn apply_retention(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<DeletionSummary, PortError>;
+
+    /// Deletes explicitly selected captures without touching active analysis leases.
+    async fn delete_captures(&self, request: DeleteCaptures) -> Result<DeletionSummary, PortError>;
+
+    /// Returns the oldest durable unreferenced-asset cleanup task.
+    async fn claim_asset_cleanup(&self) -> Result<Option<AssetCleanupTask>, PortError>;
+
+    /// Completes an asset cleanup after the filesystem delete succeeds.
+    async fn complete_asset_cleanup(&self, content_hash: &str) -> Result<(), PortError>;
+
+    /// Records a bounded cleanup failure for later retry.
+    async fn fail_asset_cleanup(&self, content_hash: &str, reason: &str) -> Result<(), PortError>;
 
     /// Runs lexical and vector retrieval and fuses their ranks.
     async fn hybrid_search(

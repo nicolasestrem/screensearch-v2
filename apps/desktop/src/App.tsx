@@ -23,11 +23,17 @@ import {
   Sparkle,
   X,
 } from "@phosphor-icons/react";
-import { api, type SearchEvent } from "./api";
+import { api, type ArchiveSettings, type SearchEvent } from "./api";
 
 type Citation = Extract<SearchEvent, { kind: "citation" }>;
 type DetailTab = "text" | "metadata" | "source";
 type ModalName = "privacy" | "settings" | null;
+type SettingsDraft = {
+  retentionDays: number | null;
+  diskBudgetBytes: number | null;
+  excludedApplications: string;
+  excludedTitles: string;
+};
 
 export function App() {
   const queryClient = useQueryClient();
@@ -121,6 +127,8 @@ export function App() {
   }
 
   const paused = health.data?.capturePaused ?? false;
+  const captureState = health.data?.captureState ?? "paused";
+  const backpressured = captureState === "backpressured";
   const error = health.error || capture.error || pause.error || search.error;
 
   return (
@@ -151,8 +159,8 @@ export function App() {
             {paused ? <Play weight="fill" /> : <Pause weight="fill" />}
             {paused ? "Resume capture" : "Pause capture"}
           </button>
-          <span className={`capture-state ${paused ? "is-paused" : ""}`}>
-            <i /> {paused ? "Paused" : "Capturing"}
+          <span className={`capture-state ${paused || backpressured ? "is-paused" : ""}`}>
+            <i /> {paused ? "Paused" : backpressured ? "Catching up" : "Capturing"}
           </span>
           <IconButton label="Settings" onClick={() => setModal("settings")}><Gear /></IconButton>
         </div>
@@ -240,14 +248,20 @@ export function App() {
         <span><ShieldCheck /> Offline mode · all processing stays local</span>
         <span className={health.data ? "healthy" : "unhealthy"}>
           {health.data ? <CheckCircle weight="fill" /> : <Info weight="fill" />}
-          {health.data ? `Index ready · daemon ${health.data.version}` : "Daemon offline"}
+          {health.data
+            ? `Index ready · ${health.data.queueDepth} queued · daemon ${health.data.version}`
+            : "Daemon offline"}
         </span>
       </footer>
 
       {capture.data && (
         <div className="toast" role="status">
           <CheckCircle weight="fill" />
-          {capture.data.duplicate ? "This frame was already indexed" : "Current frame queued for indexing"}
+          {capture.data.skippedReason
+            ? captureSkipMessage(capture.data.skippedReason)
+            : capture.data.duplicate
+              ? "This frame was already indexed"
+              : "Current frame queued for indexing"}
         </div>
       )}
       {error && <div className="error-toast" role="alert">{String(error)}</div>}
@@ -414,6 +428,35 @@ function IconButton({ label, active = false, onClick, children }: { label: strin
 }
 
 function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<ModalName, null>; paused: boolean; onClose: () => void; onCapture: () => void }) {
+  const queryClient = useQueryClient();
+  const settings = useQuery({ queryKey: ["archive-settings"], queryFn: api.archiveSettings });
+  const [draft, setDraft] = useState<SettingsDraft>();
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const current = draft ?? settingsDraft(settings.data);
+
+  const save = useMutation({
+    mutationFn: () => api.updateArchiveSettings({
+      retentionDays: current.retentionDays,
+      diskBudgetBytes: current.diskBudgetBytes,
+      excludedApplications: splitPatterns(current.excludedApplications),
+      excludedTitles: splitPatterns(current.excludedTitles),
+    }),
+    onSuccess: (result) => {
+      queryClient.setQueryData<ArchiveSettings>(["archive-settings"], result.settings);
+      setDraft(settingsDraft(result.settings));
+      void queryClient.invalidateQueries({ queryKey: ["health"] });
+    },
+  });
+  const deleteAll = useMutation({
+    mutationFn: () => api.deleteAllCaptures(true),
+    onSuccess: () => {
+      setConfirmDelete(false);
+      void queryClient.invalidateQueries({ queryKey: ["archive-settings"] });
+      void queryClient.invalidateQueries({ queryKey: ["health"] });
+    },
+  });
+  const modalError = settings.error || save.error || deleteAll.error;
+
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
       <section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" onMouseDown={(event) => event.stopPropagation()}>
@@ -427,19 +470,83 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
         {name === "privacy" ? (
           <div className="modal-content">
             <div className="notice"><ShieldCheck weight="fill" /><p><strong>Offline by design</strong><span>Captures, OCR text, embeddings, and search stay in the local application data directory.</span></p></div>
-            <div className="setting-row"><span><strong>Application exclusions</strong><small>Per-application exclusion rules are the next privacy control to land.</small></span><button type="button" disabled>Not configured</button></div>
-            <div className="setting-row"><span><strong>Retention</strong><small>No automatic deletion policy is configured yet.</small></span><button type="button" disabled>Keep all</button></div>
+            <label className="settings-field">
+              <span><strong>Application exclusions</strong><small>One case-insensitive application name per line.</small></span>
+              <textarea value={current.excludedApplications} onChange={(event) => setDraft({ ...current, excludedApplications: event.target.value })} placeholder={"1password.exe\nprivate-app.exe"} />
+            </label>
+            <label className="settings-field">
+              <span><strong>Window title exclusions</strong><small>Skip windows whose titles contain one of these phrases.</small></span>
+              <textarea value={current.excludedTitles} onChange={(event) => setDraft({ ...current, excludedTitles: event.target.value })} placeholder={"Private browsing\nConfidential"} />
+            </label>
+            <div className="modal-actions">
+              <span>{save.isSuccess ? "Privacy exclusions saved" : "Rules apply before screenshots are stored."}</span>
+              <button type="button" onClick={() => save.mutate()} disabled={settings.isPending || save.isPending}>{save.isPending ? "Saving…" : "Save exclusions"}</button>
+            </div>
           </div>
         ) : (
           <div className="modal-content">
             <div className="setting-row"><span><strong>Automatic capture</strong><small>{paused ? "Capture is paused." : "The focused monitor is captured every two seconds."}</small></span><span className={`state-pill ${paused ? "paused" : ""}`}>{paused ? "Paused" : "Active"}</span></div>
+            <div className="storage-summary">
+              <span><strong>{settings.data?.captureCount.toLocaleString() ?? "—"}</strong><small>captures</small></span>
+              <span><strong>{settings.data ? formatBytes(settings.data.assetBytes) : "—"}</strong><small>screen assets</small></span>
+            </div>
+            <label className="settings-field compact">
+              <span><strong>Age retention</strong><small>Only completed or waiting captures are eligible; active analysis is protected.</small></span>
+              <select value={current.retentionDays ?? ""} onChange={(event) => setDraft({ ...current, retentionDays: event.target.value ? Number(event.target.value) : null })}>
+                <option value="">Keep all until I choose</option>
+                <option value="7">7 days</option>
+                <option value="30">30 days</option>
+                <option value="90">90 days</option>
+                <option value="365">1 year</option>
+              </select>
+            </label>
+            <label className="settings-field compact">
+              <span><strong>Screen asset budget</strong><small>Oldest eligible captures are removed first when this limit is exceeded.</small></span>
+              <select value={current.diskBudgetBytes ?? ""} onChange={(event) => setDraft({ ...current, diskBudgetBytes: event.target.value ? Number(event.target.value) : null })}>
+                <option value="">No asset limit until I choose</option>
+                <option value={1 * 1024 ** 3}>1 GB</option>
+                <option value={5 * 1024 ** 3}>5 GB</option>
+                <option value={10 * 1024 ** 3}>10 GB</option>
+                <option value={25 * 1024 ** 3}>25 GB</option>
+              </select>
+            </label>
+            <div className="modal-actions">
+              <span>{save.isSuccess ? "Retention policy saved" : "Changes are applied immediately and checked every minute."}</span>
+              <button type="button" onClick={() => save.mutate()} disabled={settings.isPending || save.isPending}>{save.isPending ? "Applying…" : "Save storage policy"}</button>
+            </div>
             <div className="setting-row"><span><strong>Capture current frame</strong><small>Queue an immediate frame without changing the automatic cadence.</small></span><button type="button" onClick={onCapture}><Camera /> Capture now</button></div>
             <div className="setting-row"><span><strong>Search shortcut</strong><small>Focus search from anywhere in this window.</small></span><kbd>Ctrl K</kbd></div>
+            <div className="danger-zone">
+              <span><strong>Delete all captured history</strong><small>This pauses capture and permanently removes screenshots, OCR, and search indexes. Models are kept.</small></span>
+              {confirmDelete ? (
+                <div><button type="button" className="secondary" onClick={() => setConfirmDelete(false)}>Cancel</button><button type="button" className="danger" onClick={() => deleteAll.mutate()} disabled={deleteAll.isPending}>{deleteAll.isPending ? "Deleting…" : "Confirm delete all"}</button></div>
+              ) : <button type="button" className="danger" onClick={() => setConfirmDelete(true)}>Delete all…</button>}
+            </div>
           </div>
         )}
+        {modalError && <div className="modal-error" role="alert">{String(modalError)}</div>}
       </section>
     </div>
   );
+}
+
+function splitPatterns(value: string) {
+  return [...new Set(value.split(/\r?\n/).map((pattern) => pattern.trim()).filter(Boolean))];
+}
+
+function settingsDraft(settings?: ArchiveSettings): SettingsDraft {
+  return {
+    retentionDays: settings?.retentionDays ?? null,
+    diskBudgetBytes: settings?.diskBudgetBytes ?? null,
+    excludedApplications: settings?.excludedApplications.join("\n") ?? "",
+    excludedTitles: settings?.excludedTitles.join("\n") ?? "",
+  };
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024 ** 2) return `${Math.round(bytes / 1024)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
 function groupCitations(citations: Citation[]) {
@@ -477,4 +584,12 @@ function readBlobAsDataUrl(blob: Blob) {
     reader.addEventListener("error", () => reject(reader.error ?? new Error("read capture preview")), { once: true });
     reader.readAsDataURL(blob);
   });
+}
+
+function captureSkipMessage(reason: string) {
+  if (reason === "paused") return "Capture is paused";
+  if (reason === "backpressured") return "Capture is waiting for indexing to catch up";
+  if (reason === "near_duplicate") return "No meaningful screen change detected";
+  if (reason.startsWith("excluded_")) return "This application is excluded from capture";
+  return "Current frame was not captured";
 }

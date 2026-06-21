@@ -1,26 +1,24 @@
 //! Persistent ScreenSearch V2 daemon and named-pipe endpoint.
 
-use std::{
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use futures::{StreamExt, stream};
-use screensearch_application::{AnalysisService, IngestService, SearchService};
-use screensearch_domain::{CaptureDisposition, CaptureId, SearchEvent, SearchMatchKind};
+use screensearch_application::{
+    AnalysisService, CapturePolicy, CapturePolicyConfig, IngestService, SearchService,
+};
+use screensearch_domain::{
+    ArchiveSettings, CaptureDisposition, CaptureId, DeleteCaptures, SearchEvent, SearchMatchKind,
+    StorageMetrics,
+};
 use screensearch_ipc::{
     IpcError, RequestHandler, ResponseStream,
     transport::{DEFAULT_PIPE_NAME, serve},
     v1::{
-        CaptureAssetResponse, CaptureResponse, Citation, ErrorResponse, HealthResponse,
-        NormalizedRect, ProcessJobsResponse, ResponseEnvelope, SearchCompleted,
-        SearchEvent as IpcSearchEvent, SetCapturePausedResponse, Token, request_envelope,
-        response_envelope, search_event,
+        ArchiveSettingsResponse, CaptureAssetResponse, CaptureResponse, Citation,
+        DeleteCapturesResponse, ErrorResponse, HealthResponse, NormalizedRect, ProcessJobsResponse,
+        ResponseEnvelope, SearchCompleted, SearchEvent as IpcSearchEvent, SetCapturePausedResponse,
+        Token, UpdateArchiveSettingsResponse, request_envelope, response_envelope, search_event,
     },
 };
 use screensearch_model_runtime::{FastEmbedEngine, LlamaCppTextGenerator};
@@ -36,7 +34,7 @@ struct DaemonHandler {
     search: Arc<SearchService>,
     repository: Arc<LibSqlArchive>,
     assets: Arc<FileAssetStore>,
-    capture_paused: Arc<AtomicBool>,
+    capture_policy: Arc<CapturePolicy>,
 }
 
 #[async_trait::async_trait]
@@ -57,15 +55,56 @@ impl RequestHandler for DaemonHandler {
         };
 
         match body {
-            request_envelope::Body::Health(_) => Ok(single_response(ResponseEnvelope {
-                request_id,
-                terminal: true,
-                body: Some(response_envelope::Body::Health(HealthResponse {
-                    version: env!("CARGO_PKG_VERSION").to_owned(),
-                    status: "ready".to_owned(),
-                    capture_paused: self.capture_paused.load(Ordering::Relaxed),
-                })),
-            })),
+            request_envelope::Body::Health(_) => {
+                let metrics = match self.repository.queue_metrics().await {
+                    Ok(metrics) => metrics,
+                    Err(error) => {
+                        return Ok(single_response(error_response(
+                            request_id,
+                            "health_failed",
+                            &error.to_string(),
+                            true,
+                        )));
+                    }
+                };
+                let storage = match self.repository.storage_metrics().await {
+                    Ok(metrics) => metrics,
+                    Err(error) => {
+                        return Ok(single_response(error_response(
+                            request_id,
+                            "health_failed",
+                            &error.to_string(),
+                            true,
+                        )));
+                    }
+                };
+                let capture_state = if self.capture_policy.is_paused() {
+                    "paused"
+                } else if self.capture_policy.is_backpressured() {
+                    "backpressured"
+                } else {
+                    "capturing"
+                };
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::Health(HealthResponse {
+                        version: env!("CARGO_PKG_VERSION").to_owned(),
+                        status: "ready".to_owned(),
+                        capture_paused: self.capture_policy.is_paused(),
+                        capture_state: capture_state.to_owned(),
+                        queue_depth: metrics.depth(),
+                        oldest_pending_age_seconds: metrics.oldest_pending_age_seconds,
+                        retry_count: metrics.retry_count,
+                        dead_letter_count: metrics.dead_letter_count,
+                        queue_high_water: self.capture_policy.queue_high_water(),
+                        capture_count: storage.capture_count,
+                        asset_bytes: storage.asset_bytes,
+                        ocr_block_count: storage.ocr_block_count,
+                        search_chunk_count: storage.search_chunk_count,
+                    })),
+                }))
+            }
             request_envelope::Body::Capture(_) => {
                 let response = match self.ingest.capture_once().await {
                     Ok(CaptureDisposition::Enqueued { capture_id, .. }) => ResponseEnvelope {
@@ -74,6 +113,7 @@ impl RequestHandler for DaemonHandler {
                         body: Some(response_envelope::Body::Capture(CaptureResponse {
                             capture_id: capture_id.to_string(),
                             duplicate: false,
+                            skipped_reason: String::new(),
                         })),
                     },
                     Ok(CaptureDisposition::Duplicate { capture_id }) => ResponseEnvelope {
@@ -82,6 +122,16 @@ impl RequestHandler for DaemonHandler {
                         body: Some(response_envelope::Body::Capture(CaptureResponse {
                             capture_id: capture_id.to_string(),
                             duplicate: true,
+                            skipped_reason: String::new(),
+                        })),
+                    },
+                    Ok(CaptureDisposition::Skipped { reason }) => ResponseEnvelope {
+                        request_id,
+                        terminal: true,
+                        body: Some(response_envelope::Body::Capture(CaptureResponse {
+                            capture_id: String::new(),
+                            duplicate: false,
+                            skipped_reason: reason.to_string(),
                         })),
                     },
                     Err(error) => {
@@ -209,7 +259,7 @@ impl RequestHandler for DaemonHandler {
                 }))
             }
             request_envelope::Body::SetCapturePaused(command) => {
-                self.capture_paused.store(command.paused, Ordering::Relaxed);
+                self.capture_policy.set_paused(command.paused);
                 info!(paused = command.paused, "automatic capture state changed");
                 Ok(single_response(ResponseEnvelope {
                     request_id,
@@ -221,7 +271,143 @@ impl RequestHandler for DaemonHandler {
                     )),
                 }))
             }
+            request_envelope::Body::GetArchiveSettings(_) => {
+                let settings = self
+                    .ingest
+                    .archive_settings()
+                    .await
+                    .map_err(|error| IpcError::Handler(error.to_string()))?;
+                let metrics = self
+                    .ingest
+                    .storage_metrics()
+                    .await
+                    .map_err(|error| IpcError::Handler(error.to_string()))?;
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::ArchiveSettings(
+                        map_archive_settings(settings, metrics),
+                    )),
+                }))
+            }
+            request_envelope::Body::UpdateArchiveSettings(command) => {
+                let settings = ArchiveSettings {
+                    retention_days: command.retention_days,
+                    disk_budget_bytes: command.disk_budget_bytes,
+                    excluded_applications: command.excluded_applications,
+                    excluded_titles: command.excluded_titles,
+                };
+                if let Err(error) = self.ingest.update_archive_settings(settings).await {
+                    return Ok(single_response(error_response(
+                        request_id,
+                        "invalid_archive_settings",
+                        &error.to_string(),
+                        false,
+                    )));
+                }
+                let deleted = self
+                    .ingest
+                    .run_retention(chrono::Utc::now())
+                    .await
+                    .map_err(|error| IpcError::Handler(error.to_string()))?;
+                let settings = self
+                    .ingest
+                    .archive_settings()
+                    .await
+                    .map_err(|error| IpcError::Handler(error.to_string()))?;
+                let metrics = self
+                    .ingest
+                    .storage_metrics()
+                    .await
+                    .map_err(|error| IpcError::Handler(error.to_string()))?;
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::UpdateArchiveSettings(
+                        UpdateArchiveSettingsResponse {
+                            settings: Some(map_archive_settings(settings, metrics)),
+                            captures_deleted: deleted.captures_deleted,
+                            assets_scheduled: deleted.assets_scheduled,
+                        },
+                    )),
+                }))
+            }
+            request_envelope::Body::DeleteCaptures(command) => {
+                if command.delete_all && !command.confirmed {
+                    return Ok(single_response(error_response(
+                        request_id,
+                        "confirmation_required",
+                        "deleting all captured history requires explicit confirmation",
+                        false,
+                    )));
+                }
+                let mut capture_ids = Vec::with_capacity(command.capture_ids.len());
+                for value in command.capture_ids {
+                    match uuid::Uuid::parse_str(&value) {
+                        Ok(value) => capture_ids.push(CaptureId(value)),
+                        Err(error) => {
+                            return Ok(single_response(error_response(
+                                request_id,
+                                "invalid_capture_id",
+                                &error.to_string(),
+                                false,
+                            )));
+                        }
+                    }
+                }
+                let before = if command.before.trim().is_empty() {
+                    None
+                } else {
+                    match chrono::DateTime::parse_from_rfc3339(&command.before) {
+                        Ok(value) => Some(value.with_timezone(&chrono::Utc)),
+                        Err(error) => {
+                            return Ok(single_response(error_response(
+                                request_id,
+                                "invalid_delete_range",
+                                &error.to_string(),
+                                false,
+                            )));
+                        }
+                    }
+                };
+                if command.delete_all {
+                    self.capture_policy.set_paused(true);
+                }
+                let deleted = self
+                    .ingest
+                    .delete_captures(DeleteCaptures {
+                        capture_ids,
+                        before,
+                        delete_all: command.delete_all,
+                    })
+                    .await
+                    .map_err(|error| IpcError::Handler(error.to_string()))?;
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::DeleteCaptures(
+                        DeleteCapturesResponse {
+                            captures_deleted: deleted.captures_deleted,
+                            assets_scheduled: deleted.assets_scheduled,
+                        },
+                    )),
+                }))
+            }
         }
+    }
+}
+
+fn map_archive_settings(
+    settings: ArchiveSettings,
+    metrics: StorageMetrics,
+) -> ArchiveSettingsResponse {
+    ArchiveSettingsResponse {
+        retention_days: settings.retention_days,
+        disk_budget_bytes: settings.disk_budget_bytes,
+        excluded_applications: settings.excluded_applications,
+        excluded_titles: settings.excluded_titles,
+        capture_count: metrics.capture_count,
+        asset_bytes: metrics.asset_bytes,
     }
 }
 
@@ -313,6 +499,10 @@ async fn main() -> anyhow::Result<()> {
         .migrate()
         .await
         .context("migrate archive database")?;
+    let persisted_settings = repository
+        .archive_settings()
+        .await
+        .context("load archive settings")?;
 
     let asset_root = data_directory.join("assets");
     let assets = Arc::new(FileAssetStore::new(&asset_root));
@@ -320,10 +510,23 @@ async fn main() -> anyhow::Result<()> {
     let generator = Arc::new(LlamaCppTextGenerator::new(
         data_directory.join("models/generator/model.gguf"),
     ));
-    let ingest = Arc::new(IngestService::new(
+    let capture_policy = Arc::new(CapturePolicy::new(CapturePolicyConfig {
+        queue_high_water: 100,
+        queue_low_water: 50,
+        excluded_applications: vec!["screensearch".to_owned()],
+        excluded_titles: Vec::new(),
+    })?);
+    capture_policy
+        .replace_exclusions(
+            persisted_settings.excluded_applications,
+            persisted_settings.excluded_titles,
+        )
+        .await;
+    let ingest = Arc::new(IngestService::with_policy(
         Arc::new(WindowsGraphicsCaptureSource),
         assets.clone(),
         repository.clone(),
+        capture_policy.clone(),
     ));
     let analysis = Arc::new(AnalysisService::new(
         repository.clone(),
@@ -331,7 +534,6 @@ async fn main() -> anyhow::Result<()> {
         embeddings.clone(),
         "daemon-windows-worker",
     ));
-    let capture_paused = Arc::new(AtomicBool::new(false));
     let handler = Arc::new(DaemonHandler {
         ingest: ingest.clone(),
         analysis: analysis.clone(),
@@ -342,13 +544,17 @@ async fn main() -> anyhow::Result<()> {
         )),
         repository,
         assets,
-        capture_paused: capture_paused.clone(),
+        capture_policy,
     });
 
-    info!(pipe = DEFAULT_PIPE_NAME, data = %data_directory.display(), "daemon ready");
+    info!(pipe = DEFAULT_PIPE_NAME, "daemon ready");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let capture_task = tokio::spawn(capture_loop(ingest, capture_paused, shutdown_rx.clone()));
+    let capture_task = tokio::spawn(capture_loop(ingest, shutdown_rx.clone()));
     let analysis_task = tokio::spawn(analysis_loop(analysis, shutdown_rx));
+    let maintenance_task = tokio::spawn(maintenance_loop(
+        handler.ingest.clone(),
+        shutdown_tx.subscribe(),
+    ));
     tokio::select! {
         result = serve(DEFAULT_PIPE_NAME, handler) => result.context("serve named pipe")?,
         result = tokio::signal::ctrl_c() => result.context("wait for shutdown signal")?,
@@ -356,23 +562,18 @@ async fn main() -> anyhow::Result<()> {
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(3), capture_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(3), analysis_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), maintenance_task).await;
     info!("daemon stopped");
     Ok(())
 }
 
-async fn capture_loop(
-    ingest: Arc<IngestService>,
-    capture_paused: Arc<AtomicBool>,
-    mut shutdown: watch::Receiver<bool>,
-) {
+async fn capture_loop(ingest: Arc<IngestService>, mut shutdown: watch::Receiver<bool>) {
     let mut cadence = tokio::time::interval(Duration::from_secs(2));
     cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = cadence.tick() => {
-                if !capture_paused.load(Ordering::Relaxed)
-                    && let Err(error) = ingest.capture_once().await
-                {
+                if let Err(error) = ingest.capture_once().await {
                     warn!(error = %error, "automatic capture failed");
                 }
             }
@@ -396,6 +597,33 @@ async fn analysis_loop(analysis: Arc<AnalysisService>, mut shutdown: watch::Rece
                         warn!(error = %error, "automatic analysis failed");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn maintenance_loop(ingest: Arc<IngestService>, mut shutdown: watch::Receiver<bool>) {
+    let mut cadence = tokio::time::interval(Duration::from_secs(60));
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = cadence.tick() => {
+                match ingest.run_retention(chrono::Utc::now()).await {
+                    Ok(summary) if summary.captures_deleted > 0 => {
+                        info!(
+                            captures_deleted = summary.captures_deleted,
+                            assets_scheduled = summary.assets_scheduled,
+                            "archive retention completed"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(error = %error, "archive retention failed"),
                 }
             }
             changed = shutdown.changed() => {

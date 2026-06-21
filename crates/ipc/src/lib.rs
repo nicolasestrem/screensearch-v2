@@ -237,7 +237,10 @@ mod tests {
 
     use prost::Message;
 
-    use super::v1::{HealthRequest, RequestEnvelope, request_envelope};
+    use super::v1::{
+        HealthRequest, HealthResponse, RequestEnvelope, ResponseEnvelope,
+        UpdateArchiveSettingsRequest, request_envelope, response_envelope,
+    };
 
     #[test]
     fn request_contract_round_trips() {
@@ -254,6 +257,59 @@ mod tests {
             decoded.body,
             Some(request_envelope::Body::Health(_))
         ));
+    }
+
+    #[test]
+    fn health_response_round_trips_queue_observability() {
+        let response = ResponseEnvelope {
+            request_id: "request-2".to_owned(),
+            terminal: true,
+            body: Some(response_envelope::Body::Health(HealthResponse {
+                version: "test".to_owned(),
+                status: "ready".to_owned(),
+                capture_paused: false,
+                capture_state: "backpressured".to_owned(),
+                queue_depth: 100,
+                oldest_pending_age_seconds: 42,
+                retry_count: 3,
+                dead_letter_count: 1,
+                queue_high_water: 100,
+                capture_count: 12,
+                asset_bytes: 34,
+                ocr_block_count: 56,
+                search_chunk_count: 78,
+            })),
+        };
+
+        let decoded = ResponseEnvelope::decode(response.encode_to_vec().as_slice()).unwrap();
+        let Some(response_envelope::Body::Health(health)) = decoded.body else {
+            panic!("expected health response");
+        };
+        assert_eq!(health.capture_state, "backpressured");
+        assert_eq!(health.queue_depth, 100);
+        assert_eq!(health.retry_count, 3);
+    }
+
+    #[test]
+    fn archive_settings_request_round_trips_optional_policy() {
+        let request = RequestEnvelope {
+            request_id: "settings-request".to_owned(),
+            body: Some(request_envelope::Body::UpdateArchiveSettings(
+                UpdateArchiveSettingsRequest {
+                    retention_days: Some(30),
+                    disk_budget_bytes: Some(5 * 1024 * 1024 * 1024),
+                    excluded_applications: vec!["private.exe".to_owned()],
+                    excluded_titles: vec!["confidential".to_owned()],
+                },
+            )),
+        };
+
+        let decoded = RequestEnvelope::decode(request.encode_to_vec().as_slice()).unwrap();
+        let Some(request_envelope::Body::UpdateArchiveSettings(settings)) = decoded.body else {
+            panic!("expected settings request");
+        };
+        assert_eq!(settings.retention_days, Some(30));
+        assert_eq!(settings.excluded_applications, ["private.exe"]);
     }
 
     #[cfg(windows)]
@@ -276,6 +332,16 @@ mod tests {
                         version: "test".to_owned(),
                         status: "ready".to_owned(),
                         capture_paused: false,
+                        capture_state: "capturing".to_owned(),
+                        queue_depth: 0,
+                        oldest_pending_age_seconds: 0,
+                        retry_count: 0,
+                        dead_letter_count: 0,
+                        queue_high_water: 100,
+                        capture_count: 0,
+                        asset_bytes: 0,
+                        ocr_block_count: 0,
+                        search_chunk_count: 0,
                     })),
                 })
             })))

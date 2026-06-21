@@ -78,3 +78,63 @@ The working evidence loop needed a product surface that made visual source mater
 ### Remaining boundary
 
 Tray lifecycle, a system-wide hotkey, application exclusions, retention/deletion, model-worker isolation, GGUF model selection, and automation emission remain open.
+
+## 2026-06-21 — P0 verification and P1 capture policy
+
+### Changed
+
+- Re-verified the full P0 Rust and frontend build rather than relying on the prior review claim.
+- Serialized capture attempts and added 100/50-job high/low-water backpressure with automatic recovery.
+- Added a conservative, deterministic perceptual-change filter that runs before asset persistence and preserves separate application/title evidence.
+- Enforced production self-exclusion and added case-insensitive application/title policy primitives before asset persistence.
+- Extended queue observability and IPC health with depth, oldest pending age, retries, dead letters, capture state, and high-water mark.
+- Made policy skips explicit and content-free through the capture response and product status surface.
+- Removed the archive path from the daemon-ready log event.
+
+### Why
+
+P1 semantic retrieval was already active, but capture could still grow the durable queue without bounds and store visually insignificant frames. This pass closes the first ordered P1 gap without inventing retention or user-configurable exclusion settings that belong to the next patch item.
+
+### Verification evidence
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+- `npm run lint`
+- `npm run build`
+- The ignored real Windows archive integration test was explicitly run and passed against the populated local archive and cached MiniLM model.
+
+### Remaining boundary
+
+Performance acceptance and the explicit 10-million-row run remain pending a named reference machine. Persisted user exclusions, locked-session detection, retention, deletion, and disk budgets remain in the next privacy/storage slice.
+
+## 2026-06-21 — P1 semantic retrieval and scale completed
+
+### Changed
+
+- Added migration-backed local archive settings for age retention, captured-asset budgets, and application/title exclusions.
+- Applied updated exclusions to the live capture policy without restarting the daemon and enforced retention periodically and immediately after settings changes.
+- Added storage metrics, transactional capture/derived-data deletion, active-job protection, shared-asset reference accounting, and durable idempotent cleanup of unreferenced image files.
+- Exposed settings, storage status, privacy exclusions, and two-step captured-history deletion through protobuf, Tauri, and the selected Memory Timeline dialogs.
+- Kept lexical and semantic results isolated to one embedding revision and added a bounded exact-cosine path for smaller live archives after the vector index showed pathological cold latency there.
+- Reworked the explicit scale harness to populate and query ten million metadata rows without fabricating ten million image assets.
+- Recorded the named-machine P1 baseline in `docs/performance/P1_SCALE_BASELINE.md`.
+
+### Why
+
+P1 requires semantic recall to remain truthful under growth. Revision consistency, capture shedding, retention, durable deletion, and measured scale are one system: each prevents the archive from becoming either misleading or operationally unbounded.
+
+### Verification evidence
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+- `npm run lint`
+- `npm run build`
+- The explicitly opted-in ten-million-row benchmark passed twice on the named reference machine.
+- The final post-refactor populated Windows archive test returned resolvable real screenshot evidence at 27.69 ms hybrid-search p95.
+- Desktop settings/privacy dialogs passed interaction and layout QA at desktop and compact window sizes.
+
+### Remaining boundary
+
+P2 begins with tray lifecycle, the configurable system-wide hotkey, and complete keyboard navigation. Release hardening still includes locked-session detection, model-worker isolation, long-duration capture resource soak, factory-reset scope, named-pipe ACLs, signing, security checks, and packaging.

@@ -1,7 +1,7 @@
 # ScreenSearch V2 Build Review
 
 Review date: 2026-06-21  
-Build reviewed: first truthful evidence-loop pass
+Build reviewed: completed P0 truthful evidence loop and P1 semantic-retrieval/scale phase
 
 ## Implemented
 
@@ -20,12 +20,21 @@ Build reviewed: first truthful evidence-loop pass
 - A generic local GGUF llama.cpp generator adapter with evidence-only search as the safe default when no model is installed.
 - The selected Memory Timeline product interface with real screenshot evidence, grouped results, filters, metadata/provenance tabs, privacy/settings dialogs, and visual QA.
 - A real daemon-owned pause/resume capture control exposed through IPC and the desktop UI.
+- Single-flight capture with queue high/low-water hysteresis and automatic recovery below low-water.
+- Conservative perceptual-change filtering against the last accepted same-window frame, before asset persistence.
+- Production self-exclusion plus case-insensitive application/title exclusion policy primitives.
+- Queue depth, oldest pending age, retries, dead letters, capture state, and high-water visibility through IPC and the desktop status surface.
+- Migration-backed archive settings for age retention, captured-asset budgets, and case-insensitive application/title exclusions.
+- Live policy refresh after settings updates, periodic retention enforcement, transactional derived-data deletion, and durable idempotent cleanup of unreferenced assets.
+- Storage metrics and confirmed captured-history deletion exposed through typed IPC, Tauri commands, and the selected Memory Timeline settings/privacy dialogs.
+- Model-revision-isolated lexical and semantic ranking, deterministic exact-text boost, and a bounded exact-cosine path that avoids pathological vector-index startup on smaller live archives.
+- An explicit ten-million-capture metadata benchmark with throughput, database size, query percentiles, peak process memory, and CPU time recorded on a named Windows machine.
 
 ## Deliberately skipped
 
 - An approved and installed default GGUF generation model.
 - Tray lifecycle and a system-wide search hotkey.
-- Retention, exclusions, deletion, disk budget, model acquisition, signing, and production automation.
+- Locked-session detection, tray lifecycle, a system-wide search hotkey, model acquisition, signing, factory reset of database/model files, and production automation.
 
 ## Placeholder behavior that must not be mistaken for product behavior
 
@@ -41,13 +50,13 @@ Build reviewed: first truthful evidence-loop pass
 
 ## Risks found
 
-1. Full-frame exact hashes generate excessive unique captures for cursor, clock, animation, and other minor changes.
-2. Capture and analysis share one daemon and need queue backpressure plus process isolation before production scale.
+1. The initial perceptual-change threshold needs measurement and tuning on the reference hardware; it deliberately favors preserving evidence over aggressive reduction.
+2. Capture and analysis share one daemon; queue backpressure is implemented, but model process isolation remains necessary for release resilience.
 3. First model acquisition currently depends on Hugging Face connectivity and lacks a signed manifest flow.
 4. The fixed 384-dimensional vector table is correct for MiniLM but requires a new migration for future dimensions.
 5. The native model-worker boundary is declared but not exercised.
 6. Current logging review has not yet proven that all future native errors are content-free.
-7. Application exclusions and retention/deletion remain unimplemented; the UI discloses those gaps.
+7. Long-duration capture CPU/storage growth and perceptual-threshold tuning remain release-hardening work beyond the completed P1 engineering baseline.
 
 ## Verification evidence
 
@@ -57,8 +66,8 @@ Build reviewed: first truthful evidence-loop pass
 - `npm run lint`
 - `npm run build`
 
-All commands above passed after the truthful evidence-loop implementation on 2026-06-21. The real Windows archive integration test also passed against a populated smoke archive; the long-running 10-million-capture benchmark remains explicitly ignored pending a dedicated run.
+All commands above passed after the completed P1 pass on 2026-06-21. Coverage includes backpressure, pause precedence, exclusions, perceptual thresholds, settings validation/persistence, retention by age and asset budget, active-job protection, shared-asset reference handling, deletion cleanup recovery, queue/storage IPC, exact-text ranking boost, and model-revision isolation. The explicitly invoked ten-million-capture benchmark passed twice; the instrumented run populated 10,000,000 metadata rows in 90.73 seconds, produced a 3.62 GiB database, used 22.69 MiB peak process working set, and measured 38.1/108.6/136.7 microsecond p50/p95/p99 metadata queries. The final post-refactor populated local Windows archive test returned resolvable screenshot evidence with positioned bounds at 22.59/27.69/27.69 millisecond hybrid-search p50/p95/p99. See `docs/performance/P1_SCALE_BASELINE.md`.
 
 ## Review verdict
 
-The repository now has a credible truthful evidence loop: a smoke archive captured seven live screenshots, completed seven jobs automatically, and produced 393 positioned OCR blocks; a second archive passed a real semantic/evidence query against resolvable screenshot assets. It is not release-ready until privacy/backpressure policies, model-worker isolation, selected product UI, and release hardening land.
+P0 remains verified and P1 is complete. The build has real revision-consistent hybrid retrieval, bounded capture growth, configurable local privacy/storage policy, durable deletion cleanup, indexing/storage metrics, and a reproduced ten-million-row engineering baseline. It is not release-ready until P2 product-shell lifecycle and keyboard work, model-worker isolation, generation/model decisions, security/packaging, and release-hardware soak validation land.

@@ -26,7 +26,7 @@ This keeps deployment simple for one desktop user while preserving fault and mem
 
 ## Priorities
 
-### P0 — Truthful evidence loop
+### P0 — Truthful evidence loop (complete 2026-06-21)
 
 - Capture real Windows pixels.
 - Encode stable image assets.
@@ -37,7 +37,7 @@ This keeps deployment simple for one desktop user while preserving fault and mem
 
 Why: until this works, neither semantic search nor visual design can be judged honestly.
 
-### P1 — Semantic retrieval and scale
+### P1 — Semantic retrieval and scale (complete 2026-06-21)
 
 - Add a compact local embedding model behind the existing port.
 - Preserve model revision consistency.

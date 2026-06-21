@@ -7,7 +7,9 @@ license.workspace = true
 
 [dependencies]
 blake3.workspace = true
+chrono.workspace = true
 futures.workspace = true
+image.workspace = true
 screensearch-domain = { path = "../domain" }
 screensearch-ports = { path = "../ports" }
 tracing.workspace = true
@@ -15,7 +17,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-chrono.workspace = true
 tokio.workspace = true
 
 [lints]

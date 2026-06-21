@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 futures.workspace = true
 screensearch-application = { path = "../../crates/application" }
 screensearch-domain = { path = "../../crates/domain" }

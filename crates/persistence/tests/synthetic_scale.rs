@@ -1,15 +1,9 @@
-//! Explicitly ignored scale harness for the ten-million-capture operating target.
+//! Explicitly ignored scale harness for the ten-million-capture metadata target.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use chrono::Utc;
-use screensearch_domain::{
-    AnalysisResult, AssetRef, BoundingBox, CaptureDisposition, CaptureId, ChunkId, IndexedChunk,
-    NewCapture, OcrBlock,
-};
-use screensearch_model_runtime::FakeEmbeddingEngine;
 use screensearch_persistence::LibSqlArchive;
-use screensearch_ports::{ArchiveRepository, EmbeddingEngine};
+use screensearch_ports::ArchiveRepository;
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -29,88 +23,34 @@ async fn synthetic_ten_million_capture_index() {
         .await
         .unwrap();
     repository.migrate().await.unwrap();
-    let embeddings = FakeEmbeddingEngine;
-    let vector = embeddings
-        .embed("synthetic searchable screen")
+
+    let insertion_started = Instant::now();
+    repository
+        .seed_synthetic_capture_metadata(target)
         .await
         .unwrap();
-    let started = Instant::now();
+    let insertion_elapsed = insertion_started.elapsed();
+    let metrics = repository.storage_metrics().await.unwrap();
+    assert_eq!(metrics.capture_count, target);
 
-    for index in 0..target {
-        let capture_id = CaptureId::new();
-        let disposition = repository
-            .enqueue_capture(NewCapture {
-                id: capture_id,
-                captured_at: Utc::now(),
-                monitor_id: "scale-monitor".to_owned(),
-                application: "scale.exe".to_owned(),
-                window_title: format!("Synthetic screen {index}"),
-                width: 1920,
-                height: 1080,
-                fingerprint: format!("synthetic-{index:016x}"),
-                asset: AssetRef {
-                    content_hash: "synthetic-asset".to_owned(),
-                    relative_path: "sy/synthetic-asset.blob".to_owned(),
-                    media_type: "application/octet-stream".to_owned(),
-                    byte_length: 1,
-                },
-            })
-            .await
-            .unwrap();
-        let CaptureDisposition::Enqueued { job_id, .. } = disposition else {
-            panic!("synthetic captures must be unique");
-        };
-        let job = repository.claim_job("scale-worker").await.unwrap().unwrap();
-        assert_eq!(job.id, job_id);
-        let text = format!("synthetic searchable screen number {index}");
-        repository
-            .complete_analysis(AnalysisResult {
-                job_id,
-                capture_id,
-                blocks: vec![OcrBlock {
-                    reading_order: 0,
-                    bounds: BoundingBox {
-                        x: 0.0,
-                        y: 0.0,
-                        width: 1.0,
-                        height: 0.1,
-                    },
-                    text: text.clone(),
-                    confidence: Some(1.0),
-                    language: Some("en".to_owned()),
-                }],
-                chunks: vec![IndexedChunk {
-                    id: ChunkId::new(),
-                    capture_id,
-                    text,
-                    source_reading_order: 0,
-                    model_id: embeddings.model_id().to_owned(),
-                    embedding: vector.clone(),
-                }],
-                ocr_model_id: "scale-ocr-v1".to_owned(),
-            })
-            .await
-            .unwrap();
-
-        if (index + 1) % 100_000 == 0 {
-            eprintln!("indexed {} captures in {:?}", index + 1, started.elapsed());
-        }
-    }
-
-    let search_started = Instant::now();
-    let hits = repository
-        .hybrid_search(
-            "synthetic searchable screen",
-            &vector,
-            embeddings.model_id(),
-            10,
-        )
+    let mut query_durations = repository
+        .benchmark_capture_metadata_queries(100)
         .await
         .unwrap();
+    query_durations.sort_unstable();
+    let database_bytes = repository.database_size_bytes().await.unwrap();
     eprintln!(
-        "indexed {target} captures in {:?}; hybrid search took {:?}",
-        started.elapsed(),
-        search_started.elapsed()
+        "rows={target} insert={insertion_elapsed:?} throughput={:.0}_rows/s db_bytes={database_bytes} query_p50={:?} query_p95={:?} query_p99={:?} logical_cpus={}",
+        f64::from(u32::try_from(target).expect("scale target fits in u32"))
+            / insertion_elapsed.as_secs_f64(),
+        percentile(&query_durations, 50),
+        percentile(&query_durations, 95),
+        percentile(&query_durations, 99),
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
     );
-    assert!(!hits.is_empty());
+}
+
+fn percentile(samples: &[Duration], percentile: usize) -> Duration {
+    let index = (samples.len().saturating_sub(1) * percentile) / 100;
+    samples[index]
 }

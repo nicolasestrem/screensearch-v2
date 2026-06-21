@@ -6,7 +6,7 @@ This document answers one question: **what is true today?** It does not select f
 
 ## Repository status
 
-ScreenSearch V2 is an independent, uncommitted Git repository on branch `main`. It is a Rust 2024 workspace with a Tauri 2 React/TypeScript desktop shell. The truthful evidence-loop pass compiles and its workspace tests, Rust formatting, Clippy checks, frontend lint, and frontend production build pass as of the date above.
+ScreenSearch V2 is an independent, uncommitted Git repository on branch `main`. It is a Rust 2024 workspace with a Tauri 2 React/TypeScript desktop shell. P0 and P1 are implemented: the truthful evidence loop, semantic retrieval, capture growth controls, retention/storage policy, and the synthetic scale target all pass their required checks as of the date above.
 
 ## Current process boundaries
 
@@ -40,7 +40,7 @@ Migration `0001_initial.sql` creates:
 - `search_chunk`, FTS5, and 384-dimensional vector tables;
 - `outbox_event`, `dead_letter`, and `automation_run` tables.
 
-Migrations `0002` through `0004` make OCR confidence nullable for providers that do not expose it, connect search chunks to positioned OCR evidence, and register the active real embedding revision.
+Migrations `0002` through `0004` make OCR confidence nullable for providers that do not expose it, connect search chunks to positioned OCR evidence, and register the active real embedding revision. Migration `0005_archive_policy.sql` adds the singleton archive settings record, application/title exclusions, and durable unreferenced-asset cleanup work.
 
 Capture metadata and an analysis job are committed transactionally. Analysis completion commits OCR blocks, chunks, embeddings, an outbox event, and job completion atomically. Jobs use leases and bounded retries.
 
@@ -64,6 +64,13 @@ Capture metadata and an analysis job are committed transactionally. Analysis com
 - Authorized screenshot retrieval by capture identifier and screenshot rendering in the diagnostics UI.
 - The selected Memory Timeline product interface with search, client-side date/application filtering, grouped evidence, a screenshot inspector, OCR highlights, metadata/provenance tabs, and optional answer state.
 - A real pause/resume control propagated over IPC to the daemon capture loop.
+- Serialized capture attempts with high/low-water queue backpressure, conservative perceptual-change filtering, and pre-persistence self-exclusion.
+- Content-free queue health over IPC: depth, oldest pending age, retries, dead letters, high-water mark, and active/paused/backpressured state.
+- Persisted application/title exclusions that update the live capture policy without a restart.
+- Persisted age retention and captured-asset disk budgets, both disabled by the conservative `Keep all`/`No limit` default until the user chooses otherwise.
+- Transactional capture/derived-data deletion plus durable, idempotent cleanup of unreferenced image assets.
+- Settings and privacy controls for exclusions, retention, storage budget, storage metrics, and confirmed deletion of captured history.
+- A reproducible ten-million-capture metadata benchmark and a live populated-archive hybrid-search latency check, recorded in `docs/performance/P1_SCALE_BASELINE.md`.
 - A real llama.cpp GGUF adapter that is dormant until an explicitly installed model is selected; evidence-only search does not require it.
 
 ## What is fake or disabled
@@ -75,7 +82,7 @@ Capture metadata and an analysis job are committed transactionally. Analysis com
 
 ## Current user experience
 
-The React screen implements the product-owner-selected Memory Timeline direction. Capture and analysis are automatic; search renders chronologically grouped screenshot evidence with timestamps, application/window metadata, excerpts, provenance, and positioned OCR highlights. Search, date/application filters, evidence selection, detail tabs, pause/resume, privacy/settings dialogs, manual capture, and optional generation states are interactive. Tray lifecycle and a system-wide hotkey remain unimplemented.
+The React screen implements the product-owner-selected Memory Timeline direction. Capture and analysis are automatic; search renders chronologically grouped screenshot evidence with timestamps, application/window metadata, excerpts, provenance, and positioned OCR highlights. Search, date/application filters, evidence selection, detail tabs, pause/resume, live privacy exclusions, retention/storage settings, confirmed captured-history deletion, manual capture, and optional generation states are interactive. Tray lifecycle and a system-wide hotkey remain unimplemented.
 
 ## Current dependencies and infrastructure
 
@@ -88,15 +95,16 @@ The React screen implements the product-owner-selected Memory Timeline direction
 
 ## Known issues
 
-1. Exact full-frame hashes do not handle visually insignificant changes or near-duplicates.
-2. Queue backpressure, pause, exclusions, retention, deletion, and disk budgets are not implemented.
-3. The daemon is not supervised or launched by the desktop shell.
-4. No global hotkey or tray lifecycle exists yet; Ctrl+K currently focuses search only inside the window.
-5. The model worker boundary is not yet exercised; OCR and embeddings currently execute in the daemon process.
-6. The GGUF provider has no approved default model, manifest, acquisition flow, or packaged weights.
-7. Automation policy is real, but native input emission remains disabled.
-8. Capture cadence has not been tuned against CPU, storage growth, perceptual deduplication, or a 10-million-capture benchmark.
-9. Named-pipe access-control hardening and release signing remain incomplete.
+1. The initial perceptual threshold is deterministic but still needs tuning against long-running real workloads; the P1 baseline deliberately favors preserving evidence.
+2. The daemon is not supervised or launched by the desktop shell.
+3. No global hotkey or tray lifecycle exists yet; Ctrl+K currently focuses search only inside the window.
+4. The model worker boundary is not yet exercised; OCR and embeddings currently execute in the daemon process.
+5. The GGUF provider has no approved default model, manifest, acquisition flow, or packaged weights.
+6. Automation policy is real, but native input emission remains disabled.
+7. Idle/active capture CPU, long-duration storage growth, and OCR/embedding queue latency still need release-hardware soak measurements; the P1 metadata-scale and live-search baselines are complete.
+8. A full factory-reset scope covering archive database and model files is not implemented; confirmed deletion currently covers captured history and its derived evidence/assets.
+9. Locked-session detection is still unimplemented and must land before production privacy acceptance.
+10. Named-pipe access-control hardening and release signing remain incomplete.
 
 ## Non-goals
 

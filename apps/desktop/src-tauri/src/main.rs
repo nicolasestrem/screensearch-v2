@@ -4,8 +4,9 @@ use screensearch_ipc::{
     IpcError,
     transport::{DEFAULT_PIPE_NAME, IpcClient},
     v1::{
-        CaptureRequest, GetCaptureAssetRequest, HealthRequest, ProcessJobsRequest, RequestEnvelope,
-        SearchRequest, SetCapturePausedRequest, request_envelope, response_envelope, search_event,
+        CaptureRequest, DeleteCapturesRequest, GetArchiveSettingsRequest, GetCaptureAssetRequest,
+        HealthRequest, ProcessJobsRequest, RequestEnvelope, SearchRequest, SetCapturePausedRequest,
+        UpdateArchiveSettingsRequest, request_envelope, response_envelope, search_event,
     },
 };
 use serde::Serialize;
@@ -17,6 +18,42 @@ struct HealthStatus {
     version: String,
     status: String,
     capture_paused: bool,
+    capture_state: String,
+    queue_depth: u64,
+    oldest_pending_age_seconds: u64,
+    retry_count: u64,
+    dead_letter_count: u64,
+    queue_high_water: u64,
+    capture_count: u64,
+    asset_bytes: u64,
+    ocr_block_count: u64,
+    search_chunk_count: u64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveSettings {
+    retention_days: Option<u32>,
+    disk_budget_bytes: Option<u64>,
+    excluded_applications: Vec<String>,
+    excluded_titles: Vec<String>,
+    capture_count: u64,
+    asset_bytes: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsUpdateResult {
+    settings: ArchiveSettings,
+    captures_deleted: u64,
+    assets_scheduled: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteResult {
+    captures_deleted: u64,
+    assets_scheduled: u64,
 }
 
 #[derive(Serialize)]
@@ -24,6 +61,7 @@ struct HealthStatus {
 struct CaptureResult {
     capture_id: String,
     duplicate: bool,
+    skipped_reason: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -79,6 +117,16 @@ async fn health() -> Result<HealthStatus, String> {
                     version: status.version,
                     status: status.status,
                     capture_paused: status.capture_paused,
+                    capture_state: status.capture_state,
+                    queue_depth: status.queue_depth,
+                    oldest_pending_age_seconds: status.oldest_pending_age_seconds,
+                    retry_count: status.retry_count,
+                    dead_letter_count: status.dead_letter_count,
+                    queue_high_water: status.queue_high_water,
+                    capture_count: status.capture_count,
+                    asset_bytes: status.asset_bytes,
+                    ocr_block_count: status.ocr_block_count,
+                    search_chunk_count: status.search_chunk_count,
                 });
             }
             Some(response_envelope::Body::Error(error)) => return Err(error.message),
@@ -86,6 +134,98 @@ async fn health() -> Result<HealthStatus, String> {
         }
     }
     Err("daemon returned no health response".to_owned())
+}
+
+#[tauri::command]
+async fn archive_settings() -> Result<ArchiveSettings, String> {
+    let responses = request(request_envelope::Body::GetArchiveSettings(
+        GetArchiveSettingsRequest {},
+    ))
+    .await?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::ArchiveSettings(settings)) => {
+                return Ok(map_archive_settings(settings));
+            }
+            Some(response_envelope::Body::Error(error)) => return Err(error.message),
+            _ => {}
+        }
+    }
+    Err("daemon returned no archive settings".to_owned())
+}
+
+#[tauri::command]
+async fn update_archive_settings(
+    retention_days: Option<u32>,
+    disk_budget_bytes: Option<u64>,
+    excluded_applications: Vec<String>,
+    excluded_titles: Vec<String>,
+) -> Result<SettingsUpdateResult, String> {
+    let responses = request(request_envelope::Body::UpdateArchiveSettings(
+        UpdateArchiveSettingsRequest {
+            retention_days,
+            disk_budget_bytes,
+            excluded_applications,
+            excluded_titles,
+        },
+    ))
+    .await?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::UpdateArchiveSettings(result)) => {
+                let settings = result
+                    .settings
+                    .ok_or_else(|| "daemon returned empty archive settings".to_owned())?;
+                return Ok(SettingsUpdateResult {
+                    settings: map_archive_settings(settings),
+                    captures_deleted: result.captures_deleted,
+                    assets_scheduled: result.assets_scheduled,
+                });
+            }
+            Some(response_envelope::Body::Error(error)) => return Err(error.message),
+            _ => {}
+        }
+    }
+    Err("daemon returned no settings update".to_owned())
+}
+
+#[tauri::command]
+async fn delete_all_captures(confirmed: bool) -> Result<DeleteResult, String> {
+    let responses = request(request_envelope::Body::DeleteCaptures(
+        DeleteCapturesRequest {
+            capture_ids: Vec::new(),
+            before: String::new(),
+            delete_all: true,
+            confirmed,
+        },
+    ))
+    .await?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::DeleteCaptures(result)) => {
+                return Ok(DeleteResult {
+                    captures_deleted: result.captures_deleted,
+                    assets_scheduled: result.assets_scheduled,
+                });
+            }
+            Some(response_envelope::Body::Error(error)) => return Err(error.message),
+            _ => {}
+        }
+    }
+    Err("daemon returned no deletion result".to_owned())
+}
+
+fn map_archive_settings(
+    settings: screensearch_ipc::v1::ArchiveSettingsResponse,
+) -> ArchiveSettings {
+    ArchiveSettings {
+        retention_days: settings.retention_days,
+        disk_budget_bytes: settings.disk_budget_bytes,
+        excluded_applications: settings.excluded_applications,
+        excluded_titles: settings.excluded_titles,
+        capture_count: settings.capture_count,
+        asset_bytes: settings.asset_bytes,
+    }
 }
 
 #[tauri::command]
@@ -115,6 +255,7 @@ async fn capture_once() -> Result<CaptureResult, String> {
                 return Ok(CaptureResult {
                     capture_id: capture.capture_id,
                     duplicate: capture.duplicate,
+                    skipped_reason: capture.skipped_reason,
                 });
             }
             Some(response_envelope::Body::Error(error)) => return Err(error.message),
@@ -252,6 +393,9 @@ fn main() {
             process_jobs,
             capture_asset,
             set_capture_paused,
+            archive_settings,
+            update_archive_settings,
+            delete_all_captures,
             search
         ])
         .run(tauri::generate_context!())

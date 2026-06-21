@@ -79,10 +79,12 @@ Each frame includes UTC capture time, stable monitor identifier, foreground proc
 - A perceptual-change policy is required before increasing the default cadence.
 - When the durable queue reaches its configured high-water mark, capture pauses and reports `backpressured` rather than allowing unbounded growth.
 - Capture resumes automatically below the low-water mark.
+- The initial queue thresholds are 100 active jobs for high-water and 50 active jobs for low-water. They remain daemon-owned constants until versioned user settings land.
+- The first perceptual policy compares a 32 by 18 grayscale Triangle-filtered signature with the last accepted frame on the same monitor. A frame is skipped only when dimensions, foreground application, and title are unchanged, mean sample delta is at most 2/255, and at most 1 percent of samples differ by more than 12/255. Skipped frames do not move the baseline, so cumulative changes eventually persist; the first frame after restart is accepted.
 
 ### 4.3 Privacy policy
 
-Before asset persistence, reject frames when capture is paused, the session is locked, the active application or title matches an exclusion, or ScreenSearch itself is the foreground window unless diagnostics explicitly opt in. Exclusions default to case-insensitive process and title patterns and are stored locally. Password-field redaction is future work and must not be claimed before implemented.
+Before asset persistence, reject frames when capture is paused, the session is locked, the active application or title matches an exclusion, or ScreenSearch itself is the foreground window unless diagnostics explicitly opt in. ScreenSearch's own application identifier is excluded in the production composition. User-configurable exclusions are stored locally as case-insensitive process and title patterns and update the live daemon policy without a restart. Password-field redaction is future work and must not be claimed before implemented.
 
 ## 5. Assets and deduplication
 
@@ -135,6 +137,7 @@ Vector tables are dimension-specific. A migration creates a table and index for 
 - Deduplicate multiple chunks from the same capture for the first result view while preserving best-match geometry.
 - Default result limit is 20 evidence cards; generation context uses a smaller configurable top-k.
 - Exact phrase matches receive a deterministic ranking boost.
+- For the active model revision, archives with at most 50,000 embeddings use deterministic exact cosine ordering; larger archives use the libSQL vector index. Both paths preserve the same evidence contract and model-revision filter.
 
 ## 9. Evidence result contract
 
@@ -169,6 +172,8 @@ Required V2 operations:
 
 Reject oversized frames, queries, and event streams with structured errors. Disconnect must cancel downstream generation where safe.
 
+Health responses expose `capturing`, `paused`, or `backpressured` capture state plus queue depth, high-water mark, oldest pending age, retry count, and dead-letter count. Capture attempts that policy rejects return a content-free skip reason without a capture identifier.
+
 ## 11. Search and generation
 
 Search has two explicit modes:
@@ -195,10 +200,12 @@ Manual capture and queue buttons are diagnostics-only and excluded from the prod
 
 ## 13. Retention and deletion
 
-- Defaults are local-only and must be explicit during onboarding or settings review.
+- The conservative default is `Keep all` with no captured-asset disk limit. Settings must display that state explicitly until the user chooses an age or budget.
 - Support a disk budget and/or age-based retention without deleting captures needed by an active operation.
+- The disk budget counts immutable captured image assets referenced by captures; it does not claim to cap database or model-file size.
 - Deletion removes derived rows transactionally and schedules unreferenced asset cleanup.
 - `Delete all data` requires explicit confirmation, stops capture, closes active readers, removes database/assets/models according to the selected scope, and reports partial failure.
+- The currently implemented captured-history scope requires explicit confirmation, pauses capture, removes captures and derived evidence transactionally, and performs durable idempotent asset cleanup. Database/model factory reset remains a separate release-hardening scope.
 - There is no cloud backup assumption.
 
 ## 14. Automation safety
@@ -276,6 +283,7 @@ Structured logs may include operation identifiers, durations, dimensions, byte c
 - Record indexing throughput, query p50/p95/p99, database size, and peak memory.
 - Record idle and active capture CPU, queue latency, OCR latency, embedding latency, and model load/unload memory.
 - Performance claims require a named machine profile and reproducible command.
+- The accepted P1 engineering baseline is recorded in `docs/performance/P1_SCALE_BASELINE.md`; it does not replace later release-hardware soak measurements.
 
 ## 19. CI/CD and packaging
 

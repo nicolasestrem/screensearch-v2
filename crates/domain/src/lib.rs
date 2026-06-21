@@ -146,6 +146,159 @@ pub enum CaptureDisposition {
         /// Existing capture with the identical fingerprint.
         capture_id: CaptureId,
     },
+    /// The frame was intentionally rejected before asset persistence.
+    Skipped {
+        /// Policy reason that prevented persistence.
+        reason: CaptureSkipReason,
+    },
+}
+
+/// Content-free reason that a capture attempt did not persist pixels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureSkipReason {
+    /// Capture was explicitly paused by the user.
+    Paused,
+    /// The durable analysis queue is above its configured high-water mark.
+    Backpressured,
+    /// The foreground application matched an exclusion rule.
+    ExcludedApplication,
+    /// The foreground window title matched an exclusion rule.
+    ExcludedTitle,
+    /// The frame was below the deterministic perceptual-change threshold.
+    NearDuplicate,
+}
+
+impl std::fmt::Display for CaptureSkipReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Paused => "paused",
+            Self::Backpressured => "backpressured",
+            Self::ExcludedApplication => "excluded_application",
+            Self::ExcludedTitle => "excluded_title",
+            Self::NearDuplicate => "near_duplicate",
+        };
+        formatter.write_str(value)
+    }
+}
+
+/// Content-free durable analysis queue measurements.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueueMetrics {
+    /// Jobs waiting for a lease.
+    pub pending: u64,
+    /// Jobs currently holding a lease.
+    pub running: u64,
+    /// Total failed attempts recorded on live and dead jobs.
+    pub retry_count: u64,
+    /// Jobs that exhausted their retry budget.
+    pub dead_letter_count: u64,
+    /// Age of the oldest pending job, rounded down to seconds.
+    pub oldest_pending_age_seconds: u64,
+}
+
+/// Versioned, user-controlled archive policy stored by the daemon.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveSettings {
+    /// Delete eligible captures older than this many days; `None` keeps captures by age.
+    pub retention_days: Option<u32>,
+    /// Maximum bytes used by immutable capture assets; `None` disables the asset budget.
+    pub disk_budget_bytes: Option<u64>,
+    /// Case-insensitive application substrings excluded before asset persistence.
+    pub excluded_applications: Vec<String>,
+    /// Case-insensitive window-title substrings excluded before asset persistence.
+    pub excluded_titles: Vec<String>,
+}
+
+impl ArchiveSettings {
+    /// Validates bounded settings before they cross persistence or IPC boundaries.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self
+            .retention_days
+            .is_some_and(|days| days == 0 || days > 3_650)
+        {
+            return Err(DomainError::InvalidSettings(
+                "retention days must be between 1 and 3650".to_owned(),
+            ));
+        }
+        if self
+            .disk_budget_bytes
+            .is_some_and(|bytes| bytes < 256 * 1024 * 1024)
+        {
+            return Err(DomainError::InvalidSettings(
+                "disk budget must be at least 256 MiB".to_owned(),
+            ));
+        }
+        if self.excluded_applications.len() > 100 || self.excluded_titles.len() > 100 {
+            return Err(DomainError::InvalidSettings(
+                "at most 100 application and 100 title exclusions are allowed".to_owned(),
+            ));
+        }
+        for pattern in self
+            .excluded_applications
+            .iter()
+            .chain(&self.excluded_titles)
+        {
+            let length = pattern.trim().chars().count();
+            if length == 0 || length > 128 {
+                return Err(DomainError::InvalidSettings(
+                    "exclusion patterns must contain 1 to 128 characters".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Content-free archive storage measurements.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StorageMetrics {
+    /// Persisted captures.
+    pub capture_count: u64,
+    /// Immutable assets referenced by at least one capture.
+    pub asset_count: u64,
+    /// Encoded bytes occupied by referenced capture assets.
+    pub asset_bytes: u64,
+    /// OCR blocks available for evidence highlighting.
+    pub ocr_block_count: u64,
+    /// Search chunks indexed lexically and semantically.
+    pub search_chunk_count: u64,
+}
+
+/// Explicit deletion selector accepted by the archive boundary.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DeleteCaptures {
+    /// Specific capture identifiers to remove.
+    pub capture_ids: Vec<CaptureId>,
+    /// Remove captures strictly older than this timestamp.
+    pub before: Option<DateTime<Utc>>,
+    /// Remove every capture that is not currently leased for analysis.
+    pub delete_all: bool,
+}
+
+/// Result of retention or explicit deletion.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeletionSummary {
+    /// Capture rows removed transactionally with their derived data.
+    pub captures_deleted: u64,
+    /// Newly unreferenced assets placed on the durable cleanup queue.
+    pub assets_scheduled: u64,
+}
+
+/// One durable, unreferenced asset cleanup task.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetCleanupTask {
+    /// Content-addressed asset to remove idempotently.
+    pub asset: AssetRef,
+    /// Number of prior failed cleanup attempts.
+    pub attempt: u32,
+}
+
+impl QueueMetrics {
+    /// Work that is either waiting or currently being processed.
+    pub fn depth(self) -> u64 {
+        self.pending.saturating_add(self.running)
+    }
 }
 
 /// A leased background analysis job.
@@ -306,11 +459,14 @@ pub enum DomainError {
     /// A request that requires text received only whitespace.
     #[error("text must not be empty")]
     EmptyText,
+    /// Archive settings exceeded a documented bound.
+    #[error("invalid archive settings: {0}")]
+    InvalidSettings(String),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::BoundingBox;
+    use super::{ArchiveSettings, BoundingBox};
 
     #[test]
     fn bounding_box_rejects_coordinates_outside_capture() {
@@ -322,5 +478,25 @@ mod tests {
         };
 
         assert!(bounds.validate().is_err());
+    }
+
+    #[test]
+    fn archive_settings_reject_unbounded_or_empty_values() {
+        assert!(
+            ArchiveSettings {
+                retention_days: Some(0),
+                ..ArchiveSettings::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ArchiveSettings {
+                excluded_titles: vec![String::new()],
+                ..ArchiveSettings::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

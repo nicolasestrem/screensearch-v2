@@ -14,16 +14,16 @@ Items are ordered. An agent may continue independent work around a blocked item 
 6. [x] Extend persistence and IPC with screenshot evidence, asset authorization, metadata, provenance, and OCR bounds.
 7. [x] Add evidence-only search and render real screenshots/results in the diagnostics surface.
 8. [x] Add quantized MiniLM ONNX embeddings and activate its 384-dimensional revision.
-9. [ ] Add queue high/low-water backpressure, perceptual deduplication, and capture pause/exclusion policy.
-10. [ ] Benchmark hybrid ranking, exact-match boost, model isolation, latency, CPU, memory, and disk growth.
-11. [ ] Implement exclusions, queue status, retention, deletion, and disk-budget policies; pause/resume is complete.
+9. [x] Add queue high/low-water backpressure, conservative perceptual deduplication, single-flight capture, and pre-persistence pause/self-exclusion policy.
+10. [x] Benchmark hybrid ranking, exact-match boost, model-revision isolation, latency, CPU, memory, database size, and ten-million-row metadata growth on the named P1 reference machine.
+11. [x] Implement persisted user-configurable exclusions, age retention, captured-asset disk budgets, storage metrics, transactional capture deletion, and durable unreferenced-asset cleanup.
 12. [x] Generate exactly three grounded visual directions and obtain product-owner selection of Memory Timeline.
 13. [x] Record the selected visual target and binding decisions in `docs/design`.
 14. [ ] Add tray lifecycle, a system-wide hotkey, and complete keyboard navigation; the selected search/timeline/evidence/settings interface is implemented and has passed visual QA.
 15. [ ] Select/install a GGUF model and validate the implemented llama.cpp provider, citations, cancellation, and memory lifecycle.
 16. [ ] Move OCR, embedding, and generation execution behind the supervised model-worker boundary.
 17. [ ] Implement typed Windows automation emission behind existing approval/focus/abort gates, or keep the feature disabled if safety requirements cannot be proven.
-18. [ ] Run recovery, crash, saturation, restart, 10-million-row, Windows end-to-end, security, packaging, and visual QA verification.
+18. [ ] Complete locked-session privacy handling plus remaining recovery, worker-crash, Windows end-to-end, security, packaging, and release-hardware soak verification; saturation, 10-million-row metadata scale, live evidence latency, and settings visual QA are complete.
 19. [ ] Replace this plan with only genuine remaining gaps and prepare a release review.
 
 ## Definition for closing an item

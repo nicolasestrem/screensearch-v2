@@ -11,6 +11,9 @@ message RequestEnvelope {
     SearchRequest search = 13;
     GetCaptureAssetRequest get_capture_asset = 14;
     SetCapturePausedRequest set_capture_paused = 15;
+    GetArchiveSettingsRequest get_archive_settings = 16;
+    UpdateArchiveSettingsRequest update_archive_settings = 17;
+    DeleteCapturesRequest delete_captures = 18;
   }
 }
 
@@ -25,6 +28,9 @@ message ResponseEnvelope {
     ErrorResponse error = 14;
     CaptureAssetResponse capture_asset = 15;
     SetCapturePausedResponse set_capture_paused = 16;
+    ArchiveSettingsResponse archive_settings = 17;
+    UpdateArchiveSettingsResponse update_archive_settings = 18;
+    DeleteCapturesResponse delete_captures = 19;
   }
 }
 
@@ -34,6 +40,16 @@ message HealthResponse {
   string version = 1;
   string status = 2;
   bool capture_paused = 3;
+  string capture_state = 4;
+  uint64 queue_depth = 5;
+  uint64 oldest_pending_age_seconds = 6;
+  uint64 retry_count = 7;
+  uint64 dead_letter_count = 8;
+  uint64 queue_high_water = 9;
+  uint64 capture_count = 10;
+  uint64 asset_bytes = 11;
+  uint64 ocr_block_count = 12;
+  uint64 search_chunk_count = 13;
 }
 
 message SetCapturePausedRequest {
@@ -44,11 +60,48 @@ message SetCapturePausedResponse {
   bool paused = 1;
 }
 
+message GetArchiveSettingsRequest {}
+
+message ArchiveSettingsResponse {
+  optional uint32 retention_days = 1;
+  optional uint64 disk_budget_bytes = 2;
+  repeated string excluded_applications = 3;
+  repeated string excluded_titles = 4;
+  uint64 capture_count = 5;
+  uint64 asset_bytes = 6;
+}
+
+message UpdateArchiveSettingsRequest {
+  optional uint32 retention_days = 1;
+  optional uint64 disk_budget_bytes = 2;
+  repeated string excluded_applications = 3;
+  repeated string excluded_titles = 4;
+}
+
+message UpdateArchiveSettingsResponse {
+  ArchiveSettingsResponse settings = 1;
+  uint64 captures_deleted = 2;
+  uint64 assets_scheduled = 3;
+}
+
+message DeleteCapturesRequest {
+  repeated string capture_ids = 1;
+  string before = 2;
+  bool delete_all = 3;
+  bool confirmed = 4;
+}
+
+message DeleteCapturesResponse {
+  uint64 captures_deleted = 1;
+  uint64 assets_scheduled = 2;
+}
+
 message CaptureRequest {}
 
 message CaptureResponse {
   string capture_id = 1;
   bool duplicate = 2;
+  string skipped_reason = 3;
 }
 
 message ProcessJobsRequest {
