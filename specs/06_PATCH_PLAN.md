@@ -26,6 +26,10 @@ Items are ordered. An agent may continue independent work around a blocked item 
 18. [ ] Complete locked-session privacy handling plus remaining recovery, worker-crash, Windows end-to-end, security, packaging, and release-hardware soak verification; saturation, 10-million-row metadata scale, live evidence latency, and settings visual QA are complete.
 19. [ ] Replace this plan with only genuine remaining gaps and prepare a release review.
 
+## Notes
+
+- 2026-06-21 P0/P1 review: items 1–13 remain closed. A review pass added explicit analysis failure-path tests (retry backoff, dead-letter promotion at `MAX_JOB_ATTEMPTS`, embedding-dimension rejection at the persistence and `process_one` layers) so items 4 and 8 now meet the success-and-failure test bar below. No item was reopened; no production code changed.
+
 ## Definition for closing an item
 
 An item is closed only when its production path is composed, tests cover success and failure behavior, user-visible claims are truthful, and the build review/changelog are updated. A placeholder, fake, unreachable adapter, or compile-only implementation does not close an item.

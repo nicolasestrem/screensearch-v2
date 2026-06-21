@@ -138,3 +138,37 @@ P1 requires semantic recall to remain truthful under growth. Revision consistenc
 ### Remaining boundary
 
 P2 begins with tray lifecycle, the configurable system-wide hotkey, and complete keyboard navigation. Release hardening still includes locked-session detection, model-worker isolation, long-duration capture resource soak, factory-reset scope, named-pipe ACLs, signing, security checks, and packaging.
+
+## 2026-06-21 — P0/P1 review and analysis failure-path test coverage
+
+### Changed
+
+- Audited the P0 evidence loop and P1 semantic-retrieval/scale phases against the patch-plan closing definition; confirmed real adapters are composed in production and no fake provider is reachable on the production path.
+- Added four deterministic tests in `crates/persistence/src/lib.rs` covering analysis-pipeline failure behavior that was implemented but previously unexercised:
+  - `fail_job_reschedules_with_backoff_and_defers_claim` — a failed job returns to `pending` with an incremented attempt and a deferred `next_run_at`, and is not immediately re-claimable.
+  - `fail_job_dead_letters_after_max_attempts` — reaching `MAX_JOB_ATTEMPTS` promotes the job to `dead`, records a `dead_letter` row, and surfaces it through `queue_metrics().dead_letter_count`.
+  - `complete_analysis_rejects_wrong_embedding_dimension` — a non-384-dimension embedding is rejected with `InvalidData` and the transaction rolls back, leaving the job claimable.
+  - `process_one_fails_job_on_embedding_dimension_mismatch` — `AnalysisService::process_one` routes a dimension-mismatch error through `fail_job` (reschedule, not dead-letter) and propagates the error.
+
+### Why
+
+The two phases were substantively complete and truthful, but the analysis retry/dead-letter and dimension-rejection paths had no tests, so they did not meet the patch-plan bar that a closed item's tests cover both success and failure behavior. These tests close that gap without changing production code.
+
+### Decisions made
+
+- Placed the `AnalysisService::process_one` failure test in the persistence test module, which already dev-depends on `screensearch-application` and `screensearch-model-runtime`, rather than adding `application → persistence` as a dev-dependency (which would form a dev-dependency cycle). No production dependency direction changed.
+
+### Verification evidence
+
+- `cargo test -p screensearch-persistence` — 9 passed, 0 failed (5 prior + 4 new; scale and live-archive tests remain ignored).
+- `cargo test --workspace` — all suites passed.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo fmt --check` — clean.
+
+### Not changed
+
+- No production code, schema, IPC contract, dependency, or generated artifact changed. The change is test-only plus documentation.
+
+### Remaining boundary
+
+Unchanged from the prior P1 entry: P2 product-shell lifecycle and keyboard work, model-worker isolation, GGUF model selection, security/packaging, and release-hardware soak remain open.
