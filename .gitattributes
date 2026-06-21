@@ -1,0 +1,31 @@
+# Deterministic line endings.
+#
+# The repo previously had no .gitattributes, so files were normalized per each
+# machine's `core.autocrlf`. That produced phantom "modified" diffs (LF vs CRLF
+# with no content change) whenever a tool wrote a different line ending than Git
+# expected. Git always stores LF in the blob; the working-tree endings below are
+# explicit so they no longer depend on local config.
+
+# Default: auto-detect text, store as LF, and check out as LF on every platform.
+# (Binary files are auto-detected and left untouched; explicit types are below.)
+* text=auto eol=lf
+
+# These must check out as CRLF:
+#   - Rust, to satisfy rustfmt's `newline_style = "Windows"` (otherwise
+#     `cargo fmt --check` fails on LF input);
+#   - Windows batch scripts, which can misbehave with LF line endings.
+*.rs  text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Explicit binary types — never normalized or line-ending converted.
+*.ico  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.gguf binary
+*.onnx binary
+*.db   binary
+*.bin  binary
