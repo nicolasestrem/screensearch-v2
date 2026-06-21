@@ -10,10 +10,13 @@
 # (Binary files are auto-detected and left untouched; explicit types are below.)
 * text=auto eol=lf
 
-# Rust sources must check out as CRLF to satisfy rustfmt
-# (`newline_style = "Windows"` in rustfmt.toml); otherwise `cargo fmt --check`
-# fails on LF input.
-*.rs text eol=crlf
+# These must check out as CRLF:
+#   - Rust, to satisfy rustfmt's `newline_style = "Windows"` (otherwise
+#     `cargo fmt --check` fails on LF input);
+#   - Windows batch scripts, which can misbehave with LF line endings.
+*.rs  text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
 
 # Explicit binary types — never normalized or line-ending converted.
 *.ico  binary
