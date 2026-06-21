@@ -229,6 +229,13 @@ Patch-plan item 14 stays **open**: the native tray, global hotkey, and hide-to-t
 - `npm run lint` and `npm run build` (`apps/desktop`) — clean.
 - Browser QA: the Search button is a form submit, disabled on empty query and enabled when filled; the preview UI renders with zero console warnings/errors.
 
+### Hardening (PR #4 automated review)
+
+- **Hotkey persistence ordering** (`set_shell_settings`): register the new shortcut first and persist only on success, so a hotkey the OS rejects is never written to the settings file and cannot leave the next launch without a working summon shortcut.
+- **Scoped shortcut replacement** (`apply_shortcut`): track the active shortcut in managed state and unregister only the previous binding (instead of `unregister_all`), restoring it if the new `register` call fails — a rejected hotkey no longer wipes the shortcut with no recovery.
+- **Tray pause race** (`toggle_pause`): derive the target by atomically flipping a known-state `AtomicBool` (reconciled by the health poll) rather than reading-then-inverting, so two rapid clicks issue opposite requests instead of racing on a stale read; the optimistic flip rolls back if the request fails.
+- **Summon-listener leak** (`App.tsx`): guard the `listen("summon-search")` effect with an `active` flag and dispose immediately if the component unmounts before the promise resolves, preventing a dangling Tauri event listener.
+
 ### Remaining boundary
 
 Unchanged: patch-plan item 14 stays open pending the manual Windows tray/hotkey runtime check (spec §18). The pause/resume notification is best confirmed in a packaged build.

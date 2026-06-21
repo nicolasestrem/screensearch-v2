@@ -157,14 +157,20 @@ export function App() {
 
   useEffect(() => {
     if (!isTauri) return;
+    let active = true;
     let unlisten: (() => void) | undefined;
     void listen("summon-search", () => {
       searchInput.current?.focus();
       searchInput.current?.select();
     }).then((dispose) => {
-      unlisten = dispose;
+      // If the effect was already cleaned up before listen() resolved, dispose immediately.
+      if (active) unlisten = dispose;
+      else dispose();
     });
-    return () => unlisten?.();
+    return () => {
+      active = false;
+      unlisten?.();
+    };
   }, []);
 
   useEffect(() => {

@@ -2,7 +2,13 @@
 
 mod shell_settings;
 
-use std::time::Duration;
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use screensearch_ipc::{
     IpcError,
@@ -165,10 +171,10 @@ fn get_shell_settings(app: AppHandle) -> shell_settings::ShellSettings {
     shell_settings::load(&app)
 }
 
-/// Validates and persists the summon hotkey, then re-registers the global shortcut live.
+/// Registers the new summon hotkey live, then persists it on success.
 ///
-/// The accelerator is parsed before anything is written so an invalid combination cannot brick
-/// the next launch.
+/// The accelerator is parsed and re-registered before anything is written, so a rejected
+/// combination is never saved and cannot leave the next launch without a working shortcut.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 fn set_shell_settings(
@@ -178,9 +184,11 @@ fn set_shell_settings(
     let shortcut = hotkey
         .parse::<Shortcut>()
         .map_err(|error| format!("invalid hotkey: {error}"))?;
+    // Register the shortcut first; only persist a hotkey the OS actually accepted, so a rejected
+    // combination never leaves a dead hotkey in the settings file for the next launch.
+    apply_shortcut(&app, shortcut)?;
     let settings = shell_settings::ShellSettings { hotkey };
     shell_settings::save(&app, &settings).map_err(|error| error.to_string())?;
-    apply_shortcut(&app, &shortcut)?;
     Ok(settings)
 }
 
@@ -438,7 +446,13 @@ struct TrayHandles {
     icon: TrayIcon<Wry>,
     status_item: MenuItem<Wry>,
     pause_item: MenuItem<Wry>,
+    /// Last known daemon pause state; the tray toggle flips this optimistically to avoid a
+    /// read-then-write race on rapid clicks.
+    paused: AtomicBool,
 }
+
+/// The currently registered global summon shortcut, so a change unregisters only the old binding.
+struct ActiveShortcut(Mutex<Option<Shortcut>>);
 
 /// Brings the main window to the foreground (used by the tray, hotkey, and menu).
 fn summon_main_window(app: &AppHandle) {
@@ -449,23 +463,48 @@ fn summon_main_window(app: &AppHandle) {
     }
 }
 
-/// Registers the global summon shortcut, clearing any previous binding first.
-fn apply_shortcut(app: &AppHandle, shortcut: &Shortcut) -> Result<(), String> {
+/// Registers the global summon shortcut, replacing only the previously registered binding.
+///
+/// On failure the previous binding is restored, so a rejected hotkey never leaves the user with
+/// no working summon shortcut.
+fn apply_shortcut(app: &AppHandle, shortcut: Shortcut) -> Result<(), String> {
     let manager = app.global_shortcut();
-    let _ = manager.unregister_all();
-    manager
-        .register(*shortcut)
-        .map_err(|error| error.to_string())
+    let Some(state) = app.try_state::<ActiveShortcut>() else {
+        return manager
+            .register(shortcut)
+            .map_err(|error| error.to_string());
+    };
+    let mut active = state.0.lock().expect("active shortcut lock poisoned");
+    if let Some(previous) = *active {
+        let _ = manager.unregister(previous);
+    }
+    match manager.register(shortcut) {
+        Ok(()) => {
+            *active = Some(shortcut);
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(previous) = *active {
+                let _ = manager.register(previous);
+            }
+            Err(error.to_string())
+        }
+    }
 }
 
 /// Flips the daemon capture-pause state from the tray menu, then notifies and refreshes the tray.
+///
+/// The target state is derived by atomically flipping the last known state rather than reading it
+/// first, so two rapid clicks issue opposite requests instead of racing on a stale read.
 fn toggle_pause(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let Ok(status) = fetch_health().await else {
-            return;
+        let target = {
+            let Some(handles) = app.try_state::<TrayHandles>() else {
+                return;
+            };
+            !handles.paused.fetch_xor(true, Ordering::SeqCst)
         };
-        let target = !status.capture_paused;
         if request(request_envelope::Body::SetCapturePaused(
             SetCapturePausedRequest { paused: target },
         ))
@@ -474,6 +513,9 @@ fn toggle_pause(app: &AppHandle) {
         {
             notify_capture_state(&app, target);
             refresh_tray(&app).await;
+        } else if let Some(handles) = app.try_state::<TrayHandles>() {
+            // Roll back the optimistic flip if the daemon never applied it.
+            handles.paused.store(!target, Ordering::SeqCst);
         }
     });
 }
@@ -493,7 +535,8 @@ fn notify_capture_state(app: &AppHandle, paused: bool) {
 
 /// Reflects current daemon capture state in the tray tooltip, status line, and pause label.
 async fn refresh_tray(app: &AppHandle) {
-    let (status_line, pause_label) = match fetch_health().await {
+    let result = fetch_health().await;
+    let (status_line, pause_label) = match &result {
         Ok(status) => {
             let state = match status.capture_state.as_str() {
                 "paused" => "Paused",
@@ -514,6 +557,11 @@ async fn refresh_tray(app: &AppHandle) {
         let _ = handles.icon.set_tooltip(Some(tooltip.as_str()));
         let _ = handles.status_item.set_text(&status_line);
         let _ = handles.pause_item.set_text(pause_label);
+        if let Ok(status) = &result {
+            handles
+                .paused
+                .store(status.capture_paused, Ordering::SeqCst);
+        }
     }
 }
 
@@ -579,11 +627,13 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
         icon: tray,
         status_item,
         pause_item,
+        paused: AtomicBool::new(false),
     });
+    app.manage(ActiveShortcut(Mutex::new(None)));
 
     let settings = shell_settings::load(&handle);
     if let Ok(shortcut) = settings.hotkey.parse::<Shortcut>() {
-        let _ = apply_shortcut(&handle, &shortcut);
+        let _ = apply_shortcut(&handle, shortcut);
     }
 
     spawn_health_poll(handle);
