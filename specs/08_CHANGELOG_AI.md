@@ -172,3 +172,70 @@ The two phases were substantively complete and truthful, but the analysis retry/
 ### Remaining boundary
 
 Unchanged from the prior P1 entry: P2 product-shell lifecycle and keyboard work, model-worker isolation, GGUF model selection, security/packaging, and release-hardware soak remain open.
+
+## 2026-06-21 — P2 product shell: tray, global hotkey, keyboard navigation
+
+### Changed
+
+- Added a system tray to the Tauri shell (`apps/desktop/src-tauri/src/main.rs`): an icon with a tooltip and a disabled status line that show at-a-glance capture state, plus **Open ScreenSearch**, **Pause/Resume capture**, and **Quit** items. A `tauri::async_runtime` background task polls daemon health every three seconds and updates the tooltip, status line, and pause/resume label; it reads `Daemon offline` when the daemon is unreachable.
+- Made the window **hide to the tray** on close (`WindowEvent::CloseRequested` → `prevent_close` + `hide`); only tray **Quit** exits the shell, and the separate capture daemon is unaffected.
+- Added a configurable system-wide summon hotkey (default `Ctrl+Shift+Space`) using `tauri-plugin-global-shortcut`, registered from Rust. Pressing it foregrounds and focuses the window and emits a `summon-search` event the UI listens for to focus and select the search field.
+- Added a shell-local settings file (`apps/desktop/src-tauri/src/shell_settings.rs`): `ShellSettings { hotkey }` persisted atomically as JSON under the Tauri app-config directory, with `get_shell_settings`/`set_shell_settings` commands. `set_shell_settings` validates the accelerator before persisting and re-registers the shortcut live.
+- Implemented complete keyboard navigation in the Memory Timeline UI (`apps/desktop/src/App.tsx`, `styles.css`): Arrow Up/Down/Home/End move the selected result (roving tab index, focus + scroll into view, guarded against firing while typing); ARIA tablist Arrow Left/Right/Home/End for the evidence detail tabs; a focus trap, first-control focus, Escape-to-close, and focus restoration for dialogs; a `:focus-visible` ring; and a hotkey-capture control in Settings that records combinations in Tauri's accelerator vocabulary. Ctrl+K continues to focus (and now selects) the search field.
+- Added the `tray-icon` feature to `tauri`, plus `tauri-plugin-global-shortcut`, `serde_json`, and `tokio` to the desktop crate. Added `getShellSettings`/`setShellSettings` and a `summon-search` listener to `apps/desktop/src/api.ts`.
+- Documented the slice comprehensively in `docs/design/p2-shell.md` (architecture, keyboard model, accelerator vocabulary, shell-local settings, and a step-by-step manual Windows verification runbook/checklist), linked from `docs/design/README.md` and referenced from the build review and patch plan.
+
+### Fixed (UI resilience, surfaced during manual Windows testing)
+
+- Hardened the timeline date helpers (`formatTime`/`formatDateTime`/`dayLabel` and the date filter) with a shared `safeDate` that returns a fallback for any unparseable timestamp instead of throwing `RangeError: Invalid time value` from `Intl.DateTimeFormat`. Previously a single malformed/edge `capturedAt` could crash `TimelineItem` and, with no boundary, blank the entire window. `safeDate` logs the offending raw value once (`console.warn`) for diagnosis.
+- Added a React error boundary (`apps/desktop/src/ErrorBoundary.tsx`, wired in `main.tsx`) around the app so any unexpected render error shows a recoverable message instead of a blank window. (Error boundaries must be class components — the one intentional exception to the functional-component convention.)
+- Confirmed against the live archive that real citation data is well-formed (valid RFC3339 millisecond timestamps and UUID chunk ids), so these are defense-in-depth guarantees, not a workaround for a data defect.
+
+### Why
+
+P2 turns the verified evidence/retrieval engine into a native-feeling utility: it should live in the tray, be summonable from anywhere, and be fully drivable by keyboard. The hotkey is a pure shell concern, so it is stored shell-locally rather than in the daemon archive, preserving the rule that the desktop shell never owns durable indexing state.
+
+### Decisions made
+
+- Default summon hotkey `Ctrl+Shift+Space` and **hide-to-tray** on window close were confirmed by the product owner; both are user-visible and the spec was otherwise silent.
+- The global shortcut is registered from Rust (not the plugin's JS API), so no new capability/permission entries were required; custom commands and tray/window control already run under the granted `core:default`.
+
+### Verification evidence
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — all suites passed (the desktop binary compiles the tray/hotkey setup; `cargo test` does not launch the GUI).
+- `npm run lint` and `npm run build` (`apps/desktop`) — clean.
+- Browser keyboard-navigation QA against the dev server confirmed: arrow/Home/End selection with focus and detail-pane sync; the typing guard (Arrow keys ignored while the search field is focused); tablist arrow navigation; dialog focus trap (Tab wraps within the dialog); Escape closes the dialog and restores focus to the opener; the hotkey-capture control records `Ctrl+Shift+J` → `Ctrl Shift J`; and Ctrl+K focuses and selects the search field.
+
+### Remaining boundary
+
+Patch-plan item 14 stays **open**: the native tray, global hotkey, and hide-to-tray runtime still require a manual Windows `npm run tauri dev` session against a running daemon to satisfy the spec §18 "Verify tray pause/resume and global hotkey" check; `cargo test` only compiles the shell. Model-worker isolation, GGUF model selection, security/packaging, and release-hardware soak remain open.
+
+## 2026-06-21 — P2 shell follow-ups from live Windows testing
+
+### Fixed
+
+- **Search citations rendered with `undefined` fields in the real shell** (timestamps, images, selection, and React keys all broken; one bad timestamp previously blanked the window). Root cause: `SearchUiEvent` in `apps/desktop/src-tauri/src/main.rs` used `#[serde(tag = "kind", rename_all = "camelCase")]`, but on a tagged enum `rename_all` renames only the variant tags, not the struct-variant fields — so real citations serialized with snake_case keys (`captured_at`, `chunk_id`, `capture_id`, `window_title`, `match_kind`, `ocr_model_id`, `embedding_model_id`) while the UI reads camelCase. Single-word fields (`application`, `score`, `excerpt`) matched, so it half-rendered; preview data (hand-written camelCase) hid it entirely. Fixed by adding `rename_all_fields = "camelCase"`, and locked with two `serde_json` contract tests asserting the citation/completed events emit camelCase keys and never snake_case. The instrumentation added in the prior entry (`safeDate` logging) surfaced the exact `undefined` value that pinpointed this.
+
+### Added
+
+- A visible **Search** submit button in the command bar next to the `Ctrl K` hint (`apps/desktop/src/App.tsx`, `styles.css`); Enter already submitted the form, but the click affordance was missing and Ctrl+K (focus) is not a discoverable submit on Windows. The button is `type="submit"`, disabled when the query is empty or a search is in flight.
+- **Native notifications on capture pause/resume** plus an immediate tray refresh, so toggling capture from the tray gives feedback even when the window is hidden (`tauri-plugin-notification`, `notification:default` capability, `notify_capture_state`/`refresh_tray` in `main.rs`). The tray tooltip/status now update instantly on toggle rather than only on the 3-second poll. Windows toast notifications require a registered application id, so they appear reliably in packaged builds and may be suppressed in `tauri dev`; the tray tooltip/menu remain the dev-mode at-a-glance signal.
+
+### Verification evidence
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` — all clean/green, including the two new `screensearch-desktop` serialization tests.
+- `npm run lint` and `npm run build` (`apps/desktop`) — clean.
+- Browser QA: the Search button is a form submit, disabled on empty query and enabled when filled; the preview UI renders with zero console warnings/errors.
+
+### Hardening (PR #4 automated review)
+
+- **Hotkey persistence ordering** (`set_shell_settings`): register the new shortcut first and persist only on success, so a hotkey the OS rejects is never written to the settings file and cannot leave the next launch without a working summon shortcut.
+- **Scoped shortcut replacement** (`apply_shortcut`): track the active shortcut in managed state and unregister only the previous binding (instead of `unregister_all`), restoring it if the new `register` call fails — a rejected hotkey no longer wipes the shortcut with no recovery.
+- **Tray pause race** (`toggle_pause`): derive the target by atomically flipping a known-state `AtomicBool` (reconciled by the health poll) rather than reading-then-inverting, so two rapid clicks issue opposite requests instead of racing on a stale read; the optimistic flip rolls back if the request fails.
+- **Summon-listener leak** (`App.tsx`): guard the `listen("summon-search")` effect with an `active` flag and dispose immediately if the component unmounts before the promise resolves, preventing a dangling Tauri event listener.
+
+### Remaining boundary
+
+Unchanged: patch-plan item 14 stays open pending the manual Windows tray/hotkey runtime check (spec §18). The pause/resume notification is best confirmed in a packaged build.

@@ -23,7 +23,15 @@ import {
   Sparkle,
   X,
 } from "@phosphor-icons/react";
-import { api, type ArchiveSettings, type SearchEvent } from "./api";
+import { listen } from "@tauri-apps/api/event";
+import {
+  api,
+  DEFAULT_HOTKEY,
+  isTauri,
+  type ArchiveSettings,
+  type SearchEvent,
+  type ShellSettings,
+} from "./api";
 
 type Citation = Extract<SearchEvent, { kind: "citation" }>;
 type DetailTab = "text" | "metadata" | "source";
@@ -39,6 +47,8 @@ export function App() {
   const queryClient = useQueryClient();
   const searchInput = useRef<HTMLInputElement>(null);
   const initialSearch = useRef(false);
+  const itemRefs = useRef(new Map<string, HTMLButtonElement>());
+  const lastFocus = useRef<HTMLElement | null>(null);
   const [referenceTime] = useState(Date.now);
   const [query, setQuery] = useState("What was visible on screen?");
   const [events, setEvents] = useState<SearchEvent[]>([]);
@@ -91,7 +101,9 @@ export function App() {
     () => citations.filter((citation) => {
       if (applicationFilter !== "all" && citation.application !== applicationFilter) return false;
       if (dateFilter === "any") return true;
-      const age = referenceTime - new Date(citation.capturedAt).getTime();
+      const captured = safeDate(citation.capturedAt);
+      if (!captured) return true;
+      const age = referenceTime - captured.getTime();
       const day = 86_400_000;
       if (dateFilter === "today") return age < day;
       if (dateFilter === "week") return age < day * 7;
@@ -104,14 +116,61 @@ export function App() {
     ?? filteredCitations[0];
 
   useEffect(() => {
-    function focusSearch(event: KeyboardEvent) {
+    function onKeyDown(event: KeyboardEvent) {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         searchInput.current?.focus();
+        searchInput.current?.select();
+        return;
       }
+      if (event.key === "Escape") {
+        if (modal) {
+          event.preventDefault();
+          setModal(null);
+          lastFocus.current?.focus();
+        } else if (document.activeElement === searchInput.current) {
+          searchInput.current?.blur();
+        }
+        return;
+      }
+      if (modal || isTypingTarget(event.target)) return;
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp"
+        && event.key !== "Home" && event.key !== "End") return;
+      if (!filteredCitations.length) return;
+      event.preventDefault();
+      const index = filteredCitations.findIndex((citation) => citation.chunkId === selectedId);
+      const last = filteredCitations.length - 1;
+      let next: number;
+      if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = last;
+      else if (index < 0) next = 0;
+      else if (event.key === "ArrowDown") next = Math.min(last, index + 1);
+      else next = Math.max(0, index - 1);
+      const target = filteredCitations[next];
+      setSelectedId(target.chunkId);
+      setDetailTab("text");
+      itemRefs.current.get(target.chunkId)?.focus();
     }
-    window.addEventListener("keydown", focusSearch);
-    return () => window.removeEventListener("keydown", focusSearch);
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [filteredCitations, selectedId, modal]);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void listen("summon-search", () => {
+      searchInput.current?.focus();
+      searchInput.current?.select();
+    }).then((dispose) => {
+      // If the effect was already cleaned up before listen() resolved, dispose immediately.
+      if (active) unlisten = dispose;
+      else dispose();
+    });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -124,6 +183,16 @@ export function App() {
   function submit(event: FormEvent) {
     event.preventDefault();
     if (query.trim()) search.mutate({ value: query.trim(), generateAnswer: false });
+  }
+
+  function openModal(name: Exclude<ModalName, null>) {
+    lastFocus.current = document.activeElement as HTMLElement | null;
+    setModal(name);
+  }
+
+  function closeModal() {
+    setModal(null);
+    lastFocus.current?.focus();
   }
 
   const paused = health.data?.capturePaused ?? false;
@@ -147,7 +216,12 @@ export function App() {
             onChange={(event) => setQuery(event.target.value)}
             placeholder="Search your screen memory…"
           />
-          <kbd>Ctrl K</kbd>
+          <div className="search-actions">
+            <kbd>Ctrl K</kbd>
+            <button type="submit" className="search-submit" disabled={!query.trim() || search.isPending}>
+              {search.isPending ? "Searching…" : "Search"}
+            </button>
+          </div>
         </form>
         <div className="top-actions">
           <button
@@ -162,7 +236,7 @@ export function App() {
           <span className={`capture-state ${paused || backpressured ? "is-paused" : ""}`}>
             <i /> {paused ? "Paused" : backpressured ? "Catching up" : "Capturing"}
           </span>
-          <IconButton label="Settings" onClick={() => setModal("settings")}><Gear /></IconButton>
+          <IconButton label="Settings" onClick={() => openModal("settings")}><Gear /></IconButton>
         </div>
       </header>
 
@@ -172,7 +246,7 @@ export function App() {
           <IconButton label="Recent evidence" onClick={() => document.querySelector(".timeline-pane")?.scrollTo({ top: 0, behavior: "smooth" })}><ClockCounterClockwise /></IconButton>
           <IconButton label="Visual evidence" onClick={() => selected && setSelectedId(selected.chunkId)}><ImageSquare /></IconButton>
           <span className="rail-spacer" />
-          <IconButton label="Privacy and exclusions" onClick={() => setModal("privacy")}><ShieldCheck /></IconButton>
+          <IconButton label="Privacy and exclusions" onClick={() => openModal("privacy")}><ShieldCheck /></IconButton>
         </nav>
 
         <section className="product-surface">
@@ -187,7 +261,7 @@ export function App() {
               <option value="all">All applications</option>
               {applications.map((application) => <option key={application}>{application}</option>)}
             </SelectControl>
-            <button className="filter-button" type="button" onClick={() => setModal("privacy")}>
+            <button className="filter-button" type="button" onClick={() => openModal("privacy")}>
               <ShieldCheck /> Privacy & exclusions <CaretDown />
             </button>
             <span className="result-count">
@@ -205,6 +279,10 @@ export function App() {
                       key={citation.chunkId}
                       citation={citation}
                       selected={citation.chunkId === selected?.chunkId}
+                      itemRef={(node) => {
+                        if (node) itemRefs.current.set(citation.chunkId, node);
+                        else itemRefs.current.delete(citation.chunkId);
+                      }}
                       onSelect={() => {
                         setSelectedId(citation.chunkId);
                         setDetailTab("text");
@@ -265,7 +343,7 @@ export function App() {
         </div>
       )}
       {error && <div className="error-toast" role="alert">{String(error)}</div>}
-      {modal && <SettingsModal name={modal} paused={paused} onClose={() => setModal(null)} onCapture={() => capture.mutate()} />}
+      {modal && <SettingsModal name={modal} paused={paused} onClose={closeModal} onCapture={() => capture.mutate()} />}
     </main>
   );
 }
@@ -285,6 +363,8 @@ function EvidenceDetail({
   onTabChange: (tab: DetailTab) => void;
   onGenerate: () => void;
 }) {
+  const tabOrder = ["text", "metadata", "source"] as const;
+  const tabRefs = useRef<Partial<Record<DetailTab, HTMLButtonElement | null>>>({});
   return (
     <>
       <div className="detail-heading">
@@ -297,14 +377,32 @@ function EvidenceDetail({
       <CaptureImage citation={citation} large />
       <div className="detail-grid">
         <div className="tabbed-panel">
-          <div className="tabs" role="tablist" aria-label="Evidence details">
-            {(["text", "metadata", "source"] as const).map((value) => (
+          <div
+            className="tabs"
+            role="tablist"
+            aria-label="Evidence details"
+            onKeyDown={(event) => {
+              const index = tabOrder.indexOf(tab);
+              let next = index;
+              if (event.key === "ArrowRight") next = (index + 1) % tabOrder.length;
+              else if (event.key === "ArrowLeft") next = (index - 1 + tabOrder.length) % tabOrder.length;
+              else if (event.key === "Home") next = 0;
+              else if (event.key === "End") next = tabOrder.length - 1;
+              else return;
+              event.preventDefault();
+              onTabChange(tabOrder[next]);
+              tabRefs.current[tabOrder[next]]?.focus();
+            }}
+          >
+            {tabOrder.map((value) => (
               <button
                 key={value}
+                ref={(node) => { tabRefs.current[value] = node; }}
                 className={tab === value ? "active" : ""}
                 type="button"
                 role="tab"
                 aria-selected={tab === value}
+                tabIndex={tab === value ? 0 : -1}
                 onClick={() => onTabChange(value)}
               >
                 {value === "text" ? "Extracted text" : value === "metadata" ? "Metadata" : "Source"}
@@ -356,9 +454,16 @@ function EvidenceDetail({
   );
 }
 
-function TimelineItem({ citation, selected, onSelect }: { citation: Citation; selected: boolean; onSelect: () => void }) {
+function TimelineItem({ citation, selected, itemRef, onSelect }: { citation: Citation; selected: boolean; itemRef: (node: HTMLButtonElement | null) => void; onSelect: () => void }) {
   return (
-    <button className={`timeline-item ${selected ? "selected" : ""}`} type="button" onClick={onSelect}>
+    <button
+      ref={itemRef}
+      className={`timeline-item ${selected ? "selected" : ""}`}
+      type="button"
+      tabIndex={selected ? 0 : -1}
+      aria-current={selected || undefined}
+      onClick={onSelect}
+    >
       <CaptureImage citation={citation} />
       <span className="timeline-copy">
         <time>{formatTime(citation.capturedAt)}</time>
@@ -429,10 +534,37 @@ function IconButton({ label, active = false, onClick, children }: { label: strin
 
 function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<ModalName, null>; paused: boolean; onClose: () => void; onCapture: () => void }) {
   const queryClient = useQueryClient();
+  const dialogRef = useRef<HTMLElement>(null);
   const settings = useQuery({ queryKey: ["archive-settings"], queryFn: api.archiveSettings });
+  const shell = useQuery({ queryKey: ["shell-settings"], queryFn: api.getShellSettings });
   const [draft, setDraft] = useState<SettingsDraft>();
   const [confirmDelete, setConfirmDelete] = useState(false);
   const current = draft ?? settingsDraft(settings.data);
+
+  useEffect(() => {
+    const root = dialogRef.current;
+    if (!root) return;
+    const selector = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+    const focusable = () => [...root.querySelectorAll<HTMLElement>(selector)]
+      .filter((element) => !element.hasAttribute("disabled"));
+    focusable()[0]?.focus();
+    function trap(event: KeyboardEvent) {
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    root.addEventListener("keydown", trap);
+    return () => root.removeEventListener("keydown", trap);
+  }, []);
 
   const save = useMutation({
     mutationFn: () => api.updateArchiveSettings({
@@ -455,11 +587,17 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
       void queryClient.invalidateQueries({ queryKey: ["health"] });
     },
   });
-  const modalError = settings.error || save.error || deleteAll.error;
+  const saveHotkey = useMutation({
+    mutationFn: (hotkey: string) => api.setShellSettings(hotkey),
+    onSuccess: (result) => {
+      queryClient.setQueryData<ShellSettings>(["shell-settings"], result);
+    },
+  });
+  const modalError = settings.error || save.error || deleteAll.error || saveHotkey.error;
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" onMouseDown={(event) => event.stopPropagation()}>
+      <section ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-heading">
           <div>
             <span>{name === "privacy" ? <ShieldCheck /> : <Gear />}</span>
@@ -516,6 +654,7 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
             </div>
             <div className="setting-row"><span><strong>Capture current frame</strong><small>Queue an immediate frame without changing the automatic cadence.</small></span><button type="button" onClick={onCapture}><Camera /> Capture now</button></div>
             <div className="setting-row"><span><strong>Search shortcut</strong><small>Focus search from anywhere in this window.</small></span><kbd>Ctrl K</kbd></div>
+            <div className="setting-row"><span><strong>Summon shortcut</strong><small>Bring ScreenSearch to the front from any application.</small></span><HotkeyCapture value={shell.data?.hotkey ?? DEFAULT_HOTKEY} busy={saveHotkey.isPending} onChange={(hotkey) => saveHotkey.mutate(hotkey)} /></div>
             <div className="danger-zone">
               <span><strong>Delete all captured history</strong><small>This pauses capture and permanently removes screenshots, OCR, and search indexes. Models are kept.</small></span>
               {confirmDelete ? (
@@ -528,6 +667,59 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
       </section>
     </div>
   );
+}
+
+function HotkeyCapture({ value, busy, onChange }: { value: string; busy: boolean; onChange: (hotkey: string) => void }) {
+  const [recording, setRecording] = useState(false);
+  return (
+    <button
+      type="button"
+      className={`hotkey-capture ${recording ? "recording" : ""}`}
+      aria-label="Change summon shortcut"
+      onClick={() => setRecording(true)}
+      onBlur={() => setRecording(false)}
+      onKeyDown={(event) => {
+        if (!recording) return;
+        if (event.key === "Tab") return;
+        event.preventDefault();
+        if (event.key === "Escape") {
+          setRecording(false);
+          return;
+        }
+        if (["Control", "Shift", "Alt", "Meta"].includes(event.key)) return;
+        const parts: string[] = [];
+        if (event.ctrlKey || event.metaKey) parts.push("CmdOrCtrl");
+        if (event.altKey) parts.push("Alt");
+        if (event.shiftKey) parts.push("Shift");
+        parts.push(normalizeHotkeyKey(event.key));
+        setRecording(false);
+        onChange(parts.join("+"));
+      }}
+    >
+      {recording ? "Press keys…" : busy ? "Saving…" : <kbd>{prettyHotkey(value)}</kbd>}
+    </button>
+  );
+}
+
+function isTypingTarget(target: EventTarget | null) {
+  const element = target as HTMLElement | null;
+  if (!element) return false;
+  const tag = element.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || element.isContentEditable;
+}
+
+function normalizeHotkeyKey(key: string) {
+  if (key === " " || key === "Spacebar") return "Space";
+  if (key.startsWith("Arrow")) return key.slice(5);
+  if (key.length === 1) return key.toUpperCase();
+  return key;
+}
+
+function prettyHotkey(value: string) {
+  return value
+    .split("+")
+    .map((part) => (part === "CmdOrCtrl" ? "Ctrl" : part))
+    .join(" ");
 }
 
 function splitPatterns(value: string) {
@@ -558,8 +750,25 @@ function groupCitations(citations: Citation[]) {
   return [...groups.entries()].map(([label, items]) => ({ label, items }));
 }
 
-function dayLabel(value: string) {
+const warnedTimestamps = new Set<string>();
+
+// Parse a capture timestamp defensively. A single malformed value must never crash the timeline,
+// so unparseable input returns null (callers render a fallback) and is logged once for diagnosis.
+function safeDate(value: string): Date | null {
   const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    if (!warnedTimestamps.has(value)) {
+      warnedTimestamps.add(value);
+      console.warn("ScreenSearch: unparseable capture timestamp", JSON.stringify(value));
+    }
+    return null;
+  }
+  return date;
+}
+
+function dayLabel(value: string) {
+  const date = safeDate(value);
+  if (!date) return "Unknown date";
   const today = new Date();
   const start = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
   const captured = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
@@ -570,11 +779,15 @@ function dayLabel(value: string) {
 }
 
 function formatTime(value: string) {
-  return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value));
+  const date = safeDate(value);
+  if (!date) return "Unknown time";
+  return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(date);
 }
 
 function formatDateTime(value: string) {
-  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(value));
+  const date = safeDate(value);
+  if (!date) return "Unknown date";
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(date);
 }
 
 function readBlobAsDataUrl(blob: Blob) {

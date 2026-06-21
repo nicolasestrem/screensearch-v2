@@ -70,6 +70,10 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
 .command-search input { min-width: 0; border: 0; outline: 0; color: var(--text); background: transparent; }
 .command-search input::placeholder { color: var(--faint); }
 kbd { border: 1px solid #454641; border-radius: 4px; padding: 3px 7px; color: #b8b7b1; background: #242525; font-family: inherit; font-size: 11px; box-shadow: inset 0 -1px #111; }
+.search-actions { display: flex; align-items: center; gap: 8px; }
+.search-submit { height: 28px; border: 1px solid #6c5d2f; border-radius: 6px; padding: 0 14px; color: #18160e; background: var(--accent); font-size: 12px; font-weight: 600; white-space: nowrap; }
+.search-submit:hover:not(:disabled) { background: #eccb6e; }
+.search-submit:disabled { border-color: #3a3b38; color: var(--faint); background: #242525; cursor: default; }
 
 .top-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; min-width: 0; }
 .pause-button, .filter-button, .modal-content button {
@@ -236,6 +240,22 @@ dd { min-width: 0; margin: 0; overflow: hidden; color: #d0cfca; text-overflow: e
 }
 .state-pill { border: 1px solid #31583f; border-radius: 999px; padding: 4px 8px; color: var(--green); background: #17231b; font-size: 10px; }
 .state-pill.paused { border-color: #675a33; color: var(--accent); background: #29251a; }
+
+/* Keyboard-only focus rings. :where() keeps specificity at 0 so component styles win. */
+:where(button, a, input, select, textarea, [tabindex]):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.timeline-item:focus-visible { outline-offset: -2px; }
+.tabs button:focus-visible { outline-offset: -2px; border-radius: 3px; }
+.command-search input:focus-visible { outline: 0; }
+
+.hotkey-capture { display: inline-flex; align-items: center; min-height: 26px; border: 1px solid #454641; border-radius: 5px; padding: 3px 8px; color: #b8b7b1; background: #242525; font-size: 11px; }
+.hotkey-capture.recording { border-color: var(--accent); color: var(--accent); }
+.hotkey-capture kbd { border: 0; padding: 0; background: transparent; box-shadow: none; }
+
+.app-error { display: grid; gap: 12px; place-content: center; height: 100vh; padding: 32px; text-align: center; color: var(--text); }
+.app-error h1 { font-size: 18px; }
+.app-error pre { max-width: 520px; margin: 0 auto; overflow: auto; border: 1px solid #6c3f3f; border-radius: 6px; padding: 10px 12px; color: #f0b7b7; background: #2a1919; font-size: 11px; text-align: left; }
+.app-error-actions { display: flex; gap: 10px; justify-content: center; }
+.app-error-actions button { border: 1px solid #454641; border-radius: 6px; padding: 7px 14px; color: var(--text); background: #242525; }
 
 .toast, .error-toast { position: fixed; z-index: 30; right: 18px; bottom: 50px; display: flex; align-items: center; gap: 8px; border: 1px solid #31583f; border-radius: 6px; padding: 10px 12px; color: #d1ded4; background: #19251d; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3); font-size: 11px; }
 .toast svg { color: var(--green); }

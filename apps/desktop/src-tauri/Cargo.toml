@@ -12,7 +12,11 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 screensearch-ipc = { path = "../../../crates/ipc" }
 serde.workspace = true
-tauri = { version = "2.11.3", features = [] }
+serde_json.workspace = true
+tauri = { version = "2.11.3", features = ["tray-icon"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-notification = "2"
+tokio.workspace = true
 uuid.workspace = true
 
 [lints]
