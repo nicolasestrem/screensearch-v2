@@ -10,6 +10,7 @@ message RequestEnvelope {
     ProcessJobsRequest process_jobs = 12;
     SearchRequest search = 13;
     GetCaptureAssetRequest get_capture_asset = 14;
+    SetCapturePausedRequest set_capture_paused = 15;
   }
 }
 
@@ -23,6 +24,7 @@ message ResponseEnvelope {
     SearchEvent search = 13;
     ErrorResponse error = 14;
     CaptureAssetResponse capture_asset = 15;
+    SetCapturePausedResponse set_capture_paused = 16;
   }
 }
 
@@ -31,6 +33,15 @@ message HealthRequest {}
 message HealthResponse {
   string version = 1;
   string status = 2;
+  bool capture_paused = 3;
+}
+
+message SetCapturePausedRequest {
+  bool paused = 1;
+}
+
+message SetCapturePausedResponse {
+  bool paused = 1;
 }
 
 message CaptureRequest {}

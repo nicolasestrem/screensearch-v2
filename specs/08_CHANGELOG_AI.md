@@ -54,3 +54,27 @@ The bootstrap UI could not demonstrate value because its pixels, OCR, vectors, a
 ### Remaining boundary
 
 Production UI implementation pauses for selection among three visual directions. GGUF model selection, model-worker isolation, privacy/retention controls, and automation emission remain open.
+
+## 2026-06-21 — Memory Timeline product interface
+
+### Changed
+
+- Recorded the product-owner selection of visual direction 2, Memory Timeline, as a durable design reference.
+- Replaced the diagnostics scaffold with a compact search/timeline/evidence workspace using real screenshot assets and OCR bounds.
+- Added interactive date/application filters, evidence selection, extracted-text/metadata/source tabs, privacy/settings dialogs, and optional local-answer state.
+- Added a real IPC pause/resume command and wired it to the daemon's automatic capture loop.
+- Added Phosphor icons and enlarged the default Tauri window for the dense evidence workspace.
+
+### Why
+
+The working evidence loop needed a product surface that made visual source material primary and exposed incomplete privacy/model capabilities truthfully.
+
+### Verification evidence
+
+- Frontend lint and production build passed.
+- Browser interaction checks passed for search, filters, evidence selection, tabs, pause/resume, dialogs, and optional answer generation.
+- Full-view and focused side-by-side comparison found no remaining P0/P1/P2 design issues; `design-qa.md` records `final result: passed`.
+
+### Remaining boundary
+
+Tray lifecycle, a system-wide hotkey, application exclusions, retention/deletion, model-worker isolation, GGUF model selection, and automation emission remain open.

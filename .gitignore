@@ -14,3 +14,4 @@ dist/
 /models/
 /captures/
 **/src-tauri/gen/
+/apps/desktop/public/qa-capture.png

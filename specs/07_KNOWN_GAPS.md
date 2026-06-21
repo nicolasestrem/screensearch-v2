@@ -6,7 +6,7 @@ This file contains decisions or external inputs that cannot be safely invented b
 
 | ID | Gap | Owner | Needed by | Status |
 |---|---|---|---|---|
-| GAP-001 | Select one of three product visual directions for the tray/hotkey search experience. | Product owner | Before production UI implementation | Open |
+| GAP-001 | Select one of three product visual directions for the tray/hotkey search experience. | Product owner | Before production UI implementation | Resolved: Memory Timeline |
 | GAP-002 | Approve redistribution of the Apache-2.0 `Xenova/all-MiniLM-L6-v2` quantized ONNX files and select/approve a GGUF generation model. | Product owner / legal | Before packaging model weights | Open |
 | GAP-003 | Choose whether models ship in the installer or download through an explicit first-run flow. | Product owner | Before release packaging | Open |
 | GAP-004 | Define the default retention period or disk budget shown during first-run/settings. | Product owner | Before retention defaults ship | Open |

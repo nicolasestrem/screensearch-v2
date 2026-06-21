@@ -3,6 +3,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 export interface HealthStatus {
   version: string;
   status: string;
+  capturePaused: boolean;
 }
 
 export interface CaptureResult {
@@ -42,14 +43,77 @@ export type SearchEvent =
   | { kind: "token"; text: string }
   | { kind: "completed"; citationCount: number };
 
+const isTauri = "__TAURI_INTERNALS__" in window;
+let previewPaused = false;
+
+function previewCitation(
+  index: number,
+  application: string,
+  title: string,
+  hoursAgo: number,
+): Extract<SearchEvent, { kind: "citation" }> {
+  return {
+    kind: "citation",
+    captureId: `preview-capture-${index}`,
+    chunkId: `preview-chunk-${index}`,
+    excerpt: index === 0
+      ? "The real evidence loop captured seven live screenshots, completed durable OCR jobs, and returned positioned text evidence."
+      : "ScreenSearch keeps screenshots, OCR text, and semantic matches on this device for private recall.",
+    score: 0.94 - index * 0.07,
+    capturedAt: new Date(Date.now() - hoursAgo * 3_600_000).toISOString(),
+    application,
+    windowTitle: title,
+    width: 2560,
+    height: 1080,
+    bounds: [{ x: 0.64, y: 0.19, width: 0.22, height: 0.22 }],
+    matchKind: index % 3 === 0 ? "hybrid" : index % 2 === 0 ? "semantic" : "lexical",
+    ocrModelId: "windows-media-ocr",
+    embeddingModelId: "fastembed-all-minilm-l6-v2-q-384-v1",
+  };
+}
+
+const previewCitations = [
+  previewCitation(0, "Codex", "Design V2 architecture", 1),
+  previewCitation(1, "Microsoft Edge", "NVIDIA Nemotron model overview", 2),
+  previewCitation(2, "Visual Studio Code", "screensearch-v2 — App.tsx", 5),
+  previewCitation(3, "PowerShell", "ScreenSearch V2 verification", 28),
+  previewCitation(4, "Microsoft Edge", "Local model documentation", 31),
+  previewCitation(5, "Codex", "Truthful evidence loop", 74),
+];
+
 export const api = {
-  health: () => invoke<HealthStatus>("health"),
-  capture: () => invoke<CaptureResult>("capture_once"),
+  health: () => isTauri
+    ? invoke<HealthStatus>("health")
+    : Promise.resolve({ version: "0.1.0-preview", status: "ready", capturePaused: previewPaused }),
+  capture: () => isTauri
+    ? invoke<CaptureResult>("capture_once")
+    : Promise.resolve({ captureId: "preview-capture-new", duplicate: false }),
   processJobs: (maximum = 10) => invoke<number>("process_jobs", { maximum }),
-  captureAsset: (captureId: string) => invoke<CaptureAsset>("capture_asset", { captureId }),
-  search: async (query: string, receive: (event: SearchEvent) => void) => {
+  captureAsset: async (captureId: string) => {
+    if (isTauri) return invoke<CaptureAsset>("capture_asset", { captureId });
+    const content = [...new Uint8Array(await (await fetch("/qa-capture.png")).arrayBuffer())];
+    return { mediaType: "image/png", content };
+  },
+  setCapturePaused: async (paused: boolean) => {
+    if (isTauri) return invoke<boolean>("set_capture_paused", { paused });
+    previewPaused = paused;
+    return paused;
+  },
+  search: async (
+    query: string,
+    generateAnswer: boolean,
+    receive: (event: SearchEvent) => void,
+  ) => {
+    if (!isTauri) {
+      previewCitations.forEach(receive);
+      if (generateAnswer) {
+        receive({ kind: "token", text: "The selected evidence shows the V2 architecture and its locally verified capture, OCR, and search pipeline." });
+      }
+      receive({ kind: "completed", citationCount: previewCitations.length });
+      return;
+    }
     const onEvent = new Channel<SearchEvent>();
     onEvent.onmessage = receive;
-    await invoke<void>("search", { query, onEvent });
+    await invoke<void>("search", { query, generateAnswer, onEvent });
   },
 };

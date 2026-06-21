@@ -14,10 +14,10 @@
       {
         "label": "main",
         "title": "ScreenSearch V2",
-        "width": 1100,
-        "height": 760,
-        "minWidth": 760,
-        "minHeight": 620,
+        "width": 1400,
+        "height": 940,
+        "minWidth": 780,
+        "minHeight": 640,
         "resizable": true
       }
     ],
@@ -30,4 +30,3 @@
     "targets": ["nsis"]
   }
 }
-

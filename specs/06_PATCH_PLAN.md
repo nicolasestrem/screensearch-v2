@@ -16,10 +16,10 @@ Items are ordered. An agent may continue independent work around a blocked item 
 8. [x] Add quantized MiniLM ONNX embeddings and activate its 384-dimensional revision.
 9. [ ] Add queue high/low-water backpressure, perceptual deduplication, and capture pause/exclusion policy.
 10. [ ] Benchmark hybrid ranking, exact-match boost, model isolation, latency, CPU, memory, and disk growth.
-11. [ ] Implement pause, exclusions, queue status, retention, deletion, and disk-budget policies.
-12. [ ] Generate exactly three grounded visual directions for the confirmed tray/hotkey workflow and obtain user selection.
-13. [ ] Record the selected visual target in a durable UI reference.
-14. [ ] Implement tray lifecycle, global hotkey, compact search, evidence cards, highlighted detail, keyboard navigation, settings, and all selected states.
+11. [ ] Implement exclusions, queue status, retention, deletion, and disk-budget policies; pause/resume is complete.
+12. [x] Generate exactly three grounded visual directions and obtain product-owner selection of Memory Timeline.
+13. [x] Record the selected visual target and binding decisions in `docs/design`.
+14. [ ] Add tray lifecycle, a system-wide hotkey, and complete keyboard navigation; the selected search/timeline/evidence/settings interface is implemented and has passed visual QA.
 15. [ ] Select/install a GGUF model and validate the implemented llama.cpp provider, citations, cancellation, and memory lifecycle.
 16. [ ] Move OCR, embedding, and generation execution behind the supervised model-worker boundary.
 17. [ ] Implement typed Windows automation emission behind existing approval/focus/abort gates, or keep the feature disabled if safety requirements cannot be proven.

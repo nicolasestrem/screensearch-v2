@@ -1,6 +1,13 @@
 //! Persistent ScreenSearch V2 daemon and named-pipe endpoint.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::Context;
 use futures::{StreamExt, stream};
@@ -12,7 +19,8 @@ use screensearch_ipc::{
     v1::{
         CaptureAssetResponse, CaptureResponse, Citation, ErrorResponse, HealthResponse,
         NormalizedRect, ProcessJobsResponse, ResponseEnvelope, SearchCompleted,
-        SearchEvent as IpcSearchEvent, Token, request_envelope, response_envelope, search_event,
+        SearchEvent as IpcSearchEvent, SetCapturePausedResponse, Token, request_envelope,
+        response_envelope, search_event,
     },
 };
 use screensearch_model_runtime::{FastEmbedEngine, LlamaCppTextGenerator};
@@ -28,6 +36,7 @@ struct DaemonHandler {
     search: Arc<SearchService>,
     repository: Arc<LibSqlArchive>,
     assets: Arc<FileAssetStore>,
+    capture_paused: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -54,6 +63,7 @@ impl RequestHandler for DaemonHandler {
                 body: Some(response_envelope::Body::Health(HealthResponse {
                     version: env!("CARGO_PKG_VERSION").to_owned(),
                     status: "ready".to_owned(),
+                    capture_paused: self.capture_paused.load(Ordering::Relaxed),
                 })),
             })),
             request_envelope::Body::Capture(_) => {
@@ -198,6 +208,19 @@ impl RequestHandler for DaemonHandler {
                     )),
                 }))
             }
+            request_envelope::Body::SetCapturePaused(command) => {
+                self.capture_paused.store(command.paused, Ordering::Relaxed);
+                info!(paused = command.paused, "automatic capture state changed");
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::SetCapturePaused(
+                        SetCapturePausedResponse {
+                            paused: command.paused,
+                        },
+                    )),
+                }))
+            }
         }
     }
 }
@@ -308,6 +331,7 @@ async fn main() -> anyhow::Result<()> {
         embeddings.clone(),
         "daemon-windows-worker",
     ));
+    let capture_paused = Arc::new(AtomicBool::new(false));
     let handler = Arc::new(DaemonHandler {
         ingest: ingest.clone(),
         analysis: analysis.clone(),
@@ -318,11 +342,12 @@ async fn main() -> anyhow::Result<()> {
         )),
         repository,
         assets,
+        capture_paused: capture_paused.clone(),
     });
 
     info!(pipe = DEFAULT_PIPE_NAME, data = %data_directory.display(), "daemon ready");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let capture_task = tokio::spawn(capture_loop(ingest, shutdown_rx.clone()));
+    let capture_task = tokio::spawn(capture_loop(ingest, capture_paused, shutdown_rx.clone()));
     let analysis_task = tokio::spawn(analysis_loop(analysis, shutdown_rx));
     tokio::select! {
         result = serve(DEFAULT_PIPE_NAME, handler) => result.context("serve named pipe")?,
@@ -335,13 +360,19 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn capture_loop(ingest: Arc<IngestService>, mut shutdown: watch::Receiver<bool>) {
+async fn capture_loop(
+    ingest: Arc<IngestService>,
+    capture_paused: Arc<AtomicBool>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut cadence = tokio::time::interval(Duration::from_secs(2));
     cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = cadence.tick() => {
-                if let Err(error) = ingest.capture_once().await {
+                if !capture_paused.load(Ordering::Relaxed)
+                    && let Err(error) = ingest.capture_once().await
+                {
                     warn!(error = %error, "automatic capture failed");
                 }
             }

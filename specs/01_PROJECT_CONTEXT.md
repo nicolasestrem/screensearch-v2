@@ -62,6 +62,8 @@ Capture metadata and an analysis job are committed transactionally. Analysis com
 - Quantized `Xenova/all-MiniLM-L6-v2` ONNX embeddings through fastembed, cached below the app data directory and executed locally.
 - Evidence-rich search citations containing screenshot, time, application, title, excerpt, match provenance, model revisions, and highlight bounds.
 - Authorized screenshot retrieval by capture identifier and screenshot rendering in the diagnostics UI.
+- The selected Memory Timeline product interface with search, client-side date/application filtering, grouped evidence, a screenshot inspector, OCR highlights, metadata/provenance tabs, and optional answer state.
+- A real pause/resume control propagated over IPC to the daemon capture loop.
 - A real llama.cpp GGUF adapter that is dormant until an explicitly installed model is selected; evidence-only search does not require it.
 
 ## What is fake or disabled
@@ -73,7 +75,7 @@ Capture metadata and an analysis job are committed transactionally. Analysis com
 
 ## Current user experience
 
-The React screen remains a diagnostics harness. Capture and analysis are automatic; search now renders real screenshot evidence with timestamps, application/window metadata, excerpts, provenance, and positioned OCR highlights. A manual `Capture now` control remains for diagnostics. It is not an accepted production design.
+The React screen implements the product-owner-selected Memory Timeline direction. Capture and analysis are automatic; search renders chronologically grouped screenshot evidence with timestamps, application/window metadata, excerpts, provenance, and positioned OCR highlights. Search, date/application filters, evidence selection, detail tabs, pause/resume, privacy/settings dialogs, manual capture, and optional generation states are interactive. Tray lifecycle and a system-wide hotkey remain unimplemented.
 
 ## Current dependencies and infrastructure
 
@@ -89,7 +91,7 @@ The React screen remains a diagnostics harness. Capture and analysis are automat
 1. Exact full-frame hashes do not handle visually insignificant changes or near-duplicates.
 2. Queue backpressure, pause, exclusions, retention, deletion, and disk budgets are not implemented.
 3. The daemon is not supervised or launched by the desktop shell.
-4. No global hotkey, tray state, selected production visual direction, or timeline/detail view exists.
+4. No global hotkey or tray lifecycle exists yet; Ctrl+K currently focuses search only inside the window.
 5. The model worker boundary is not yet exercised; OCR and embeddings currently execute in the daemon process.
 6. The GGUF provider has no approved default model, manifest, acquisition flow, or packaged weights.
 7. Automation policy is real, but native input emission remains disabled.

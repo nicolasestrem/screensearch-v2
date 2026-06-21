@@ -18,17 +18,18 @@ Build reviewed: first truthful evidence-loop pass
 - Real quantized MiniLM ONNX embeddings cached locally and isolated by model revision.
 - Evidence-rich IPC citations and authorized screenshot loading in the React diagnostics surface.
 - A generic local GGUF llama.cpp generator adapter with evidence-only search as the safe default when no model is installed.
+- The selected Memory Timeline product interface with real screenshot evidence, grouped results, filters, metadata/provenance tabs, privacy/settings dialogs, and visual QA.
+- A real daemon-owned pause/resume capture control exposed through IPC and the desktop UI.
 
 ## Deliberately skipped
 
 - An approved and installed default GGUF generation model.
-- Tray/global-hotkey product shell.
+- Tray lifecycle and a system-wide search hotkey.
 - Retention, exclusions, deletion, disk budget, model acquisition, signing, and production automation.
 
 ## Placeholder behavior that must not be mistaken for product behavior
 
 - Fake providers remain for deterministic tests and are no longer composed by the production daemon.
-- The UI remains a diagnostics harness and still exposes `Capture now`.
 - The model-worker executable remains a placeholder; real model work currently runs in the daemon.
 
 ## Existing strengths
@@ -46,7 +47,7 @@ Build reviewed: first truthful evidence-loop pass
 4. The fixed 384-dimensional vector table is correct for MiniLM but requires a new migration for future dimensions.
 5. The native model-worker boundary is declared but not exercised.
 6. Current logging review has not yet proven that all future native errors are content-free.
-7. Product UI, privacy controls, and retention/deletion remain unimplemented.
+7. Application exclusions and retention/deletion remain unimplemented; the UI discloses those gaps.
 
 ## Verification evidence
 

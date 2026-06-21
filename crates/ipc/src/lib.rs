@@ -275,6 +275,7 @@ mod tests {
                     body: Some(response_envelope::Body::Health(HealthResponse {
                         version: "test".to_owned(),
                         status: "ready".to_owned(),
+                        capture_paused: false,
                     })),
                 })
             })))

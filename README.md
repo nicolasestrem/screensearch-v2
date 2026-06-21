@@ -35,6 +35,8 @@ cargo run -p screensearch-daemon
 
 The current vertical slice automatically captures the focused monitor, runs Windows Media OCR, produces local quantized MiniLM embeddings, and returns screenshot-backed hybrid-search evidence. Deterministic providers are test-only; optional answer generation requires an explicitly installed GGUF model at `models/generator/model.gguf` below the application data directory.
 
+The desktop uses the selected **Memory Timeline** interface: search and filters lead to chronologically grouped screenshot evidence, positioned OCR highlights, provenance, and an optional cited answer. Automatic capture can be paused and resumed through a durable daemon control; retention and application exclusions remain explicitly unconfigured.
+
 ## Data safety
 
 Never commit captures, databases, logs, API keys, model files, or other user screen data. Automation is disabled unless a structured plan is explicitly approved, the expected foreground window still matches, and the emergency abort flag is clear.

@@ -5,7 +5,7 @@ use screensearch_ipc::{
     transport::{DEFAULT_PIPE_NAME, IpcClient},
     v1::{
         CaptureRequest, GetCaptureAssetRequest, HealthRequest, ProcessJobsRequest, RequestEnvelope,
-        SearchRequest, request_envelope, response_envelope, search_event,
+        SearchRequest, SetCapturePausedRequest, request_envelope, response_envelope, search_event,
     },
 };
 use serde::Serialize;
@@ -16,6 +16,7 @@ use tauri::ipc::Channel;
 struct HealthStatus {
     version: String,
     status: String,
+    capture_paused: bool,
 }
 
 #[derive(Serialize)]
@@ -77,6 +78,7 @@ async fn health() -> Result<HealthStatus, String> {
                 return Ok(HealthStatus {
                     version: status.version,
                     status: status.status,
+                    capture_paused: status.capture_paused,
                 });
             }
             Some(response_envelope::Body::Error(error)) => return Err(error.message),
@@ -84,6 +86,24 @@ async fn health() -> Result<HealthStatus, String> {
         }
     }
     Err("daemon returned no health response".to_owned())
+}
+
+#[tauri::command]
+async fn set_capture_paused(paused: bool) -> Result<bool, String> {
+    let responses = request(request_envelope::Body::SetCapturePaused(
+        SetCapturePausedRequest { paused },
+    ))
+    .await?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::SetCapturePaused(result)) => {
+                return Ok(result.paused);
+            }
+            Some(response_envelope::Body::Error(error)) => return Err(error.message),
+            _ => {}
+        }
+    }
+    Err("daemon returned no capture state response".to_owned())
 }
 
 #[tauri::command]
@@ -142,14 +162,18 @@ async fn capture_asset(capture_id: String) -> Result<CaptureAsset, String> {
 }
 
 #[tauri::command]
-async fn search(query: String, on_event: Channel<SearchUiEvent>) -> Result<(), String> {
+async fn search(
+    query: String,
+    generate_answer: bool,
+    on_event: Channel<SearchUiEvent>,
+) -> Result<(), String> {
     let client = IpcClient::new(DEFAULT_PIPE_NAME);
     let request = RequestEnvelope {
         request_id: uuid::Uuid::now_v7().to_string(),
         body: Some(request_envelope::Body::Search(SearchRequest {
             query,
-            limit: 8,
-            generate_answer: false,
+            limit: 16,
+            generate_answer,
         })),
     };
     client
@@ -227,6 +251,7 @@ fn main() {
             capture_once,
             process_jobs,
             capture_asset,
+            set_capture_paused,
             search
         ])
         .run(tauri::generate_context!())
