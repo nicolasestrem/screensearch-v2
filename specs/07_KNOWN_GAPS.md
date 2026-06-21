@@ -7,8 +7,8 @@ This file contains decisions or external inputs that cannot be safely invented b
 | ID | Gap | Owner | Needed by | Status |
 |---|---|---|---|---|
 | GAP-001 | Select one of three product visual directions for the tray/hotkey search experience. | Product owner | Before production UI implementation | Resolved: Memory Timeline |
-| GAP-002 | Approve redistribution of the Apache-2.0 `Xenova/all-MiniLM-L6-v2` quantized ONNX files and select/approve a GGUF generation model. | Product owner / legal | Before packaging model weights | Open |
-| GAP-003 | Choose whether models ship in the installer or download through an explicit first-run flow. | Product owner | Before release packaging | Open |
+| GAP-002 | Approve redistribution of the Apache-2.0 `Xenova/all-MiniLM-L6-v2` quantized ONNX files and approve the final selected GGUF generation model for release. | Product owner / legal | Before packaging model weights | Open; ignored for engineering model comparison |
+| GAP-003 | Choose the release default between bundled model resources, explicit Hugging Face download, or both. | Product owner | Before release packaging | Open; engineering branch supports both acquisition paths |
 | GAP-004 | Define the default retention period or disk budget shown during first-run/settings. | Product owner | Before retention defaults ship | Resolved for P1: explicit `Keep all` / `No limit` conservative default |
 | GAP-005 | Provide Windows code-signing identity and release ownership. | Product owner | Before public distribution | Open |
 | GAP-006 | Decide whether guarded automation belongs in the first public release or remains feature-disabled. | Product owner | Before release scope freeze | Open |
@@ -18,7 +18,7 @@ This file contains decisions or external inputs that cannot be safely invented b
 
 - Development uses Windows-provided offline OCR without redistributing separate weights.
 - Development uses quantized `Xenova/all-MiniLM-L6-v2` at model revision `751bff37182d3f1213fa05d7196b954e230abad9`, advertised as Apache-2.0; release redistribution still requires approval.
-- The GGUF adapter expects `models/generator/model.gguf`; a missing file fails explicitly and never falls back to a fake.
+- The legacy GGUF adapter path `models/generator/model.gguf` remains a compatibility fallback. New engineering work uses the generation-model catalog below the app data model root, with explicit local import or Hugging Face download.
 - Evidence-only search remains fully usable when generation models are absent.
 - Automation remains disabled until GAP-006 is resolved and all safety tests pass.
 - Development backpressure uses daemon-owned high/low-water marks of 100/50 active jobs. The P1 baseline is accepted on the named GAP-007 engineering machine; release-hardware soak budgets remain a separate hardening task.

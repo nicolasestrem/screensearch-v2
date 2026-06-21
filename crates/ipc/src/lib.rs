@@ -64,6 +64,8 @@ pub mod transport {
 
     /// Default per-user daemon pipe name.
     pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\screensearch-v2";
+    /// Default per-user model-worker pipe name.
+    pub const DEFAULT_WORKER_PIPE_NAME: &str = r"\\.\pipe\screensearch-v2-model-worker";
     const MAX_FRAME_LENGTH: usize = 20 * 1024 * 1024;
 
     /// Serves requests until the task is cancelled.
@@ -187,6 +189,8 @@ pub mod transport {
 
     /// Symbolic pipe name used only for shared configuration.
     pub const DEFAULT_PIPE_NAME: &str = "screensearch-v2";
+    /// Symbolic worker pipe name used only for shared configuration.
+    pub const DEFAULT_WORKER_PIPE_NAME: &str = "screensearch-v2-model-worker";
 
     /// Reports that the bootstrap transport is Windows-only.
     pub async fn serve(_pipe_name: &str, _handler: SharedHandler) -> Result<(), IpcError> {

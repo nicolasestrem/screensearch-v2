@@ -41,7 +41,7 @@ Build reviewed: completed P0 truthful evidence loop and P1 semantic-retrieval/sc
 ## Placeholder behavior that must not be mistaken for product behavior
 
 - Fake providers remain for deterministic tests and are no longer composed by the production daemon.
-- The model-worker executable remains a placeholder; real model work currently runs in the daemon.
+- The P3 branch changes the model-worker executable into the intended inference endpoint and routes daemon model ports through it, but this is not yet verified by the required checks in this session.
 
 ## Existing strengths
 
@@ -75,3 +75,7 @@ The subsequent P2 product-shell pass (tray, configurable summon hotkey, keyboard
 ## Review verdict
 
 P0 remains verified and P1 is complete. The build has real revision-consistent hybrid retrieval, bounded capture growth, configurable local privacy/storage policy, durable deletion cleanup, indexing/storage metrics, and a reproduced ten-million-row engineering baseline. P2 product-shell work has landed in code and passes all automated checks: tray lifecycle, a configurable system-wide hotkey, hide-to-tray, and complete keyboard navigation are implemented and composed in production, with keyboard navigation verified by browser QA. It is not release-ready until the native tray/hotkey runtime is confirmed on Windows, plus model-worker isolation, generation/model decisions, security/packaging, and release-hardware soak validation land.
+
+## P3 branch review note
+
+The current `p3-model-selection-worker` branch adds generation-model catalog persistence, local GGUF import, explicit Hugging Face download, active-model selection, answer completion statuses, and worker IPC for OCR, embeddings, and generation. This note does not close P3: required Rust/frontend verification and live local-model benchmarking were blocked by the command-execution environment during implementation.

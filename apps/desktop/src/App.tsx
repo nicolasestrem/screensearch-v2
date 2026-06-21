@@ -29,6 +29,7 @@ import {
   DEFAULT_HOTKEY,
   isTauri,
   type ArchiveSettings,
+  type GenerationModel,
   type SearchEvent,
   type ShellSettings,
 } from "./api";
@@ -91,6 +92,10 @@ export function App() {
   );
   const answer = useMemo(
     () => events.filter((event) => event.kind === "token").map((event) => event.text).join(""),
+    [events],
+  );
+  const answerCompletion = useMemo(
+    () => [...events].reverse().find((event): event is Extract<SearchEvent, { kind: "completed" }> => event.kind === "completed"),
     [events],
   );
   const applications = useMemo(
@@ -306,6 +311,8 @@ export function App() {
                   citation={selected}
                   tab={detailTab}
                   answer={answer}
+                  answerStatus={answerCompletion?.answerStatus ?? "evidence_only"}
+                  answerMessage={answerCompletion?.answerMessage ?? ""}
                   searching={search.isPending}
                   onTabChange={setDetailTab}
                   onGenerate={() => search.mutate({ value: query.trim(), generateAnswer: true })}
@@ -352,6 +359,8 @@ function EvidenceDetail({
   citation,
   tab,
   answer,
+  answerStatus,
+  answerMessage,
   searching,
   onTabChange,
   onGenerate,
@@ -359,6 +368,8 @@ function EvidenceDetail({
   citation: Citation;
   tab: DetailTab;
   answer: string;
+  answerStatus: string;
+  answerMessage: string;
   searching: boolean;
   onTabChange: (tab: DetailTab) => void;
   onGenerate: () => void;
@@ -442,7 +453,7 @@ function EvidenceDetail({
       <section className="answer-panel">
         <div>
           <span className="answer-label"><Sparkle weight="fill" /> Answer (optional)</span>
-          <small>{answer ? "Grounded in the evidence above" : "Requires an installed local GGUF model"}</small>
+          <small>{answerSubtitle(answer, answerStatus, answerMessage)}</small>
         </div>
         {answer ? <p>{answer}</p> : (
           <button type="button" onClick={onGenerate} disabled={searching}>
@@ -537,7 +548,14 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
   const dialogRef = useRef<HTMLElement>(null);
   const settings = useQuery({ queryKey: ["archive-settings"], queryFn: api.archiveSettings });
   const shell = useQuery({ queryKey: ["shell-settings"], queryFn: api.getShellSettings });
+  const models = useQuery({ queryKey: ["generation-models"], queryFn: api.generationModels });
   const [draft, setDraft] = useState<SettingsDraft>();
+  const [modelDraft, setModelDraft] = useState({
+    sourcePath: "models\\NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf",
+    repository: "unsloth/Qwen3.5-4B-GGUF",
+    filename: "Qwen3.5-4B-Q4_K_M.gguf",
+    displayName: "Qwen3.5 4B Q4_K_M",
+  });
   const [confirmDelete, setConfirmDelete] = useState(false);
   const current = draft ?? settingsDraft(settings.data);
 
@@ -593,7 +611,25 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
       queryClient.setQueryData<ShellSettings>(["shell-settings"], result);
     },
   });
-  const modalError = settings.error || save.error || deleteAll.error || saveHotkey.error;
+  const importModel = useMutation({
+    mutationFn: () => api.importLocalGenerationModel(modelDraft.sourcePath, modelDraft.displayName, true),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["generation-models"] }),
+  });
+  const downloadModel = useMutation({
+    mutationFn: () => api.downloadGenerationModel(modelDraft.repository, modelDraft.filename, modelDraft.displayName, true),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["generation-models"] }),
+  });
+  const selectModel = useMutation({
+    mutationFn: (modelId: string) => api.selectGenerationModel(modelId),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["generation-models"] }),
+  });
+  const deleteModel = useMutation({
+    mutationFn: (modelId: string) => api.deleteGenerationModel(modelId),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["generation-models"] }),
+  });
+  const unloadModel = useMutation({ mutationFn: api.unloadGenerationModel });
+  const modalError = settings.error || save.error || deleteAll.error || saveHotkey.error
+    || models.error || importModel.error || downloadModel.error || selectModel.error || deleteModel.error || unloadModel.error;
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
@@ -655,6 +691,17 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
             <div className="setting-row"><span><strong>Capture current frame</strong><small>Queue an immediate frame without changing the automatic cadence.</small></span><button type="button" onClick={onCapture}><Camera /> Capture now</button></div>
             <div className="setting-row"><span><strong>Search shortcut</strong><small>Focus search from anywhere in this window.</small></span><kbd>Ctrl K</kbd></div>
             <div className="setting-row"><span><strong>Summon shortcut</strong><small>Bring ScreenSearch to the front from any application.</small></span><HotkeyCapture value={shell.data?.hotkey ?? DEFAULT_HOTKEY} busy={saveHotkey.isPending} onChange={(hotkey) => saveHotkey.mutate(hotkey)} /></div>
+            <ModelSettings
+              models={models.data ?? []}
+              draft={modelDraft}
+              busy={importModel.isPending || downloadModel.isPending || selectModel.isPending || deleteModel.isPending || unloadModel.isPending}
+              onDraft={setModelDraft}
+              onImport={() => importModel.mutate()}
+              onDownload={() => downloadModel.mutate()}
+              onSelect={(modelId) => selectModel.mutate(modelId)}
+              onDelete={(modelId) => deleteModel.mutate(modelId)}
+              onUnload={() => unloadModel.mutate()}
+            />
             <div className="danger-zone">
               <span><strong>Delete all captured history</strong><small>This pauses capture and permanently removes screenshots, OCR, and search indexes. Models are kept.</small></span>
               {confirmDelete ? (
@@ -701,11 +748,95 @@ function HotkeyCapture({ value, busy, onChange }: { value: string; busy: boolean
   );
 }
 
+function ModelSettings({
+  models,
+  draft,
+  busy,
+  onDraft,
+  onImport,
+  onDownload,
+  onSelect,
+  onDelete,
+  onUnload,
+}: {
+  models: GenerationModel[];
+  draft: { sourcePath: string; repository: string; filename: string; displayName: string };
+  busy: boolean;
+  onDraft: (draft: { sourcePath: string; repository: string; filename: string; displayName: string }) => void;
+  onImport: () => void;
+  onDownload: () => void;
+  onSelect: (modelId: string) => void;
+  onDelete: (modelId: string) => void;
+  onUnload: () => void;
+}) {
+  const active = models.find((model) => model.active);
+  return (
+    <section className="model-settings" aria-label="Generation models">
+      <div className="setting-row">
+        <span>
+          <strong>Answer model</strong>
+          <small>{active ? `${active.displayName} · ${active.quantization || "GGUF"}` : "No generation model selected."}</small>
+        </span>
+        <button type="button" onClick={onUnload} disabled={busy || !active}>Unload</button>
+      </div>
+      <label className="settings-field compact">
+        <span><strong>Local GGUF path</strong><small>Use ignored repo samples or any local GGUF file.</small></span>
+        <input value={draft.sourcePath} onChange={(event) => onDraft({ ...draft, sourcePath: event.target.value })} />
+      </label>
+      <label className="settings-field compact">
+        <span><strong>Display name</strong><small>Shown in diagnostics and benchmark reports.</small></span>
+        <input value={draft.displayName} onChange={(event) => onDraft({ ...draft, displayName: event.target.value })} />
+      </label>
+      <div className="modal-actions">
+        <span>Imports copy and hash the GGUF into app data.</span>
+        <button type="button" onClick={onImport} disabled={busy || !draft.sourcePath.trim()}><Archive /> Import local</button>
+      </div>
+      <label className="settings-field compact">
+        <span><strong>Hugging Face repo</strong><small>Explicit download only; no background network use.</small></span>
+        <input value={draft.repository} onChange={(event) => onDraft({ ...draft, repository: event.target.value })} />
+      </label>
+      <label className="settings-field compact">
+        <span><strong>HF filename</strong><small>Example: Qwen3.5-4B-Q4_K_M.gguf.</small></span>
+        <input value={draft.filename} onChange={(event) => onDraft({ ...draft, filename: event.target.value })} />
+      </label>
+      <div className="modal-actions">
+        <span>Downloaded models are stored below local app data.</span>
+        <button type="button" onClick={onDownload} disabled={busy || !draft.repository.trim() || !draft.filename.trim()}><Sparkle /> Download HF</button>
+      </div>
+      {models.length > 0 && (
+        <div className="model-list">
+          {models.map((model) => (
+            <div key={model.id} className="model-row">
+              <span>
+                <strong>{model.displayName}</strong>
+                <small>{model.source} · {formatBytes(model.byteLength)} · {model.architecture || "GGUF"} · {model.quantization || "unknown quant"}</small>
+              </span>
+              <div>
+                <button type="button" onClick={() => onSelect(model.id)} disabled={busy || model.active}>Use</button>
+                <button type="button" className="secondary" onClick={() => onDelete(model.id)} disabled={busy || model.active}>Delete</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function isTypingTarget(target: EventTarget | null) {
   const element = target as HTMLElement | null;
   if (!element) return false;
   const tag = element.tagName;
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || element.isContentEditable;
+}
+
+function answerSubtitle(answer: string, status: string, message: string) {
+  if (answer) return "Grounded in the evidence above";
+  if (status === "model_missing") return message || "Select or download a local GGUF model in Settings.";
+  if (status === "no_evidence") return "No matching evidence was found, so generation did not run.";
+  if (status === "generation_failed") return message || "Local generation failed.";
+  if (status === "cancelled") return "Generation was cancelled.";
+  return "Requires an active local GGUF model";
 }
 
 function normalizeHotkeyKey(key: string) {

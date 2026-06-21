@@ -239,3 +239,28 @@ Patch-plan item 14 stays **open**: the native tray, global hotkey, and hide-to-t
 ### Remaining boundary
 
 Unchanged: patch-plan item 14 stays open pending the manual Windows tray/hotkey runtime check (spec §18). The pause/resume notification is best confirmed in a packaged build.
+
+## 2026-06-21 — P3 model selection and worker boundary implementation
+
+### Changed
+
+- Created the `p3-model-selection-worker` branch.
+- Added migration `0006_generation_model_catalog.sql` for selectable generation models with source kind, file metadata, hash, quantization, context, vision capability, and single-active selection.
+- Extended domain and port contracts with generation-model catalog operations.
+- Extended protobuf IPC additively with model-management requests, answer completion status fields, and worker-only OCR/embedding/generation messages.
+- Added daemon model-management operations for local GGUF import, explicit Hugging Face download, active selection, inactive deletion, and unload.
+- Added a real `screensearch-model-worker` named-pipe endpoint for Windows OCR, MiniLM embeddings, and llama.cpp generation.
+- Changed daemon composition so production OCR, embedding, and generation ports call the model-worker pipe.
+- Updated the desktop proxy, TypeScript API, Settings modal, and answer panel for model management and answer terminal states.
+
+### Why
+
+P3 needs model choice to be measured against the screen-memory use case rather than hard-coded. The branch supports local sample models, explicit Hugging Face downloads, and later bundled discovery while keeping evidence-first search usable without generation.
+
+### Verification evidence
+
+Not run in this implementation session. The Windows sandbox failed before launching commands, and the escalation reviewer rejected further command approval due to usage limits. Required follow-up commands remain `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `npm run lint`, and `npm run build`.
+
+### Remaining boundary
+
+Items 15 and 16 remain open until the branch compiles cleanly, the model-worker is verified against local GGUF candidates, and a benchmark report selects a default model for the use case. Legal/license approval remains intentionally deferred for this engineering slice.

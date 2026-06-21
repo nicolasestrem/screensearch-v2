@@ -210,6 +210,114 @@ pub struct ArchiveSettings {
     pub excluded_titles: Vec<String>,
 }
 
+/// Source used to install or discover a local generation model.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSourceKind {
+    /// Model was imported from a user-provided local file.
+    Local,
+    /// Model was downloaded explicitly from Hugging Face.
+    HuggingFace,
+    /// Model was discovered from packaged application resources.
+    Bundled,
+}
+
+impl ModelSourceKind {
+    /// Stable persistence value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::HuggingFace => "hf",
+            Self::Bundled => "bundled",
+        }
+    }
+
+    /// Parses a persisted source value.
+    pub fn parse(value: &str) -> Result<Self, DomainError> {
+        match value {
+            "local" => Ok(Self::Local),
+            "hf" => Ok(Self::HuggingFace),
+            "bundled" => Ok(Self::Bundled),
+            _ => Err(DomainError::InvalidModelCatalog(format!(
+                "unknown model source kind {value}"
+            ))),
+        }
+    }
+}
+
+/// Runtime metadata for one selectable GGUF generation model.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GenerationModel {
+    /// Stable model identifier used by settings and diagnostics.
+    pub id: String,
+    /// Human-readable model name.
+    pub display_name: String,
+    /// Source used to acquire the model.
+    pub source: ModelSourceKind,
+    /// Hugging Face repository when `source` is `HuggingFace`.
+    pub repository: Option<String>,
+    /// File name inside the source repository or import directory.
+    pub filename: String,
+    /// Path relative to the generation-model root.
+    pub relative_path: String,
+    /// BLAKE3 hash of the GGUF file when known.
+    pub content_hash: Option<String>,
+    /// File size in bytes.
+    pub byte_length: u64,
+    /// Model architecture or family label.
+    pub architecture: Option<String>,
+    /// Quantization label such as `Q4_K_M`.
+    pub quantization: Option<String>,
+    /// Context window configured for evaluation.
+    pub context_tokens: Option<u32>,
+    /// Whether the model has a matching multimodal projector.
+    pub supports_vision: bool,
+    /// Whether this model is currently active for answer generation.
+    pub active: bool,
+}
+
+impl GenerationModel {
+    /// Validates bounded, content-free model metadata.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        validate_model_text("model id", &self.id, 1, 128)?;
+        validate_model_text("model display name", &self.display_name, 1, 160)?;
+        validate_model_text("model filename", &self.filename, 1, 260)?;
+        validate_model_text("model relative path", &self.relative_path, 1, 512)?;
+        if self.relative_path.contains("..") || self.relative_path.starts_with('/') {
+            return Err(DomainError::InvalidModelCatalog(
+                "model relative path must stay below the model root".to_owned(),
+            ));
+        }
+        if let Some(repository) = &self.repository {
+            validate_model_text("model repository", repository, 1, 200)?;
+        }
+        if let Some(content_hash) = &self.content_hash {
+            validate_model_text("model content hash", content_hash, 64, 64)?;
+        }
+        if self.byte_length == 0 {
+            return Err(DomainError::InvalidModelCatalog(
+                "model byte length must be non-zero".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_model_text(
+    label: &str,
+    value: &str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<(), DomainError> {
+    let length = value.trim().chars().count();
+    if length < minimum || length > maximum {
+        return Err(DomainError::InvalidModelCatalog(format!(
+            "{label} must contain {minimum} to {maximum} characters"
+        )));
+    }
+    Ok(())
+}
+
 impl ArchiveSettings {
     /// Validates bounded settings before they cross persistence or IPC boundaries.
     pub fn validate(&self) -> Result<(), DomainError> {
@@ -447,6 +555,10 @@ pub enum SearchEvent {
     Completed {
         /// Number of retrieval citations emitted for this answer.
         citation_count: usize,
+        /// Content-free answer-generation terminal status.
+        answer_status: String,
+        /// Optional content-free explanation for the answer status.
+        answer_message: Option<String>,
     },
 }
 
@@ -462,6 +574,9 @@ pub enum DomainError {
     /// Archive settings exceeded a documented bound.
     #[error("invalid archive settings: {0}")]
     InvalidSettings(String),
+    /// Model catalog metadata exceeded a documented bound.
+    #[error("invalid model catalog: {0}")]
+    InvalidModelCatalog(String),
 }
 
 #[cfg(test)]

@@ -1,30 +1,41 @@
 //! Persistent ScreenSearch V2 daemon and named-pipe endpoint.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context;
+use async_stream::try_stream;
 use futures::{StreamExt, stream};
 use screensearch_application::{
     AnalysisService, CapturePolicy, CapturePolicyConfig, IngestService, SearchService,
 };
 use screensearch_domain::{
-    ArchiveSettings, CaptureDisposition, CaptureId, DeleteCaptures, SearchEvent, SearchMatchKind,
-    StorageMetrics,
+    ArchiveSettings, CaptureDisposition, CaptureId, DeleteCaptures, GenerationModel,
+    ModelSourceKind, SearchEvent, SearchMatchKind, StorageMetrics,
 };
 use screensearch_ipc::{
     IpcError, RequestHandler, ResponseStream,
-    transport::{DEFAULT_PIPE_NAME, serve},
+    transport::{DEFAULT_PIPE_NAME, DEFAULT_WORKER_PIPE_NAME, IpcClient, serve},
     v1::{
         ArchiveSettingsResponse, CaptureAssetResponse, CaptureResponse, Citation,
-        DeleteCapturesResponse, ErrorResponse, HealthResponse, NormalizedRect, ProcessJobsResponse,
-        ResponseEnvelope, SearchCompleted, SearchEvent as IpcSearchEvent, SetCapturePausedResponse,
-        Token, UpdateArchiveSettingsResponse, request_envelope, response_envelope, search_event,
+        DeleteCapturesResponse, DeleteGenerationModelResponse, ErrorResponse,
+        GenerationModel as IpcGenerationModel, GenerationModelResponse, GenerationModelsResponse,
+        HealthResponse, NormalizedRect, ProcessJobsResponse, ResponseEnvelope, SearchCompleted,
+        SearchEvent as IpcSearchEvent, SetCapturePausedResponse, Token,
+        UnloadGenerationModelResponse, UpdateArchiveSettingsResponse, WorkerEmbeddingRequest,
+        WorkerGenerationRequest, WorkerOcrRequest, request_envelope, response_envelope,
+        search_event, worker_generation_event,
     },
 };
-use screensearch_model_runtime::{FastEmbedEngine, LlamaCppTextGenerator};
 use screensearch_persistence::{FileAssetStore, LibSqlArchive};
-use screensearch_ports::ArchiveRepository;
-use screensearch_windows::{WindowsGraphicsCaptureSource, WindowsOcrEngine};
+use screensearch_ports::{
+    ArchiveRepository, EmbeddingEngine, OcrEngine, PortError, TextGenerator, TokenStream,
+};
+use screensearch_windows::WindowsGraphicsCaptureSource;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -35,6 +46,149 @@ struct DaemonHandler {
     repository: Arc<LibSqlArchive>,
     assets: Arc<FileAssetStore>,
     capture_policy: Arc<CapturePolicy>,
+    model_root: PathBuf,
+}
+
+struct WorkerModelClient {
+    repository: Arc<LibSqlArchive>,
+    pipe_name: String,
+}
+
+#[async_trait::async_trait]
+impl OcrEngine for WorkerModelClient {
+    fn model_id(&self) -> &'static str {
+        "windows-media-ocr-user-profile-v1"
+    }
+
+    async fn recognize(
+        &self,
+        asset: &screensearch_domain::AssetRef,
+    ) -> Result<Vec<screensearch_domain::OcrBlock>, PortError> {
+        let responses = IpcClient::new(&self.pipe_name)
+            .request(screensearch_ipc::v1::RequestEnvelope {
+                request_id: uuid::Uuid::now_v7().to_string(),
+                body: Some(request_envelope::Body::WorkerOcr(WorkerOcrRequest {
+                    asset_relative_path: asset.relative_path.clone(),
+                    media_type: asset.media_type.clone(),
+                })),
+            })
+            .await
+            .map_err(|error| worker_error(&error))?;
+        for response in responses {
+            match response.body {
+                Some(response_envelope::Body::WorkerOcr(result)) => {
+                    return result
+                        .blocks
+                        .into_iter()
+                        .map(|block| {
+                            let bounds = block.bounds.ok_or_else(|| {
+                                PortError::InvalidData(
+                                    "worker OCR block is missing bounds".to_owned(),
+                                )
+                            })?;
+                            Ok(screensearch_domain::OcrBlock {
+                                reading_order: block.reading_order,
+                                bounds: screensearch_domain::BoundingBox {
+                                    x: bounds.x,
+                                    y: bounds.y,
+                                    width: bounds.width,
+                                    height: bounds.height,
+                                }
+                                .validate()
+                                .map_err(|error| PortError::InvalidData(error.to_string()))?,
+                                text: block.text,
+                                confidence: block.confidence,
+                                language: (!block.language.is_empty()).then_some(block.language),
+                            })
+                        })
+                        .collect();
+                }
+                Some(response_envelope::Body::Error(error)) => {
+                    return Err(PortError::Transient(error.message));
+                }
+                _ => {}
+            }
+        }
+        Err(PortError::Transient(
+            "worker returned no OCR response".to_owned(),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl EmbeddingEngine for WorkerModelClient {
+    fn model_id(&self) -> &'static str {
+        "fastembed-all-minilm-l6-v2-q-384-v1"
+    }
+
+    fn dimensions(&self) -> usize {
+        384
+    }
+
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, PortError> {
+        let responses = IpcClient::new(&self.pipe_name)
+            .request(screensearch_ipc::v1::RequestEnvelope {
+                request_id: uuid::Uuid::now_v7().to_string(),
+                body: Some(request_envelope::Body::WorkerEmbedding(
+                    WorkerEmbeddingRequest {
+                        text: text.to_owned(),
+                    },
+                )),
+            })
+            .await
+            .map_err(|error| worker_error(&error))?;
+        for response in responses {
+            match response.body {
+                Some(response_envelope::Body::WorkerEmbedding(result)) => return Ok(result.vector),
+                Some(response_envelope::Body::Error(error)) => {
+                    return Err(PortError::Transient(error.message));
+                }
+                _ => {}
+            }
+        }
+        Err(PortError::Transient(
+            "worker returned no embedding response".to_owned(),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl TextGenerator for WorkerModelClient {
+    async fn generate(&self, prompt: String) -> Result<TokenStream, PortError> {
+        let model = self.repository.active_generation_model().await?;
+        let model_relative_path = model.map_or_else(
+            || "generator/model.gguf".to_owned(),
+            |model| format!("generator/{}", model.relative_path),
+        );
+        let pipe_name = self.pipe_name.clone();
+        Ok(Box::pin(try_stream! {
+            let responses = IpcClient::new(pipe_name)
+                .request(screensearch_ipc::v1::RequestEnvelope {
+                    request_id: uuid::Uuid::now_v7().to_string(),
+                    body: Some(request_envelope::Body::WorkerGeneration(WorkerGenerationRequest {
+                        model_id: String::new(),
+                        model_relative_path,
+                        prompt,
+                    })),
+                })
+                .await
+                .map_err(|error| PortError::Unavailable(format!("model worker: {error}")))?;
+            for response in responses {
+                match response.body {
+                    Some(response_envelope::Body::WorkerGeneration(event)) => match event.event {
+                        Some(worker_generation_event::Event::Token(token)) => yield token.text,
+                        Some(worker_generation_event::Event::Completed(_)) | None => {}
+                    },
+                    Some(response_envelope::Body::Error(error)) => Err(PortError::Unavailable(error.message))?,
+                    _ => {}
+                }
+            }
+        }))
+    }
+}
+
+fn worker_error(error: &IpcError) -> PortError {
+    PortError::Transient(format!("model worker: {error}"))
 }
 
 #[async_trait::async_trait]
@@ -393,6 +547,135 @@ impl RequestHandler for DaemonHandler {
                     )),
                 }))
             }
+            request_envelope::Body::ListGenerationModels(_) => {
+                let models = self
+                    .repository
+                    .generation_models()
+                    .await
+                    .map_err(|error| IpcError::Handler(error.to_string()))?;
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::GenerationModels(
+                        GenerationModelsResponse {
+                            models: models.into_iter().map(map_generation_model).collect(),
+                        },
+                    )),
+                }))
+            }
+            request_envelope::Body::ImportLocalGenerationModel(command) => {
+                let response = match import_generation_model(
+                    &self.model_root,
+                    &command.source_path,
+                    &command.display_name,
+                    command.select,
+                    &self.repository,
+                )
+                .await
+                {
+                    Ok(model) => ResponseEnvelope {
+                        request_id,
+                        terminal: true,
+                        body: Some(response_envelope::Body::GenerationModel(
+                            GenerationModelResponse {
+                                model: Some(map_generation_model(model)),
+                            },
+                        )),
+                    },
+                    Err(error) => {
+                        error_response(request_id, "model_import_failed", &error.to_string(), false)
+                    }
+                };
+                Ok(single_response(response))
+            }
+            request_envelope::Body::DownloadGenerationModel(command) => {
+                let response = match download_generation_model(
+                    &self.model_root,
+                    &command.repository,
+                    &command.filename,
+                    &command.display_name,
+                    command.select,
+                    &self.repository,
+                )
+                .await
+                {
+                    Ok(model) => ResponseEnvelope {
+                        request_id,
+                        terminal: true,
+                        body: Some(response_envelope::Body::GenerationModel(
+                            GenerationModelResponse {
+                                model: Some(map_generation_model(model)),
+                            },
+                        )),
+                    },
+                    Err(error) => error_response(
+                        request_id,
+                        "model_download_failed",
+                        &error.to_string(),
+                        true,
+                    ),
+                };
+                Ok(single_response(response))
+            }
+            request_envelope::Body::SelectGenerationModel(command) => {
+                if let Err(error) = self
+                    .repository
+                    .select_generation_model(&command.model_id)
+                    .await
+                {
+                    return Ok(single_response(error_response(
+                        request_id,
+                        "model_select_failed",
+                        &error.to_string(),
+                        false,
+                    )));
+                }
+                let model = self
+                    .repository
+                    .active_generation_model()
+                    .await
+                    .map_err(|error| IpcError::Handler(error.to_string()))?
+                    .ok_or_else(|| IpcError::Handler("active model is missing".to_owned()))?;
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::GenerationModel(
+                        GenerationModelResponse {
+                            model: Some(map_generation_model(model)),
+                        },
+                    )),
+                }))
+            }
+            request_envelope::Body::DeleteGenerationModel(command) => {
+                let deleted =
+                    delete_generation_model(&self.model_root, &command.model_id, &self.repository)
+                        .await
+                        .map_err(|error| IpcError::Handler(error.to_string()))?;
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::DeleteGenerationModel(
+                        DeleteGenerationModelResponse { deleted },
+                    )),
+                }))
+            }
+            request_envelope::Body::UnloadGenerationModel(_)
+            | request_envelope::Body::WorkerUnload(_) => Ok(single_response(ResponseEnvelope {
+                request_id,
+                terminal: true,
+                body: Some(response_envelope::Body::UnloadGenerationModel(
+                    UnloadGenerationModelResponse { unloaded: true },
+                )),
+            })),
+            request_envelope::Body::WorkerHealth(_)
+            | request_envelope::Body::WorkerOcr(_)
+            | request_envelope::Body::WorkerEmbedding(_)
+            | request_envelope::Body::WorkerGeneration(_) => Ok(single_response(error_response(
+                request_id,
+                "wrong_endpoint",
+                "worker request was sent to the daemon endpoint",
+                false,
+            ))),
         }
     }
 }
@@ -446,13 +729,261 @@ fn map_search_event(event: SearchEvent) -> (search_event::Event, bool) {
             false,
         ),
         SearchEvent::Token(text) => (search_event::Event::Token(Token { text }), false),
-        SearchEvent::Completed { citation_count } => (
+        SearchEvent::Completed {
+            citation_count,
+            answer_status,
+            answer_message,
+        } => (
             search_event::Event::Completed(SearchCompleted {
                 citation_count: u32::try_from(citation_count).unwrap_or(u32::MAX),
+                answer_status,
+                answer_message: answer_message.unwrap_or_default(),
             }),
             true,
         ),
     }
+}
+
+fn map_generation_model(model: GenerationModel) -> IpcGenerationModel {
+    IpcGenerationModel {
+        id: model.id,
+        display_name: model.display_name,
+        source: model.source.as_str().to_owned(),
+        repository: model.repository.unwrap_or_default(),
+        filename: model.filename,
+        relative_path: model.relative_path,
+        content_hash: model.content_hash.unwrap_or_default(),
+        byte_length: model.byte_length,
+        architecture: model.architecture.unwrap_or_default(),
+        quantization: model.quantization.unwrap_or_default(),
+        context_tokens: model.context_tokens.unwrap_or_default(),
+        supports_vision: model.supports_vision,
+        active: model.active,
+    }
+}
+
+async fn import_generation_model(
+    model_root: &Path,
+    source_path: &str,
+    display_name: &str,
+    select: bool,
+    repository: &Arc<LibSqlArchive>,
+) -> Result<GenerationModel, anyhow::Error> {
+    let source = PathBuf::from(source_path);
+    let filename = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("source model file has no filename"))?
+        .to_owned();
+    let model_id = model_id(display_name, &filename);
+    let relative_path = format!("{model_id}/{filename}");
+    let target = model_root.join(&relative_path);
+    let byte_length = copy_hashing(&source, &target).await?;
+    let content_hash = hash_file(&target).await?;
+    let model = generation_model_from_file(
+        model_id,
+        display_name,
+        ModelSourceKind::Local,
+        None,
+        &filename,
+        relative_path,
+        content_hash,
+        byte_length,
+        select,
+    );
+    repository
+        .upsert_generation_model(model.clone())
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(model)
+}
+
+async fn download_generation_model(
+    model_root: &Path,
+    hf_repository: &str,
+    filename: &str,
+    display_name: &str,
+    select: bool,
+    repository: &Arc<LibSqlArchive>,
+) -> Result<GenerationModel, anyhow::Error> {
+    let hf_repository = hf_repository.trim();
+    let filename = filename.trim();
+    if hf_repository.is_empty() || filename.is_empty() {
+        anyhow::bail!("Hugging Face repository and filename are required");
+    }
+    let model_id = model_id(display_name, filename);
+    let relative_path = format!("{model_id}/{filename}");
+    let target = model_root.join(&relative_path);
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = target.with_extension("download");
+    let url = format!("https://huggingface.co/{hf_repository}/resolve/main/{filename}");
+    let mut response = reqwest::get(url).await?.error_for_status()?;
+    let mut output = tokio::fs::File::create(&temporary).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut byte_length = 0_u64;
+    while let Some(chunk) = response.chunk().await? {
+        hasher.update(&chunk);
+        output.write_all(&chunk).await?;
+        byte_length = byte_length.saturating_add(chunk.len() as u64);
+    }
+    output.flush().await?;
+    drop(output);
+    let _ = tokio::fs::remove_file(&target).await;
+    tokio::fs::rename(&temporary, &target).await?;
+    let model = generation_model_from_file(
+        model_id,
+        display_name,
+        ModelSourceKind::HuggingFace,
+        Some(hf_repository.to_owned()),
+        filename,
+        relative_path,
+        hasher.finalize().to_hex().to_string(),
+        byte_length,
+        select,
+    );
+    repository
+        .upsert_generation_model(model.clone())
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(model)
+}
+
+async fn delete_generation_model(
+    model_root: &Path,
+    model_id: &str,
+    repository: &Arc<LibSqlArchive>,
+) -> Result<bool, anyhow::Error> {
+    let Some(model) = repository
+        .delete_generation_model(model_id)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+    else {
+        return Ok(false);
+    };
+    let path = model_root.join(model.relative_path);
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generation_model_from_file(
+    id: String,
+    display_name: &str,
+    source: ModelSourceKind,
+    repository: Option<String>,
+    filename: &str,
+    relative_path: String,
+    content_hash: String,
+    byte_length: u64,
+    active: bool,
+) -> GenerationModel {
+    let quantization = infer_quantization(filename);
+    GenerationModel {
+        id,
+        display_name: if display_name.trim().is_empty() {
+            filename.trim_end_matches(".gguf").to_owned()
+        } else {
+            display_name.trim().to_owned()
+        },
+        source,
+        repository,
+        filename: filename.to_owned(),
+        relative_path,
+        content_hash: Some(content_hash),
+        byte_length,
+        architecture: infer_architecture(filename),
+        quantization,
+        context_tokens: Some(2_048),
+        supports_vision: filename.to_lowercase().contains("vl") || filename.contains("mmproj"),
+        active,
+    }
+}
+
+async fn copy_hashing(source: &Path, target: &Path) -> Result<u64, anyhow::Error> {
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = target.with_extension("import");
+    let mut input = tokio::fs::File::open(source).await?;
+    let mut output = tokio::fs::File::create(&temporary).await?;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut byte_length = 0_u64;
+    loop {
+        let read = input.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read]).await?;
+        byte_length = byte_length.saturating_add(read as u64);
+    }
+    output.flush().await?;
+    drop(output);
+    let _ = tokio::fs::remove_file(target).await;
+    tokio::fs::rename(&temporary, target).await?;
+    Ok(byte_length)
+}
+
+async fn hash_file(path: &Path) -> Result<String, anyhow::Error> {
+    let mut input = tokio::fs::File::open(path).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = input.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn model_id(display_name: &str, filename: &str) -> String {
+    let base = if display_name.trim().is_empty() {
+        filename.trim_end_matches(".gguf")
+    } else {
+        display_name.trim()
+    };
+    let mut id = base
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while id.contains("--") {
+        id = id.replace("--", "-");
+    }
+    id.trim_matches('-').chars().take(96).collect()
+}
+
+fn infer_architecture(filename: &str) -> Option<String> {
+    let lowercase = filename.to_lowercase();
+    [
+        ("nemotron", "Nemotron"),
+        ("ministral", "Ministral"),
+        ("qwen", "Qwen"),
+        ("gemma", "Gemma"),
+        ("phi", "Phi"),
+        ("smollm", "SmolLM"),
+    ]
+    .iter()
+    .find_map(|(needle, label)| lowercase.contains(needle).then(|| (*label).to_owned()))
+}
+
+fn infer_quantization(filename: &str) -> Option<String> {
+    let uppercase = filename.to_ascii_uppercase();
+    ["Q4_K_M", "Q4_K_S", "Q5_K_M", "Q6_K", "Q8_0", "BF16", "F16"]
+        .iter()
+        .find_map(|value| uppercase.contains(value).then(|| (*value).to_owned()))
 }
 
 fn single_response(response: ResponseEnvelope) -> ResponseStream {
@@ -506,10 +1037,14 @@ async fn main() -> anyhow::Result<()> {
 
     let asset_root = data_directory.join("assets");
     let assets = Arc::new(FileAssetStore::new(&asset_root));
-    let embeddings = Arc::new(FastEmbedEngine::new(data_directory.join("models")));
-    let generator = Arc::new(LlamaCppTextGenerator::new(
-        data_directory.join("models/generator/model.gguf"),
-    ));
+    let model_root = data_directory.join("models");
+    let generator_root = model_root.join("generator");
+    let mut model_worker = spawn_model_worker(&data_directory, &asset_root, &model_root)
+        .context("launch model worker")?;
+    let worker_client = Arc::new(WorkerModelClient {
+        repository: repository.clone(),
+        pipe_name: DEFAULT_WORKER_PIPE_NAME.to_owned(),
+    });
     let capture_policy = Arc::new(CapturePolicy::new(CapturePolicyConfig {
         queue_high_water: 100,
         queue_low_water: 50,
@@ -530,8 +1065,8 @@ async fn main() -> anyhow::Result<()> {
     ));
     let analysis = Arc::new(AnalysisService::new(
         repository.clone(),
-        Arc::new(WindowsOcrEngine::new(asset_root)),
-        embeddings.clone(),
+        worker_client.clone(),
+        worker_client.clone(),
         "daemon-windows-worker",
     ));
     let handler = Arc::new(DaemonHandler {
@@ -539,12 +1074,13 @@ async fn main() -> anyhow::Result<()> {
         analysis: analysis.clone(),
         search: Arc::new(SearchService::new(
             repository.clone(),
-            embeddings,
-            generator,
+            worker_client.clone(),
+            worker_client,
         )),
         repository,
         assets,
         capture_policy,
+        model_root: generator_root,
     });
 
     info!(pipe = DEFAULT_PIPE_NAME, "daemon ready");
@@ -563,6 +1099,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = tokio::time::timeout(Duration::from_secs(3), capture_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(3), analysis_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(3), maintenance_task).await;
+    let _ = model_worker.start_kill();
     info!("daemon stopped");
     Ok(())
 }
@@ -633,6 +1170,53 @@ async fn maintenance_loop(ingest: Arc<IngestService>, mut shutdown: watch::Recei
             }
         }
     }
+}
+
+fn spawn_model_worker(
+    data_directory: &Path,
+    asset_root: &Path,
+    model_root: &Path,
+) -> anyhow::Result<tokio::process::Child> {
+    let current = std::env::current_exe().context("resolve daemon executable path")?;
+    let worker_name = if cfg!(windows) {
+        "screensearch-model-worker.exe"
+    } else {
+        "screensearch-model-worker"
+    };
+    let binary_dir = current
+        .parent()
+        .context("daemon executable has no parent directory")?;
+    let worker = binary_dir.join(worker_name);
+    let worker = if worker.is_file() {
+        worker
+    } else {
+        let dev_worker = workspace_debug_worker_path(binary_dir, worker_name);
+        if dev_worker.is_file() {
+            dev_worker
+        } else {
+            anyhow::bail!(
+                "model worker binary was not found beside the daemon; build it with `cargo build -p screensearch-model-worker`"
+            );
+        }
+    };
+    let mut command = tokio::process::Command::new(worker);
+    command
+        .arg("--asset-root")
+        .arg(asset_root)
+        .arg("--model-root")
+        .arg(model_root)
+        .arg("--pipe")
+        .arg(DEFAULT_WORKER_PIPE_NAME);
+    if let Some(data_directory) = data_directory.to_str() {
+        command.env("SCREENSEARCH_DATA_DIR", data_directory);
+    }
+    command
+        .spawn()
+        .context("spawn screensearch-model-worker process")
+}
+
+fn workspace_debug_worker_path(binary_dir: &Path, worker_name: &str) -> PathBuf {
+    binary_dir.join(worker_name)
 }
 
 fn data_directory() -> anyhow::Result<PathBuf> {
