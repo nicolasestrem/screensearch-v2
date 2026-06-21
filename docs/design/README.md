@@ -24,6 +24,9 @@ The blocking visual review is recorded in [`design-qa.md`](../../design-qa.md).
 
 ## Shell lifecycle (P2)
 
+The full P2 shell reference and manual Windows verification runbook is in
+[`p2-shell.md`](p2-shell.md).
+
 - ScreenSearch runs as a tray application. The tray shows at-a-glance capture state in its
   tooltip and an informational status line, and offers **Open ScreenSearch**, **Pause/Resume
   capture**, and **Quit**. The tray status is refreshed by a background daemon health poll and

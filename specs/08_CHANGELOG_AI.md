@@ -183,6 +183,13 @@ Unchanged from the prior P1 entry: P2 product-shell lifecycle and keyboard work,
 - Added a shell-local settings file (`apps/desktop/src-tauri/src/shell_settings.rs`): `ShellSettings { hotkey }` persisted atomically as JSON under the Tauri app-config directory, with `get_shell_settings`/`set_shell_settings` commands. `set_shell_settings` validates the accelerator before persisting and re-registers the shortcut live.
 - Implemented complete keyboard navigation in the Memory Timeline UI (`apps/desktop/src/App.tsx`, `styles.css`): Arrow Up/Down/Home/End move the selected result (roving tab index, focus + scroll into view, guarded against firing while typing); ARIA tablist Arrow Left/Right/Home/End for the evidence detail tabs; a focus trap, first-control focus, Escape-to-close, and focus restoration for dialogs; a `:focus-visible` ring; and a hotkey-capture control in Settings that records combinations in Tauri's accelerator vocabulary. Ctrl+K continues to focus (and now selects) the search field.
 - Added the `tray-icon` feature to `tauri`, plus `tauri-plugin-global-shortcut`, `serde_json`, and `tokio` to the desktop crate. Added `getShellSettings`/`setShellSettings` and a `summon-search` listener to `apps/desktop/src/api.ts`.
+- Documented the slice comprehensively in `docs/design/p2-shell.md` (architecture, keyboard model, accelerator vocabulary, shell-local settings, and a step-by-step manual Windows verification runbook/checklist), linked from `docs/design/README.md` and referenced from the build review and patch plan.
+
+### Fixed (UI resilience, surfaced during manual Windows testing)
+
+- Hardened the timeline date helpers (`formatTime`/`formatDateTime`/`dayLabel` and the date filter) with a shared `safeDate` that returns a fallback for any unparseable timestamp instead of throwing `RangeError: Invalid time value` from `Intl.DateTimeFormat`. Previously a single malformed/edge `capturedAt` could crash `TimelineItem` and, with no boundary, blank the entire window. `safeDate` logs the offending raw value once (`console.warn`) for diagnosis.
+- Added a React error boundary (`apps/desktop/src/ErrorBoundary.tsx`, wired in `main.tsx`) around the app so any unexpected render error shows a recoverable message instead of a blank window. (Error boundaries must be class components — the one intentional exception to the functional-component convention.)
+- Confirmed against the live archive that real citation data is well-formed (valid RFC3339 millisecond timestamps and UUID chunk ids), so these are defense-in-depth guarantees, not a workaround for a data defect.
 
 ### Why
 

@@ -247,6 +247,12 @@ dd { min-width: 0; margin: 0; overflow: hidden; color: #d0cfca; text-overflow: e
 .hotkey-capture.recording { border-color: var(--accent); color: var(--accent); }
 .hotkey-capture kbd { border: 0; padding: 0; background: transparent; box-shadow: none; }
 
+.app-error { display: grid; gap: 12px; place-content: center; height: 100vh; padding: 32px; text-align: center; color: var(--text); }
+.app-error h1 { font-size: 18px; }
+.app-error pre { max-width: 520px; margin: 0 auto; overflow: auto; border: 1px solid #6c3f3f; border-radius: 6px; padding: 10px 12px; color: #f0b7b7; background: #2a1919; font-size: 11px; text-align: left; }
+.app-error-actions { display: flex; gap: 10px; justify-content: center; }
+.app-error-actions button { border: 1px solid #454641; border-radius: 6px; padding: 7px 14px; color: var(--text); background: #242525; }
+
 .toast, .error-toast { position: fixed; z-index: 30; right: 18px; bottom: 50px; display: flex; align-items: center; gap: 8px; border: 1px solid #31583f; border-radius: 6px; padding: 10px 12px; color: #d1ded4; background: #19251d; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3); font-size: 11px; }
 .toast svg { color: var(--green); }
 .error-toast { max-width: 480px; border-color: #6c3f3f; color: #f0b7b7; background: #2a1919; }

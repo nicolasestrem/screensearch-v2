@@ -101,7 +101,9 @@ export function App() {
     () => citations.filter((citation) => {
       if (applicationFilter !== "all" && citation.application !== applicationFilter) return false;
       if (dateFilter === "any") return true;
-      const age = referenceTime - new Date(citation.capturedAt).getTime();
+      const captured = safeDate(citation.capturedAt);
+      if (!captured) return true;
+      const age = referenceTime - captured.getTime();
       const day = 86_400_000;
       if (dateFilter === "today") return age < day;
       if (dateFilter === "week") return age < day * 7;
@@ -737,8 +739,25 @@ function groupCitations(citations: Citation[]) {
   return [...groups.entries()].map(([label, items]) => ({ label, items }));
 }
 
-function dayLabel(value: string) {
+const warnedTimestamps = new Set<string>();
+
+// Parse a capture timestamp defensively. A single malformed value must never crash the timeline,
+// so unparseable input returns null (callers render a fallback) and is logged once for diagnosis.
+function safeDate(value: string): Date | null {
   const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    if (!warnedTimestamps.has(value)) {
+      warnedTimestamps.add(value);
+      console.warn("ScreenSearch: unparseable capture timestamp", JSON.stringify(value));
+    }
+    return null;
+  }
+  return date;
+}
+
+function dayLabel(value: string) {
+  const date = safeDate(value);
+  if (!date) return "Unknown date";
   const today = new Date();
   const start = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
   const captured = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
@@ -749,11 +768,15 @@ function dayLabel(value: string) {
 }
 
 function formatTime(value: string) {
-  return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value));
+  const date = safeDate(value);
+  if (!date) return "Unknown time";
+  return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(date);
 }
 
 function formatDateTime(value: string) {
-  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(value));
+  const date = safeDate(value);
+  if (!date) return "Unknown date";
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(date);
 }
 
 function readBlobAsDataUrl(blob: Blob) {
