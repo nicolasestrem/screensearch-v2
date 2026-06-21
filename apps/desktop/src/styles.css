@@ -1,0 +1,60 @@
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #e8edf7;
+  background: #090d18;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradient(circle at 15% 0%, #142544 0%, #090d18 40%); }
+button, input { font: inherit; }
+button { border: 0; border-radius: 10px; padding: 12px 18px; color: #08111e; background: #84f7cc; font-weight: 750; cursor: pointer; }
+button.secondary { color: #dbe6f8; background: #23304a; }
+button:disabled { cursor: wait; opacity: 0.55; }
+
+.shell { width: min(980px, calc(100% - 40px)); margin: 0 auto; padding: 48px 0 80px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 42px; }
+h1 { margin: 3px 0 0; font-size: clamp(2.3rem, 6vw, 4.6rem); letter-spacing: -0.055em; }
+h1 span { color: #84f7cc; }
+h2 { margin: 5px 0 10px; font-size: 1.7rem; }
+p { line-height: 1.6; }
+.eyebrow, .label { margin: 0; color: #8190aa; font-size: 0.72rem; font-weight: 800; letter-spacing: 0.15em; text-transform: uppercase; }
+.status { display: flex; align-items: center; gap: 8px; color: #a9b5c9; font-size: 0.86rem; }
+.status i { width: 9px; height: 9px; border-radius: 50%; background: #f17474; box-shadow: 0 0 15px #f17474; }
+.status.ready i { background: #84f7cc; box-shadow: 0 0 15px #84f7cc; }
+.capture-card, .result, .search { border: 1px solid #28344d; border-radius: 20px; background: rgba(16, 23, 40, 0.86); box-shadow: 0 20px 80px rgba(0, 0, 0, 0.22); }
+.capture-card { display: flex; justify-content: space-between; align-items: center; gap: 30px; padding: 28px; }
+.capture-card p:last-child { margin-bottom: 0; color: #9ba8bd; }
+.actions { display: flex; flex-shrink: 0; flex-wrap: wrap; gap: 10px; }
+.actions small { flex-basis: 100%; min-height: 1.2em; color: #84f7cc; text-align: right; }
+.search { margin-top: 18px; padding: 24px; }
+.search label { display: block; margin-bottom: 12px; font-weight: 700; }
+.search div { display: flex; gap: 10px; }
+.search input { width: 100%; border: 1px solid #34425e; border-radius: 10px; padding: 12px 14px; color: #e8edf7; background: #0a1020; outline: none; }
+.search input:focus { border-color: #84f7cc; box-shadow: 0 0 0 3px rgba(132, 247, 204, 0.12); }
+.result { min-height: 220px; margin-top: 18px; padding: 28px; }
+.answer { max-width: 760px; margin: 16px 0 24px; font-size: 1.18rem; }
+.answer.empty { color: #71809a; }
+.citations { display: grid; gap: 14px; margin-top: 16px; }
+.evidence-card { display: grid; grid-template-columns: minmax(260px, 42%) 1fr; overflow: hidden; border: 1px solid #2e3a52; border-radius: 12px; background: #0b1120; }
+.screenshot { position: relative; min-height: 170px; background: #050812; }
+.screenshot img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.image-state { display: grid; min-height: 170px; place-items: center; padding: 20px; color: #71809a; font-size: 0.85rem; }
+.match-box { position: absolute; border: 2px solid #84f7cc; border-radius: 3px; background: rgba(132, 247, 204, 0.18); box-shadow: 0 0 0 1px rgba(7, 17, 30, 0.8); pointer-events: none; }
+.evidence-copy { align-self: center; padding: 16px 18px; }
+.evidence-copy p { margin: 8px 0 0; color: #c1cbda; font-size: 0.93rem; }
+.evidence-copy .window-title { overflow: hidden; color: #8190aa; font-size: 0.82rem; text-overflow: ellipsis; white-space: nowrap; }
+.evidence-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
+.evidence-meta strong { color: #f0f4fb; }
+.evidence-meta time { color: #8190aa; font-size: 0.78rem; }
+.evidence-meta span { margin-left: auto; border: 1px solid #305345; border-radius: 999px; padding: 3px 7px; color: #84f7cc; font-size: 0.68rem; text-transform: uppercase; }
+.answer-block { margin-top: 24px; border-top: 1px solid #28344d; padding-top: 24px; }
+.error { margin-top: 18px; border: 1px solid #663b49; border-radius: 12px; padding: 14px; color: #ffb7c5; background: #2d1720; }
+
+@media (max-width: 720px) {
+  header, .capture-card { align-items: flex-start; flex-direction: column; }
+  .actions { width: 100%; }
+  .actions button { flex: 1; }
+  .evidence-card { grid-template-columns: 1fr; }
+}

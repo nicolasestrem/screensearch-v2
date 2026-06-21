@@ -1,0 +1,16 @@
+/target/
+node_modules/
+dist/
+.vite/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+/data/
+/models/
+/captures/
+**/src-tauri/gen/

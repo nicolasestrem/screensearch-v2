@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package screensearch.v1;
+
+message RequestEnvelope {
+  string request_id = 1;
+  oneof body {
+    HealthRequest health = 10;
+    CaptureRequest capture = 11;
+    ProcessJobsRequest process_jobs = 12;
+    SearchRequest search = 13;
+    GetCaptureAssetRequest get_capture_asset = 14;
+  }
+}
+
+message ResponseEnvelope {
+  string request_id = 1;
+  bool terminal = 2;
+  oneof body {
+    HealthResponse health = 10;
+    CaptureResponse capture = 11;
+    ProcessJobsResponse process_jobs = 12;
+    SearchEvent search = 13;
+    ErrorResponse error = 14;
+    CaptureAssetResponse capture_asset = 15;
+  }
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string version = 1;
+  string status = 2;
+}
+
+message CaptureRequest {}
+
+message CaptureResponse {
+  string capture_id = 1;
+  bool duplicate = 2;
+}
+
+message ProcessJobsRequest {
+  uint32 maximum = 1;
+}
+
+message ProcessJobsResponse {
+  uint32 processed = 1;
+}
+
+message SearchRequest {
+  string query = 1;
+  uint32 limit = 2;
+  bool generate_answer = 3;
+}
+
+message SearchEvent {
+  oneof event {
+    Citation citation = 1;
+    Token token = 2;
+    SearchCompleted completed = 3;
+  }
+}
+
+message Citation {
+  string capture_id = 1;
+  string chunk_id = 2;
+  string excerpt = 3;
+  double score = 4;
+  string captured_at = 5;
+  string application = 6;
+  string window_title = 7;
+  uint32 width = 8;
+  uint32 height = 9;
+  repeated NormalizedRect bounds = 10;
+  string match_kind = 11;
+  string ocr_model_id = 12;
+  string embedding_model_id = 13;
+}
+
+message NormalizedRect {
+  float x = 1;
+  float y = 2;
+  float width = 3;
+  float height = 4;
+}
+
+message GetCaptureAssetRequest {
+  string capture_id = 1;
+}
+
+message CaptureAssetResponse {
+  string capture_id = 1;
+  string media_type = 2;
+  bytes content = 3;
+}
+
+message Token {
+  string text = 1;
+}
+
+message SearchCompleted {
+  uint32 citation_count = 1;
+}
+
+message ErrorResponse {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+}

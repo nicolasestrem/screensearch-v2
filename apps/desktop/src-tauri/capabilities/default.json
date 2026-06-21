@@ -1,0 +1,7 @@
+{
+  "identifier": "main-capability",
+  "description": "Least-privilege capability for the ScreenSearch main window.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
+

@@ -1,0 +1,20 @@
+[package]
+name = "screensearch-windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+image.workspace = true
+screensearch-domain = { path = "../domain" }
+screensearch-ports = { path = "../ports" }
+tokio.workspace = true
+windows.workspace = true
+xcap.workspace = true
+
+[lints]
+workspace = true

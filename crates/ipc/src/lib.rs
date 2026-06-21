@@ -1,0 +1,310 @@
+//! Versioned Protobuf messages and local named-pipe transport.
+
+use std::{pin::Pin, sync::Arc};
+
+use async_trait::async_trait;
+use futures::Stream;
+use thiserror::Error;
+
+/// Generated V1 IPC contract.
+#[allow(missing_docs)]
+pub mod v1 {
+    include!(concat!(env!("OUT_DIR"), "/screensearch.v1.rs"));
+}
+
+/// Stream of response envelopes for one request.
+pub type ResponseStream =
+    Pin<Box<dyn Stream<Item = Result<v1::ResponseEnvelope, IpcError>> + Send>>;
+
+/// Application handler behind the transport boundary.
+#[async_trait]
+pub trait RequestHandler: Send + Sync {
+    /// Handles one request and returns a finite response stream.
+    async fn handle(&self, request: v1::RequestEnvelope) -> Result<ResponseStream, IpcError>;
+}
+
+/// Shared dynamic request handler.
+pub type SharedHandler = Arc<dyn RequestHandler>;
+
+/// Named-pipe framing or protocol errors.
+#[derive(Debug, Error)]
+pub enum IpcError {
+    /// The operating-system pipe operation failed.
+    #[error("named-pipe I/O: {0}")]
+    Io(#[from] std::io::Error),
+    /// A frame did not contain a valid contract message.
+    #[error("invalid Protobuf frame: {0}")]
+    Decode(#[from] prost::DecodeError),
+    /// A handler ended without a terminal response.
+    #[error("response stream ended without a terminal envelope")]
+    MissingTerminal,
+    /// The request could not be served.
+    #[error("request failed: {0}")]
+    Handler(String),
+    /// The current operating system does not implement this transport.
+    #[error("transport unsupported: {0}")]
+    Unsupported(String),
+}
+
+/// Windows named-pipe transport implementation.
+#[cfg(windows)]
+pub mod transport {
+    use std::{sync::Arc, time::Duration};
+
+    use bytes::Bytes;
+    use futures::{SinkExt, StreamExt};
+    use prost::Message;
+    use tokio::net::windows::named_pipe::{
+        ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+    };
+    use tokio_util::codec::LengthDelimitedCodec;
+    use tracing::{debug, warn};
+
+    use crate::{IpcError, SharedHandler, v1};
+
+    /// Default per-user daemon pipe name.
+    pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\screensearch-v2";
+    const MAX_FRAME_LENGTH: usize = 20 * 1024 * 1024;
+
+    /// Serves requests until the task is cancelled.
+    pub async fn serve(pipe_name: &str, handler: SharedHandler) -> Result<(), IpcError> {
+        let mut first_instance = true;
+        loop {
+            let mut options = ServerOptions::new();
+            options.first_pipe_instance(first_instance);
+            let server = options.create(pipe_name)?;
+            first_instance = false;
+            server.connect().await?;
+            let connection_handler = Arc::clone(&handler);
+            tokio::spawn(async move {
+                if let Err(error) = serve_connection(server, connection_handler).await {
+                    warn!(%error, "named-pipe connection closed with an error");
+                }
+            });
+        }
+    }
+
+    async fn serve_connection(
+        server: NamedPipeServer,
+        handler: SharedHandler,
+    ) -> Result<(), IpcError> {
+        let mut framed = LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_FRAME_LENGTH)
+            .new_framed(server);
+        while let Some(frame) = framed.next().await {
+            let request = v1::RequestEnvelope::decode(frame?)?;
+            debug!(request_id = %request.request_id, "IPC request received");
+            let mut responses = handler.handle(request).await?;
+            let mut saw_terminal = false;
+            while let Some(response) = responses.next().await {
+                let response = response?;
+                saw_terminal |= response.terminal;
+                framed.send(Bytes::from(response.encode_to_vec())).await?;
+                if saw_terminal {
+                    break;
+                }
+            }
+            if !saw_terminal {
+                return Err(IpcError::MissingTerminal);
+            }
+        }
+        Ok(())
+    }
+
+    /// Single-request client used by the Tauri command proxy and contract tests.
+    pub struct IpcClient {
+        pipe_name: String,
+    }
+
+    impl IpcClient {
+        /// Creates a client for a named-pipe endpoint.
+        pub fn new(pipe_name: impl Into<String>) -> Self {
+            Self {
+                pipe_name: pipe_name.into(),
+            }
+        }
+
+        /// Sends one request and collects frames through the terminal envelope.
+        pub async fn request(
+            &self,
+            request: v1::RequestEnvelope,
+        ) -> Result<Vec<v1::ResponseEnvelope>, IpcError> {
+            let mut responses = Vec::new();
+            self.request_each(request, |response| {
+                responses.push(response);
+                Ok(())
+            })
+            .await?;
+            Ok(responses)
+        }
+
+        /// Sends one request and invokes a callback as each response frame arrives.
+        pub async fn request_each<F>(
+            &self,
+            request: v1::RequestEnvelope,
+            mut receive: F,
+        ) -> Result<(), IpcError>
+        where
+            F: FnMut(v1::ResponseEnvelope) -> Result<(), IpcError>,
+        {
+            let client = connect_with_retry(&self.pipe_name).await?;
+            let mut framed = LengthDelimitedCodec::builder()
+                .max_frame_length(MAX_FRAME_LENGTH)
+                .new_framed(client);
+            framed.send(Bytes::from(request.encode_to_vec())).await?;
+
+            while let Some(frame) = framed.next().await {
+                let response = v1::ResponseEnvelope::decode(frame?)?;
+                let terminal = response.terminal;
+                receive(response)?;
+                if terminal {
+                    return Ok(());
+                }
+            }
+            Err(IpcError::MissingTerminal)
+        }
+    }
+
+    async fn connect_with_retry(pipe_name: &str) -> Result<NamedPipeClient, std::io::Error> {
+        let mut last_error = None;
+        for _ in 0..40 {
+            match ClientOptions::new().open(pipe_name) {
+                Ok(client) => return Ok(client),
+                Err(error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| std::io::Error::other("pipe connection failed")))
+    }
+}
+
+/// Non-Windows transport stubs that keep contract crates buildable for documentation tools.
+#[cfg(not(windows))]
+pub mod transport {
+    use crate::{IpcError, SharedHandler, v1};
+
+    /// Symbolic pipe name used only for shared configuration.
+    pub const DEFAULT_PIPE_NAME: &str = "screensearch-v2";
+
+    /// Reports that the bootstrap transport is Windows-only.
+    pub async fn serve(_pipe_name: &str, _handler: SharedHandler) -> Result<(), IpcError> {
+        Err(IpcError::Unsupported(
+            "V2 bootstrap supports Windows named pipes only".to_owned(),
+        ))
+    }
+
+    /// Unsupported client placeholder.
+    pub struct IpcClient;
+
+    impl IpcClient {
+        /// Creates the placeholder client.
+        pub fn new(_pipe_name: impl Into<String>) -> Self {
+            Self
+        }
+
+        /// Reports that the bootstrap transport is Windows-only.
+        pub async fn request(
+            &self,
+            _request: v1::RequestEnvelope,
+        ) -> Result<Vec<v1::ResponseEnvelope>, IpcError> {
+            Err(IpcError::Unsupported(
+                "V2 bootstrap supports Windows named pipes only".to_owned(),
+            ))
+        }
+
+        /// Reports that the bootstrap transport is Windows-only.
+        pub async fn request_each<F>(
+            &self,
+            _request: v1::RequestEnvelope,
+            _receive: F,
+        ) -> Result<(), IpcError>
+        where
+            F: FnMut(v1::ResponseEnvelope) -> Result<(), IpcError>,
+        {
+            Err(IpcError::Unsupported(
+                "V2 bootstrap supports Windows named pipes only".to_owned(),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    use std::sync::Arc;
+
+    use prost::Message;
+
+    use super::v1::{HealthRequest, RequestEnvelope, request_envelope};
+
+    #[test]
+    fn request_contract_round_trips() {
+        let request = RequestEnvelope {
+            request_id: "request-1".to_owned(),
+            body: Some(request_envelope::Body::Health(HealthRequest {})),
+        };
+
+        let bytes = request.encode_to_vec();
+        let decoded = RequestEnvelope::decode(bytes.as_slice()).unwrap();
+
+        assert_eq!(decoded.request_id, "request-1");
+        assert!(matches!(
+            decoded.body,
+            Some(request_envelope::Body::Health(_))
+        ));
+    }
+
+    #[cfg(windows)]
+    struct HealthHandler;
+
+    #[cfg(windows)]
+    #[async_trait::async_trait]
+    impl super::RequestHandler for HealthHandler {
+        async fn handle(
+            &self,
+            request: RequestEnvelope,
+        ) -> Result<super::ResponseStream, super::IpcError> {
+            use super::v1::{HealthResponse, ResponseEnvelope, response_envelope};
+
+            Ok(Box::pin(futures::stream::once(async move {
+                Ok(ResponseEnvelope {
+                    request_id: request.request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::Health(HealthResponse {
+                        version: "test".to_owned(),
+                        status: "ready".to_owned(),
+                    })),
+                })
+            })))
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn named_pipe_round_trips_a_terminal_response() {
+        use super::transport::{IpcClient, serve};
+        use super::v1::response_envelope;
+
+        let pipe_name = format!(r"\\.\pipe\screensearch-v2-test-{}", uuid::Uuid::now_v7());
+        let server_pipe = pipe_name.clone();
+        let server =
+            tokio::spawn(async move { serve(&server_pipe, Arc::new(HealthHandler)).await });
+        let responses = IpcClient::new(&pipe_name)
+            .request(RequestEnvelope {
+                request_id: "pipe-request".to_owned(),
+                body: Some(request_envelope::Body::Health(HealthRequest {})),
+            })
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(responses.len(), 1);
+        assert!(responses[0].terminal);
+        assert!(matches!(
+            responses[0].body,
+            Some(response_envelope::Body::Health(_))
+        ));
+    }
+}

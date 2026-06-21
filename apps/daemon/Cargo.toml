@@ -1,0 +1,25 @@
+[package]
+name = "screensearch-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+screensearch-application = { path = "../../crates/application" }
+screensearch-domain = { path = "../../crates/domain" }
+screensearch-ipc = { path = "../../crates/ipc" }
+screensearch-model-runtime = { path = "../../crates/model-runtime" }
+screensearch-persistence = { path = "../../crates/persistence" }
+screensearch-ports = { path = "../../crates/ports" }
+screensearch-windows = { path = "../../crates/windows" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

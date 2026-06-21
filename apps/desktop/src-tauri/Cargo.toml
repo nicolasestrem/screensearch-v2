@@ -1,0 +1,20 @@
+[package]
+name = "screensearch-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+screensearch-ipc = { path = "../../../crates/ipc" }
+serde.workspace = true
+tauri = { version = "2.11.3", features = [] }
+uuid.workspace = true
+
+[lints]
+workspace = true
+

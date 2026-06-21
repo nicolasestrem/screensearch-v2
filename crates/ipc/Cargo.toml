@@ -1,0 +1,27 @@
+[package]
+name = "screensearch-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+async-trait.workspace = true
+bytes = "1.11"
+futures.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+
+[lints]
+workspace = true

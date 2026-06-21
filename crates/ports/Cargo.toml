@@ -1,0 +1,16 @@
+[package]
+name = "screensearch-ports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+screensearch-domain = { path = "../domain" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
+

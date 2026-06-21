@@ -1,0 +1,25 @@
+[package]
+name = "screensearch-model-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+encoding_rs.workspace = true
+fastembed.workspace = true
+futures.workspace = true
+llama-cpp-2.workspace = true
+screensearch-domain = { path = "../domain" }
+screensearch-ports = { path = "../ports" }
+tokio.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
