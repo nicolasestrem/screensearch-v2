@@ -237,6 +237,16 @@ dd { min-width: 0; margin: 0; overflow: hidden; color: #d0cfca; text-overflow: e
 .state-pill { border: 1px solid #31583f; border-radius: 999px; padding: 4px 8px; color: var(--green); background: #17231b; font-size: 10px; }
 .state-pill.paused { border-color: #675a33; color: var(--accent); background: #29251a; }
 
+/* Keyboard-only focus rings. :where() keeps specificity at 0 so component styles win. */
+:where(button, a, input, select, textarea, [tabindex]):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.timeline-item:focus-visible { outline-offset: -2px; }
+.tabs button:focus-visible { outline-offset: -2px; border-radius: 3px; }
+.command-search input:focus-visible { outline: 0; }
+
+.hotkey-capture { display: inline-flex; align-items: center; min-height: 26px; border: 1px solid #454641; border-radius: 5px; padding: 3px 8px; color: #b8b7b1; background: #242525; font-size: 11px; }
+.hotkey-capture.recording { border-color: var(--accent); color: var(--accent); }
+.hotkey-capture kbd { border: 0; padding: 0; background: transparent; box-shadow: none; }
+
 .toast, .error-toast { position: fixed; z-index: 30; right: 18px; bottom: 50px; display: flex; align-items: center; gap: 8px; border: 1px solid #31583f; border-radius: 6px; padding: 10px 12px; color: #d1ded4; background: #19251d; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3); font-size: 11px; }
 .toast svg { color: var(--green); }
 .error-toast { max-width: 480px; border-color: #6c3f3f; color: #f0b7b7; background: #2a1919; }

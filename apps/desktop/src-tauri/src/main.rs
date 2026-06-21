@@ -1,5 +1,9 @@
 //! Tauri shell and typed proxy to the persistent ScreenSearch daemon.
 
+mod shell_settings;
+
+use std::time::Duration;
+
 use screensearch_ipc::{
     IpcError,
     transport::{DEFAULT_PIPE_NAME, IpcClient},
@@ -10,7 +14,13 @@ use screensearch_ipc::{
     },
 };
 use serde::Serialize;
-use tauri::ipc::Channel;
+use tauri::{
+    AppHandle, Emitter, Manager, WindowEvent, Wry,
+    ipc::Channel,
+    menu::{MenuBuilder, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
+};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,6 +119,11 @@ enum SearchUiEvent {
 
 #[tauri::command]
 async fn health() -> Result<HealthStatus, String> {
+    fetch_health().await
+}
+
+/// Queries the daemon health endpoint once; reused by the `health` command and the tray poller.
+async fn fetch_health() -> Result<HealthStatus, String> {
     let responses = request(request_envelope::Body::Health(HealthRequest {})).await?;
     for response in responses {
         match response.body {
@@ -134,6 +149,32 @@ async fn health() -> Result<HealthStatus, String> {
         }
     }
     Err("daemon returned no health response".to_owned())
+}
+
+/// Returns the shell-local settings (currently the global summon hotkey).
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn get_shell_settings(app: AppHandle) -> shell_settings::ShellSettings {
+    shell_settings::load(&app)
+}
+
+/// Validates and persists the summon hotkey, then re-registers the global shortcut live.
+///
+/// The accelerator is parsed before anything is written so an invalid combination cannot brick
+/// the next launch.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn set_shell_settings(
+    app: AppHandle,
+    hotkey: String,
+) -> Result<shell_settings::ShellSettings, String> {
+    let shortcut = hotkey
+        .parse::<Shortcut>()
+        .map_err(|error| format!("invalid hotkey: {error}"))?;
+    let settings = shell_settings::ShellSettings { hotkey };
+    shell_settings::save(&app, &settings).map_err(|error| error.to_string())?;
+    apply_shortcut(&app, &shortcut)?;
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -385,8 +426,165 @@ fn channel_error(error: tauri::Error) -> IpcError {
     IpcError::Handler(format!("Tauri channel: {error}"))
 }
 
+/// Live tray handles mutated by the background poller to reflect capture state.
+struct TrayHandles {
+    icon: TrayIcon<Wry>,
+    status_item: MenuItem<Wry>,
+    pause_item: MenuItem<Wry>,
+}
+
+/// Brings the main window to the foreground (used by the tray, hotkey, and menu).
+fn summon_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// Registers the global summon shortcut, clearing any previous binding first.
+fn apply_shortcut(app: &AppHandle, shortcut: &Shortcut) -> Result<(), String> {
+    let manager = app.global_shortcut();
+    let _ = manager.unregister_all();
+    manager
+        .register(*shortcut)
+        .map_err(|error| error.to_string())
+}
+
+/// Flips the daemon capture-pause state from the tray menu (best effort).
+///
+/// The tray poller and the in-window health poll both reflect the new state within a few seconds,
+/// so no immediate menu mutation is needed here.
+fn toggle_pause() {
+    tauri::async_runtime::spawn(async move {
+        if let Ok(status) = fetch_health().await {
+            let _ = request(request_envelope::Body::SetCapturePaused(
+                SetCapturePausedRequest {
+                    paused: !status.capture_paused,
+                },
+            ))
+            .await;
+        }
+    });
+}
+
+/// Polls daemon health every few seconds and reflects capture state in the tray.
+fn spawn_health_poll(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let (status_line, pause_label) = match fetch_health().await {
+                Ok(status) => {
+                    let state = match status.capture_state.as_str() {
+                        "paused" => "Paused",
+                        "backpressured" => "Catching up",
+                        _ => "Capturing",
+                    };
+                    let label = if status.capture_paused {
+                        "Resume capture"
+                    } else {
+                        "Pause capture"
+                    };
+                    (format!("{state} · {} queued", status.queue_depth), label)
+                }
+                Err(_) => ("Daemon offline".to_owned(), "Pause capture"),
+            };
+            let tooltip = format!("ScreenSearch V2 — {status_line}");
+            if let Some(handles) = app.try_state::<TrayHandles>() {
+                let _ = handles.icon.set_tooltip(Some(tooltip.as_str()));
+                let _ = handles.status_item.set_text(&status_line);
+                let _ = handles.pause_item.set_text(pause_label);
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    });
+}
+
+/// Builds the tray icon, its menu, and the live status poller during application setup.
+fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let handle = app.handle().clone();
+
+    let open_item = MenuItem::with_id(app, "open", "Open ScreenSearch", true, None::<&str>)?;
+    let status_item = MenuItem::with_id(app, "status", "Connecting…", false, None::<&str>)?;
+    let pause_item = MenuItem::with_id(app, "pause", "Pause capture", true, None::<&str>)?;
+    let separator_top = PredefinedMenuItem::separator(app)?;
+    let separator_bottom = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit ScreenSearch", true, None::<&str>)?;
+    let menu = MenuBuilder::new(app)
+        .items(&[
+            &open_item,
+            &separator_top,
+            &status_item,
+            &pause_item,
+            &separator_bottom,
+            &quit_item,
+        ])
+        .build()?;
+
+    let icon = app
+        .default_window_icon()
+        .expect("bundled window icon is configured")
+        .clone();
+    let tray = TrayIconBuilder::new()
+        .icon(icon)
+        .tooltip("ScreenSearch V2")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "open" => summon_main_window(app),
+            "pause" => toggle_pause(),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                summon_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+
+    app.manage(TrayHandles {
+        icon: tray,
+        status_item,
+        pause_item,
+    });
+
+    let settings = shell_settings::load(&handle);
+    if let Ok(shortcut) = settings.hotkey.parse::<Shortcut>() {
+        let _ = apply_shortcut(&handle, &shortcut);
+    }
+
+    spawn_health_poll(handle);
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == ShortcutState::Pressed {
+                        summon_main_window(app);
+                        let _ = app.emit("summon-search", ());
+                    }
+                })
+                .build(),
+        )
+        .setup(|app| {
+            setup_tray(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                // Hide to tray instead of exiting; the daemon keeps running in its own process.
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             health,
             capture_once,
@@ -396,7 +594,9 @@ fn main() {
             archive_settings,
             update_archive_settings,
             delete_all_captures,
-            search
+            search,
+            get_shell_settings,
+            set_shell_settings
         ])
         .run(tauri::generate_context!())
         .expect("run ScreenSearch V2 desktop application");

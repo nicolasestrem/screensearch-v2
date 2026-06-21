@@ -36,6 +36,12 @@ export interface DeleteResult {
   assetsScheduled: number;
 }
 
+export interface ShellSettings {
+  hotkey: string;
+}
+
+export const DEFAULT_HOTKEY = "CmdOrCtrl+Shift+Space";
+
 export interface CaptureResult {
   captureId: string;
   duplicate: boolean;
@@ -74,8 +80,9 @@ export type SearchEvent =
   | { kind: "token"; text: string }
   | { kind: "completed"; citationCount: number };
 
-const isTauri = "__TAURI_INTERNALS__" in window;
+export const isTauri = "__TAURI_INTERNALS__" in window;
 let previewPaused = false;
+let previewHotkey = DEFAULT_HOTKEY;
 let previewSettings: ArchiveSettings = {
   retentionDays: null,
   diskBudgetBytes: null,
@@ -173,6 +180,14 @@ export const api = {
     previewSettings = { ...previewSettings, captureCount: 0, assetBytes: 0 };
     previewPaused = true;
     return { capturesDeleted, assetsScheduled: capturesDeleted };
+  },
+  getShellSettings: () => isTauri
+    ? invoke<ShellSettings>("get_shell_settings")
+    : Promise.resolve({ hotkey: previewHotkey }),
+  setShellSettings: async (hotkey: string) => {
+    if (isTauri) return invoke<ShellSettings>("set_shell_settings", { hotkey });
+    previewHotkey = hotkey;
+    return { hotkey: previewHotkey };
   },
   search: async (
     query: string,

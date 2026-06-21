@@ -172,3 +172,35 @@ The two phases were substantively complete and truthful, but the analysis retry/
 ### Remaining boundary
 
 Unchanged from the prior P1 entry: P2 product-shell lifecycle and keyboard work, model-worker isolation, GGUF model selection, security/packaging, and release-hardware soak remain open.
+
+## 2026-06-21 — P2 product shell: tray, global hotkey, keyboard navigation
+
+### Changed
+
+- Added a system tray to the Tauri shell (`apps/desktop/src-tauri/src/main.rs`): an icon with a tooltip and a disabled status line that show at-a-glance capture state, plus **Open ScreenSearch**, **Pause/Resume capture**, and **Quit** items. A `tauri::async_runtime` background task polls daemon health every three seconds and updates the tooltip, status line, and pause/resume label; it reads `Daemon offline` when the daemon is unreachable.
+- Made the window **hide to the tray** on close (`WindowEvent::CloseRequested` → `prevent_close` + `hide`); only tray **Quit** exits the shell, and the separate capture daemon is unaffected.
+- Added a configurable system-wide summon hotkey (default `Ctrl+Shift+Space`) using `tauri-plugin-global-shortcut`, registered from Rust. Pressing it foregrounds and focuses the window and emits a `summon-search` event the UI listens for to focus and select the search field.
+- Added a shell-local settings file (`apps/desktop/src-tauri/src/shell_settings.rs`): `ShellSettings { hotkey }` persisted atomically as JSON under the Tauri app-config directory, with `get_shell_settings`/`set_shell_settings` commands. `set_shell_settings` validates the accelerator before persisting and re-registers the shortcut live.
+- Implemented complete keyboard navigation in the Memory Timeline UI (`apps/desktop/src/App.tsx`, `styles.css`): Arrow Up/Down/Home/End move the selected result (roving tab index, focus + scroll into view, guarded against firing while typing); ARIA tablist Arrow Left/Right/Home/End for the evidence detail tabs; a focus trap, first-control focus, Escape-to-close, and focus restoration for dialogs; a `:focus-visible` ring; and a hotkey-capture control in Settings that records combinations in Tauri's accelerator vocabulary. Ctrl+K continues to focus (and now selects) the search field.
+- Added the `tray-icon` feature to `tauri`, plus `tauri-plugin-global-shortcut`, `serde_json`, and `tokio` to the desktop crate. Added `getShellSettings`/`setShellSettings` and a `summon-search` listener to `apps/desktop/src/api.ts`.
+
+### Why
+
+P2 turns the verified evidence/retrieval engine into a native-feeling utility: it should live in the tray, be summonable from anywhere, and be fully drivable by keyboard. The hotkey is a pure shell concern, so it is stored shell-locally rather than in the daemon archive, preserving the rule that the desktop shell never owns durable indexing state.
+
+### Decisions made
+
+- Default summon hotkey `Ctrl+Shift+Space` and **hide-to-tray** on window close were confirmed by the product owner; both are user-visible and the spec was otherwise silent.
+- The global shortcut is registered from Rust (not the plugin's JS API), so no new capability/permission entries were required; custom commands and tray/window control already run under the granted `core:default`.
+
+### Verification evidence
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — all suites passed (the desktop binary compiles the tray/hotkey setup; `cargo test` does not launch the GUI).
+- `npm run lint` and `npm run build` (`apps/desktop`) — clean.
+- Browser keyboard-navigation QA against the dev server confirmed: arrow/Home/End selection with focus and detail-pane sync; the typing guard (Arrow keys ignored while the search field is focused); tablist arrow navigation; dialog focus trap (Tab wraps within the dialog); Escape closes the dialog and restores focus to the opener; the hotkey-capture control records `Ctrl+Shift+J` → `Ctrl Shift J`; and Ctrl+K focuses and selects the search field.
+
+### Remaining boundary
+
+Patch-plan item 14 stays **open**: the native tray, global hotkey, and hide-to-tray runtime still require a manual Windows `npm run tauri dev` session against a running daemon to satisfy the spec §18 "Verify tray pause/resume and global hotkey" check; `cargo test` only compiles the shell. Model-worker isolation, GGUF model selection, security/packaging, and release-hardware soak remain open.

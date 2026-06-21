@@ -22,3 +22,4 @@ This file contains decisions or external inputs that cannot be safely invented b
 - Evidence-only search remains fully usable when generation models are absent.
 - Automation remains disabled until GAP-006 is resolved and all safety tests pass.
 - Development backpressure uses daemon-owned high/low-water marks of 100/50 active jobs. The P1 baseline is accepted on the named GAP-007 engineering machine; release-hardware soak budgets remain a separate hardening task.
+- The shell summon hotkey is a shell-local setting (default `Ctrl+Shift+Space`) stored as JSON under the Tauri app-config directory, not in the daemon archive. Window close hides to the tray; only tray Quit exits the shell. Both defaults were product-owner confirmed on 2026-06-21. The native tray and global-hotkey runtime still need a manual Windows end-to-end check (spec §18) before patch-plan item 14 closes.
