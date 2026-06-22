@@ -127,6 +127,8 @@ kbd { border: 1px solid #454641; border-radius: 4px; padding: 3px 7px; color: #b
 .select-control option { color: var(--text); background: #222; }
 .filter-button { height: 34px; padding: 0 10px; color: #c8c7c1; background: #1d1e1e; font-weight: 500; }
 .filter-button svg:last-child { width: 11px; }
+.plan-summary { display: inline-flex; align-items: center; min-width: 90px; max-width: min(420px, 42vw); gap: 6px; overflow: hidden; border: 1px solid #343d48; border-radius: 5px; padding: 6px 8px; color: #b9c8d8; background: #182029; font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.plan-summary svg { width: 13px; height: 13px; flex: 0 0 auto; color: #89b6dc; }
 .result-count { margin-left: auto; overflow: hidden; color: var(--faint); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 
 .evidence-workspace { display: grid; grid-template-columns: minmax(300px, 32%) minmax(0, 1fr); min-width: 0; min-height: 0; }
@@ -223,12 +225,14 @@ dd { min-width: 0; margin: 0; overflow: hidden; color: #d0cfca; text-overflow: e
 .settings-field textarea { min-height: 66px; resize: vertical; padding: 9px 10px; font-size: 11px; line-height: 1.45; }
 .settings-field select, .settings-field input { height: 34px; padding: 0 9px; font-size: 11px; }
 .settings-field.compact { grid-template-columns: minmax(0, 1fr) 190px; align-items: center; gap: 20px; }
-.storage-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; margin: 10px 0 2px; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--line); }
-.storage-summary span { display: flex; padding: 12px; flex-direction: column; gap: 3px; background: #20211f; }
-.storage-summary strong { color: #e1dfd5; font-family: "IBM Plex Mono", monospace; font-size: 14px; }
-.storage-summary small { color: #888a85; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
+.storage-summary, .readiness-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; margin: 10px 0 2px; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--line); }
+.readiness-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.storage-summary span, .readiness-grid span { display: flex; min-width: 0; padding: 12px; flex-direction: column; gap: 3px; background: #20211f; }
+.storage-summary strong, .readiness-grid strong { overflow: hidden; color: #e1dfd5; font-family: "IBM Plex Mono", monospace; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.storage-summary small, .readiness-grid small { color: #888a85; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
 .modal-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line-soft); padding: 11px 2px 13px; }
 .modal-actions span { color: #8f908b; font-size: 10.5px; }
+.modal-action-buttons { display: flex; flex: 0 0 auto; gap: 8px; justify-content: flex-end; }
 .automation-modal { width: min(820px, 100%); }
 .automation-warning kbd { display: inline-block; margin-left: 4px; }
 .automation-confirm { display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--line-soft); padding: 12px 2px; color: #d6d5cf; font-size: 11px; }
@@ -258,11 +262,15 @@ dd { min-width: 0; margin: 0; overflow: hidden; color: #d0cfca; text-overflow: e
 .model-heading small, .model-source-heading small { color: #8f908b; font-size: 10.5px; line-height: 1.45; }
 .model-source-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .model-source { display: grid; min-width: 0; align-content: start; gap: 9px; border-top: 1px solid var(--line-soft); padding-top: 12px; }
+.model-source.primary { border-top: 0; padding-top: 0; }
+.advanced-model summary { cursor: pointer; color: #d7d6d0; font-size: 12px; font-weight: 650; }
+.advanced-model[open] summary { margin-bottom: 8px; }
 .model-source label { display: grid; min-width: 0; gap: 5px; }
 .model-source label span { color: #9a9b95; font-size: 10.5px; }
 .model-source input { width: 100%; min-width: 0; height: 34px; border: 1px solid #41433f; border-radius: 5px; padding: 0 9px; color: var(--text); background: #151616; font: inherit; font-size: 11px; }
 .model-source button { justify-self: end; }
 .model-list { display: grid; gap: 8px; padding: 2px 0 12px; }
+.model-list-empty { border: 1px dashed #41433f; border-radius: 6px; padding: 12px; color: #8f908b; background: #171817; font-size: 11px; }
 .model-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--line-soft); border-radius: 6px; padding: 10px; background: #171817; }
 .model-row > span { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
 .model-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; }
@@ -276,8 +284,9 @@ dd { min-width: 0; margin: 0; overflow: hidden; color: #d0cfca; text-overflow: e
 .modal-error { margin: 0 16px 14px; border: 1px solid #684040; border-radius: 5px; padding: 9px 10px; color: #e9a6a6; background: #2a1c1c; font-size: 11px; }
 @media (max-width: 620px) {
   .settings-field.compact { grid-template-columns: 1fr; gap: 8px; }
-  .danger-zone, .modal-actions { align-items: stretch; flex-direction: column; }
+  .danger-zone, .modal-actions, .modal-action-buttons { align-items: stretch; flex-direction: column; }
   .model-source-grid { grid-template-columns: 1fr; }
+  .readiness-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .model-heading, .model-row { align-items: stretch; flex-direction: column; }
   .model-source button, .model-row > div { justify-self: stretch; justify-content: flex-end; }
 }
@@ -319,6 +328,7 @@ dd { min-width: 0; margin: 0; overflow: hidden; color: #d0cfca; text-overflow: e
   .top-actions { grid-column: 2; grid-row: 1; }
   .pause-button { width: 36px; height: 36px; padding: 0; font-size: 0; }
   .filterbar { overflow-x: auto; }
+  .plan-summary { max-width: 280px; }
   .result-count { display: none; }
   .evidence-workspace { grid-template-columns: 1fr; }
   .timeline-pane { border-right: 0; }

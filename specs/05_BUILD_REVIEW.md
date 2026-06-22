@@ -33,10 +33,11 @@ Build reviewed: completed P0 truthful evidence loop and P1 semantic-retrieval/sc
 - A configurable system-wide summon hotkey (default `Ctrl+Shift+Space`) registered from Rust via `tauri-plugin-global-shortcut`, persisted as a shell-local JSON setting decoupled from the daemon archive, editable in Settings, and emitting a window-focus event to the UI.
 - Complete keyboard navigation in the Memory Timeline UI: arrow/Home/End result selection with roving tab index and a typing guard, ARIA tablist arrow keys for evidence detail tabs, dialog focus trapping, Escape-to-close with focus restoration, and Ctrl+K search focus.
 - Guarded automation V1 on the `codex/p4-guarded-automation` branch: domain policy, content-free persistence, daemon orchestration, typed protobuf/Tauri IPC, native Windows UIA/keyboard emission, manual approval UI, and a gated synthetic Windows fixture.
+- Useful local-answer planning: deterministic local-time source/time filters for the supplied Telegram/GitHub/Codex/Amazon prompts, backend filtered hybrid search, OR fallback lexical retrieval, metadata-only retrieval, additive search-plan IPC, richer answer prompts with local timestamp/application/title metadata, UI `<think>` stripping, and guided Settings readiness/model setup.
 
 ## Deliberately skipped
 
-- An approved and installed default GGUF generation model.
+- An approved and installed default GGUF generation model, qualitative groundedness scoring, and memory-pressure-triggered model unload.
 - Model acquisition/release selection, signing, factory reset of database/model files, capture-side locked-session privacy handling, and release-hardening item 18.
 
 ## Placeholder behavior that must not be mistaken for product behavior
@@ -57,7 +58,7 @@ Build reviewed: completed P0 truthful evidence loop and P1 semantic-retrieval/sc
 2. Capture and analysis share one daemon; queue backpressure is implemented, but model process isolation remains necessary for release resilience.
 3. First model acquisition currently depends on Hugging Face connectivity and lacks a signed manifest flow.
 4. The fixed 384-dimensional vector table is correct for MiniLM but requires a new migration for future dimensions.
-5. The native model-worker boundary is now supervised (bounded restarts + parent lifeline) and exercised by gated integration tests with local GGUF candidates; GAP-002/GAP-003 model decisions remain before item 15 can close.
+5. The native model-worker boundary is now supervised (bounded restarts + parent lifeline) and exercised by gated integration tests with local GGUF candidates; GAP-002/GAP-003 model decisions, qualitative answer scoring, and GAP-008 memory-pressure unload remain before item 15 can close.
 6. Current logging review has not yet proven that all future native errors are content-free.
 7. Long-duration capture CPU/storage growth and perceptual-threshold tuning remain release-hardening work beyond the completed P1 engineering baseline.
 8. Guarded automation is intentionally default-off and narrowly scoped. Support policy, packaging/signing, and broader release-hardening remain before public release.

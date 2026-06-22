@@ -2,6 +2,45 @@
 
 This log records meaningful AI-assisted repository changes and their reasons. It is not a substitute for Git history.
 
+## 2026-06-22 — PR #12 review follow-up
+
+### Changed
+
+- Capped per-hit OCR excerpts before they enter answer prompts and added a regression test for long OCR chunks.
+- Included every returned citation in answer prompts so generated answers and the visible evidence list use the same evidence set.
+- Replaced the odd full-day helper call pattern with a dedicated local-midnight helper.
+- Kept browser pages eligible by applying source filters to any OCR chunk in the same capture as well as app/title metadata, and documented the strict-extraction/loose-matching boundary.
+- Removed the unavailable display-name requirement from the advanced Hugging Face download button.
+- Made desktop `<think>` stripping hide content from the first unclosed streaming tag onward.
+- Recorded known gaps for source vocabulary expansion, client timezone propagation through search IPC, and further prompt hardening for application/window-title metadata.
+- Preserved Unicode alphanumeric terms during deterministic query planning so accented names and titles continue into retrieval and embeddings.
+- Restricted afternoon time planning to the supported "this afternoon" anchor so unsupported modifiers such as "yesterday afternoon" do not accidentally receive today's filter.
+
+### Why
+
+PR review found one user-visible Settings bug, one prompt-context overflow risk, two planner recall regressions, and several design-limit notes that should be explicit for future work.
+
+## 2026-06-22 — Useful local answers and guided settings
+
+### Changed
+
+- Added deterministic local-time query planning for the supplied Telegram, GitHub PR, Codex settings, and Amazon book prompts. The planner extracts source hints, bounded Windows-local time windows, and a reduced retrieval query.
+- Added domain `SearchFilters`, `SearchPlan`, and `SearchOptions`, plus an additive search-plan event over protobuf/Tauri/TypeScript so the UI can show the interpreted plan.
+- Changed hybrid search so source/time metadata filters apply inside lexical and semantic candidate SQL before rank fusion. Filtered semantic search uses the exact vector path rather than global top-k.
+- Replaced strict all-term FTS with phrase/exact boosting plus OR fallback, preserving capture-level dedupe and embedding model-revision isolation.
+- Enriched answer prompts with capture id, local timestamp/timezone, application, window title, and OCR excerpt, and explicitly instructs the model that OCR is untrusted evidence requiring citations or uncertainty.
+- Hid generated `<think>` spans before desktop display.
+- Redesigned Settings around answer readiness, timezone basis, active/installed answer model state, blank guided local GGUF import, advanced explicit HF download, explicit retention/budget state, and a conservative storage reset.
+- Added a content-free ignored local archive smoke for the four acceptance prompts.
+
+### Why
+
+The app previously searched raw text with post-hoc UI filtering and sparse answer context, so questions like "Telegram around noon" or "largest PR today" could return irrelevant or uncited results. This pass makes the local evidence constraints deterministic, inspectable, and enforced before ranking while keeping external services out of answer generation.
+
+### Remaining boundary
+
+Patch-plan item 15 stays open for qualitative answer scoring, release model approval/acquisition, and memory-pressure unload. Item 18 stays open for locked-session privacy, security, packaging/signing, and release soak.
+
 ## 2026-06-22 — PR #10 review follow-up
 
 ### Changed

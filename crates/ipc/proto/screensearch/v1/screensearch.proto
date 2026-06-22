@@ -159,7 +159,17 @@ message SearchEvent {
     Citation citation = 1;
     Token token = 2;
     SearchCompleted completed = 3;
+    SearchPlan plan = 4;
   }
+}
+
+message SearchPlan {
+  string original_query = 1;
+  string retrieval_query = 2;
+  string timezone_label = 3;
+  string captured_after = 4;
+  string captured_before = 5;
+  repeated string source_terms = 6;
 }
 
 message Citation {

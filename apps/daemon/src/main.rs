@@ -39,11 +39,11 @@ use screensearch_ipc::{
         ErrorResponse, ExecuteAutomationResponse, GenerationModel as IpcGenerationModel,
         GenerationModelResponse, GenerationModelsResponse, HealthResponse, NormalizedRect,
         ProcessJobsResponse, ResetAutomationAbortResponse, ResponseEnvelope, SearchCompleted,
-        SearchEvent as IpcSearchEvent, SetAutomationEnabledResponse, SetCapturePausedResponse,
-        Token, UnloadGenerationModelResponse, UpdateArchiveSettingsResponse,
-        WorkerEmbeddingRequest, WorkerGenerationRequest, WorkerHealthRequest, WorkerOcrRequest,
-        WorkerUnloadRequest, automation_action, request_envelope, response_envelope, search_event,
-        worker_generation_event,
+        SearchEvent as IpcSearchEvent, SearchPlan as IpcSearchPlan, SetAutomationEnabledResponse,
+        SetCapturePausedResponse, Token, UnloadGenerationModelResponse,
+        UpdateArchiveSettingsResponse, WorkerEmbeddingRequest, WorkerGenerationRequest,
+        WorkerHealthRequest, WorkerOcrRequest, WorkerUnloadRequest, automation_action,
+        request_envelope, response_envelope, search_event, worker_generation_event,
     },
 };
 use screensearch_persistence::{FileAssetStore, LibSqlArchive};
@@ -1250,6 +1250,25 @@ fn map_archive_settings(
 
 fn map_search_event(event: SearchEvent) -> (search_event::Event, bool) {
     match event {
+        SearchEvent::Plan(plan) => (
+            search_event::Event::Plan(IpcSearchPlan {
+                original_query: plan.original_query,
+                retrieval_query: plan.retrieval_query,
+                timezone_label: plan.timezone_label,
+                captured_after: plan
+                    .filters
+                    .captured_after
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_default(),
+                captured_before: plan
+                    .filters
+                    .captured_before
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_default(),
+                source_terms: plan.filters.source_terms,
+            }),
+            false,
+        ),
         SearchEvent::Citation(hit) => (
             search_event::Event::Citation(Box::new(Citation {
                 capture_id: hit.capture_id.to_string(),

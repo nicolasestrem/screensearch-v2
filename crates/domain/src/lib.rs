@@ -1,6 +1,6 @@
 //! Pure domain types and invariants for ScreenSearch.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Local, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -1032,9 +1032,70 @@ pub struct SearchHit {
     pub embedding_model_id: String,
 }
 
+/// Metadata constraints applied before hybrid search ranking.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SearchFilters {
+    /// Inclusive UTC lower bound for capture time.
+    pub captured_after: Option<DateTime<Utc>>,
+    /// Exclusive UTC upper bound for capture time.
+    pub captured_before: Option<DateTime<Utc>>,
+    /// Case-insensitive application/window-title source hints.
+    pub source_terms: Vec<String>,
+}
+
+impl SearchFilters {
+    /// Returns true when at least one metadata constraint is present.
+    pub fn has_constraints(&self) -> bool {
+        self.captured_after.is_some()
+            || self.captured_before.is_some()
+            || !self.source_terms.is_empty()
+    }
+}
+
+/// Deterministic interpretation of a user search request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchPlan {
+    /// Original user query.
+    pub original_query: String,
+    /// Evidence text terms left for lexical/vector retrieval after removing filters.
+    pub retrieval_query: String,
+    /// Local timezone label used to interpret relative time phrases.
+    pub timezone_label: String,
+    /// Backend filters to apply before ranking.
+    pub filters: SearchFilters,
+}
+
+/// Runtime search options that keep query planning and prompt timestamps on one local-time basis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchOptions {
+    /// Maximum citations to return.
+    pub limit: usize,
+    /// Whether to invoke answer generation after citations.
+    pub generate_answer: bool,
+    /// Local wall-clock instant used for relative date phrases such as "today".
+    pub now: DateTime<FixedOffset>,
+    /// Human-facing timezone label shown in plan/prompt/UI.
+    pub timezone_label: String,
+}
+
+impl SearchOptions {
+    /// Builds options from the host local clock.
+    pub fn local(limit: usize, generate_answer: bool) -> Self {
+        let now = Local::now().fixed_offset();
+        Self {
+            limit,
+            generate_answer,
+            now,
+            timezone_label: now.format("UTC%:z").to_string(),
+        }
+    }
+}
+
 /// Event emitted by citation-aware answer generation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SearchEvent {
+    /// Deterministic query plan, emitted before retrieval citations.
+    Plan(SearchPlan),
     /// Retrieval evidence, emitted before answer tokens.
     Citation(Box<SearchHit>),
     /// One incremental text token or token group.
