@@ -15,8 +15,8 @@ use encoding_rs::CoderResult;
 use futures::StreamExt;
 use reqwest::{Client, header};
 use screensearch_ports::{PortError, TextGenerator, TokenStream};
-use serde::Deserialize;
-use tempfile::{Builder, TempDir};
+use serde::{Deserialize, Serialize};
+use tempfile::{Builder, NamedTempFile, TempDir};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     time::{Instant as TokioInstant, timeout, timeout_at},
@@ -35,25 +35,34 @@ const RELEASE_API_PREFIX: &str = "https://api.github.com/repos/ggml-org/llama.cp
 const RELEASE_WEB_PREFIX: &str = "https://github.com/ggml-org/llama.cpp/releases/tag/";
 const RELEASE_OVERRIDE_ENV: &str = "SSV2C_LLAMA_RELEASE_URL";
 const CURRENT_INSTALL_DIR: &str = "current";
+const INSTALL_METADATA_FILE: &str = "screensearch-sidecar.json";
 const LLAMA_CLI_EXE: &str = "llama-cli.exe";
 const STDOUT_READ_BYTES: usize = 512;
 const STDOUT_STREAM_CHUNK_BYTES: usize = 512;
 const MAX_SIDECAR_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES: u64 = 250 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 500 * 1024 * 1024;
 const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const SIDECAR_EXIT_TRAILER: &str = "Exiting...";
+const SIDECAR_EXIT_TRAILER_HOLDBACK_BYTES: usize = SIDECAR_EXIT_TRAILER.len() + 8;
 
 static SIDECAR_INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Ensures the Windows Vulkan llama.cpp sidecar is installed and returns `llama-cli.exe`.
 pub async fn ensure_binary(sidecar_root: impl AsRef<Path>) -> Result<PathBuf, PortError> {
     let sidecar_root = sidecar_root.as_ref().to_path_buf();
-    if let Some(binary) = find_installed_binary(&sidecar_root)? {
+    let required_release_tag = release_tag_from_override_env()?;
+    if let Some(binary) =
+        find_installed_binary_for_release(&sidecar_root, required_release_tag.as_deref())?
+    {
         return Ok(binary);
     }
     let _install_guard = SIDECAR_INSTALL_LOCK.lock().await;
-    if let Some(binary) = find_installed_binary(&sidecar_root)? {
+    if let Some(binary) =
+        find_installed_binary_for_release(&sidecar_root, required_release_tag.as_deref())?
+    {
         return Ok(binary);
     }
     tokio::fs::create_dir_all(&sidecar_root)
@@ -173,6 +182,12 @@ struct SelectedReleaseAsset {
     download_url: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct InstalledReleaseMetadata {
+    release_tag: String,
+    asset_name: String,
+}
+
 fn github_client() -> Result<Client, PortError> {
     Client::builder()
         .user_agent(format!("ScreenSearchV2/{}", env!("CARGO_PKG_VERSION")))
@@ -241,6 +256,17 @@ fn asset_matches_windows_vulkan(name: &str) -> bool {
 }
 
 fn release_api_url_from_override(value: &str) -> Result<String, PortError> {
+    let tag = release_tag_from_override(value)?;
+    Ok(format!("{RELEASE_API_PREFIX}{tag}"))
+}
+
+fn release_tag_from_override_env() -> Result<Option<String>, PortError> {
+    env::var_os(RELEASE_OVERRIDE_ENV)
+        .map(|override_url| release_tag_from_override(&override_url.to_string_lossy()))
+        .transpose()
+}
+
+fn release_tag_from_override(value: &str) -> Result<String, PortError> {
     let value = value
         .trim()
         .split(['?', '#'])
@@ -253,11 +279,11 @@ fn release_api_url_from_override(value: &str) -> Result<String, PortError> {
         ));
     }
     match value.strip_prefix(RELEASE_API_PREFIX) {
-        Some(tag) if valid_release_tag(tag) => return Ok(value.to_owned()),
+        Some(tag) if valid_release_tag(tag) => return Ok(tag.to_owned()),
         _ => {}
     }
     match value.strip_prefix(RELEASE_WEB_PREFIX) {
-        Some(tag) if valid_release_tag(tag) => return Ok(format!("{RELEASE_API_PREFIX}{tag}")),
+        Some(tag) if valid_release_tag(tag) => return Ok(tag.to_owned()),
         _ => {}
     }
     Err(PortError::InvalidData(
@@ -290,8 +316,10 @@ async fn install_release_asset(
     let download_path = download.path().to_path_buf();
     let staging_path = staging.path().to_path_buf();
     let sidecar_root = sidecar_root.to_path_buf();
+    let selected = selected.clone();
     tokio::task::spawn_blocking(move || {
         extract_zip_safely(&download_path, &staging_path)?;
+        write_install_metadata(&staging_path, &selected.release_tag, &selected.asset_name)?;
         swap_staging_into_current(&sidecar_root, staging)
     })
     .await
@@ -317,17 +345,26 @@ async fn download_asset(client: &Client, url: &str, destination: &Path) -> Resul
             "llama sidecar download returned text instead of a zip archive".to_owned(),
         ));
     }
+    let content_length = response.content_length().unwrap_or(0);
+    if content_length > MAX_DOWNLOAD_BYTES {
+        return Err(PortError::Unavailable(
+            "llama sidecar download exceeded size limit".to_owned(),
+        ));
+    }
     let mut output = tokio::fs::OpenOptions::new()
         .write(true)
         .truncate(true)
         .open(destination)
         .await
         .map_err(|error| sidecar_unavailable("open sidecar download file", error))?;
+    let mut downloaded_bytes = 0_u64;
     while let Some(chunk) = timeout_at(deadline, response.chunk())
         .await
         .map_err(|_| sidecar_timeout("download llama.cpp sidecar"))?
         .map_err(|error| sidecar_unavailable("download llama.cpp sidecar", error))?
     {
+        downloaded_bytes =
+            checked_sidecar_download_size(downloaded_bytes, chunk.len(), MAX_DOWNLOAD_BYTES)?;
         output
             .write_all(&chunk)
             .await
@@ -338,6 +375,22 @@ async fn download_asset(client: &Client, url: &str, destination: &Path) -> Resul
         .await
         .map_err(|error| sidecar_unavailable("flush sidecar download file", error))?;
     Ok(())
+}
+
+fn checked_sidecar_download_size(
+    downloaded_bytes: u64,
+    chunk_bytes: usize,
+    maximum_download_bytes: u64,
+) -> Result<u64, PortError> {
+    let chunk_bytes = u64::try_from(chunk_bytes)
+        .map_err(|_| PortError::Internal("sidecar download chunk is too large".to_owned()))?;
+    let total = downloaded_bytes.saturating_add(chunk_bytes);
+    if total > maximum_download_bytes {
+        return Err(PortError::Unavailable(
+            "llama sidecar download exceeded size limit".to_owned(),
+        ));
+    }
+    Ok(total)
 }
 
 fn extract_zip_safely(archive_path: &Path, staging: &Path) -> Result<PathBuf, PortError> {
@@ -484,6 +537,64 @@ fn remove_previous_install_backup(previous: &Path) {
     }
 }
 
+fn write_install_metadata(
+    install_root: &Path,
+    release_tag: &str,
+    asset_name: &str,
+) -> Result<(), PortError> {
+    let metadata = InstalledReleaseMetadata {
+        release_tag: release_tag.to_owned(),
+        asset_name: asset_name.to_owned(),
+    };
+    let payload = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| PortError::Internal(format!("serialize sidecar metadata: {error}")))?;
+    fs::write(install_root.join(INSTALL_METADATA_FILE), payload)
+        .map_err(|error| sidecar_unavailable("write sidecar metadata", error))
+}
+
+fn read_install_metadata(
+    install_root: &Path,
+) -> Result<Option<InstalledReleaseMetadata>, PortError> {
+    let path = install_root.join(INSTALL_METADATA_FILE);
+    let payload = match fs::read(&path) {
+        Ok(payload) => payload,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(sidecar_unavailable("read sidecar metadata", error)),
+    };
+    match serde_json::from_slice(&payload) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) => {
+            warn!(
+                failure_kind = "invalid_metadata",
+                %error,
+                "could not parse llama sidecar metadata"
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn find_installed_binary_for_release(
+    sidecar_root: &Path,
+    required_release_tag: Option<&str>,
+) -> Result<Option<PathBuf>, PortError> {
+    let Some(binary) = find_installed_binary(sidecar_root)? else {
+        return Ok(None);
+    };
+    let Some(required_release_tag) = required_release_tag else {
+        return Ok(Some(binary));
+    };
+    let current = sidecar_root.join(CURRENT_INSTALL_DIR);
+    let Some(metadata) = read_install_metadata(&current)? else {
+        return Ok(None);
+    };
+    if metadata.release_tag == required_release_tag {
+        Ok(Some(binary))
+    } else {
+        Ok(None)
+    }
+}
+
 fn find_installed_binary(sidecar_root: &Path) -> Result<Option<PathBuf>, PortError> {
     let current = sidecar_root.join(CURRENT_INSTALL_DIR);
     if !current.is_dir() {
@@ -522,17 +633,7 @@ fn find_llama_cli_under(root: &Path) -> Result<Option<PathBuf>, PortError> {
 }
 
 fn run_llama_cli(binary: &Path, model_path: &Path, prompt: &str) -> Result<TokenStream, PortError> {
-    let mut prompt_file = Builder::new()
-        .prefix("screensearch-llama-prompt-")
-        .suffix(".txt")
-        .tempfile()
-        .map_err(|error| sidecar_unavailable("create sidecar prompt file", error))?;
-    prompt_file
-        .write_all(prompt.as_bytes())
-        .map_err(|error| sidecar_unavailable("write sidecar prompt file", error))?;
-    prompt_file
-        .flush()
-        .map_err(|error| sidecar_unavailable("flush sidecar prompt file", error))?;
+    let prompt_file = write_prompt_tempfile(prompt)?;
     let threads = cpu_thread_budget().to_string();
     let context_tokens = GENERATION_CONTEXT_TOKENS.to_string();
     let token_cap = MAX_GENERATED_TOKENS.to_string();
@@ -570,7 +671,10 @@ fn run_llama_cli(binary: &Path, model_path: &Path, prompt: &str) -> Result<Token
         let _prompt_file = prompt_file;
         let mut stdout = stdout;
         let mut buffer = [0_u8; STDOUT_READ_BYTES];
-        let mut stdout_bytes = Vec::new();
+        let mut stdout_bytes = 0_usize;
+        let mut answer_bytes = 0_usize;
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut sanitizer = SidecarStdoutSanitizer::new(&prompt_text);
         let deadline = TokioInstant::now() + GENERATION_DEADLINE;
         let started = Instant::now();
         loop {
@@ -579,12 +683,24 @@ fn run_llama_cli(binary: &Path, model_path: &Path, prompt: &str) -> Result<Token
             if read == 0 {
                 break;
             }
-            if stdout_bytes.len().saturating_add(read) > MAX_SIDECAR_STDOUT_BYTES {
+            if stdout_bytes.saturating_add(read) > MAX_SIDECAR_STDOUT_BYTES {
                 Err(PortError::Unavailable(
                     "llama sidecar stdout exceeded the capture limit".to_owned(),
                 ))?;
             }
-            stdout_bytes.extend_from_slice(&buffer[..read]);
+            stdout_bytes = stdout_bytes.saturating_add(read);
+            let text = decode_sidecar_stdout(&mut decoder, &buffer[..read], false)?;
+            let answer = sanitizer.push(&text);
+            if !answer.is_empty() {
+                answer_bytes = answer_bytes.saturating_add(answer.len());
+                yield answer;
+            }
+        }
+        let trailing = decode_sidecar_stdout(&mut decoder, &[], true)?;
+        let answer = sanitizer.push(&trailing);
+        if !answer.is_empty() {
+            answer_bytes = answer_bytes.saturating_add(answer.len());
+            yield answer;
         }
         let status = wait_for_sidecar_exit(&mut child, deadline).await?;
         if !status.success() {
@@ -595,24 +711,39 @@ fn run_llama_cli(binary: &Path, model_path: &Path, prompt: &str) -> Result<Token
                     .map_or_else(|| "terminated".to_owned(), |code| code.to_string())
             )))?;
         }
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let raw_stdout = decode_sidecar_stdout(&mut decoder, &stdout_bytes, true)?;
-        let answer = sanitize_sidecar_stdout(&raw_stdout, &prompt_text)?;
+        let answer = sanitizer.finish()?;
         if answer.is_empty() {
-            Err(PortError::Unavailable(
-                "llama sidecar returned no answer text".to_owned(),
-            ))?;
+            if answer_bytes == 0 {
+                Err(PortError::Unavailable(
+                    "llama sidecar returned no answer text".to_owned(),
+                ))?;
+            }
+        } else {
+            answer_bytes = answer_bytes.saturating_add(answer.len());
+            yield answer;
         }
         info!(
             elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            stdout_bytes = stdout_bytes.len(),
-            answer_bytes = answer.len(),
+            stdout_bytes,
+            answer_bytes,
             "completed llama.cpp Vulkan sidecar generation"
         );
-        for chunk in sidecar_output_chunks(&answer) {
-            yield chunk;
-        }
     }))
+}
+
+fn write_prompt_tempfile(prompt: &str) -> Result<NamedTempFile, PortError> {
+    let mut prompt_file = Builder::new()
+        .prefix("screensearch-llama-prompt-")
+        .suffix(".txt")
+        .tempfile()
+        .map_err(|error| sidecar_unavailable("create sidecar prompt file", error))?;
+    prompt_file
+        .write_all(prompt.as_bytes())
+        .map_err(|error| sidecar_unavailable("write sidecar prompt file", error))?;
+    prompt_file
+        .flush()
+        .map_err(|error| sidecar_unavailable("flush sidecar prompt file", error))?;
+    Ok(prompt_file)
 }
 
 fn build_llama_cli_args(
@@ -637,6 +768,10 @@ fn build_llama_cli_args(
         "all".to_owned(),
         "--predict".to_owned(),
         token_cap.to_owned(),
+        "--temp".to_owned(),
+        "0".to_owned(),
+        "--seed".to_owned(),
+        "0".to_owned(),
         // Together these flags make chat-template models produce one assistant turn and exit.
         // If upstream behavior regresses, the generation deadline still kills the sidecar.
         "--conversation".to_owned(),
@@ -670,6 +805,147 @@ fn decode_sidecar_stdout(
     Ok(text)
 }
 
+struct SidecarStdoutSanitizer {
+    prompt: String,
+    pending: String,
+    mode: SidecarStdoutMode,
+    emitted_text: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidecarStdoutMode {
+    Undecided,
+    AwaitingPromptBoundary,
+    Streaming,
+}
+
+impl SidecarStdoutSanitizer {
+    fn new(prompt: &str) -> Self {
+        Self {
+            prompt: normalize_newlines(prompt),
+            pending: String::new(),
+            mode: SidecarStdoutMode::Undecided,
+            emitted_text: false,
+        }
+    }
+
+    fn push(&mut self, text: &str) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        self.pending.push_str(&normalize_newlines(text));
+        match self.mode {
+            SidecarStdoutMode::Undecided => self.process_undecided(),
+            SidecarStdoutMode::AwaitingPromptBoundary => self.process_prompt_boundary(),
+            SidecarStdoutMode::Streaming => self.flush_streaming(),
+        }
+    }
+
+    fn finish(&mut self) -> Result<String, PortError> {
+        match self.mode {
+            SidecarStdoutMode::Undecided => {
+                if self.pending.trim().is_empty() {
+                    Ok(String::new())
+                } else if looks_like_llama_cli_transcript_prefix(&self.pending) {
+                    Err(ambiguous_sidecar_transcript())
+                } else {
+                    self.mode = SidecarStdoutMode::Streaming;
+                    Ok(self.finish_streaming())
+                }
+            }
+            SidecarStdoutMode::AwaitingPromptBoundary => Err(ambiguous_sidecar_transcript()),
+            SidecarStdoutMode::Streaming => Ok(self.finish_streaming()),
+        }
+    }
+
+    fn process_undecided(&mut self) -> String {
+        if let Some(output) = self.discard_through_prompt_boundary() {
+            return output;
+        }
+        if looks_like_llama_cli_transcript_prefix(&self.pending) {
+            self.mode = SidecarStdoutMode::AwaitingPromptBoundary;
+            return String::new();
+        }
+        if is_possible_llama_cli_transcript_prefix(&self.pending) {
+            return String::new();
+        }
+        self.mode = SidecarStdoutMode::Streaming;
+        self.flush_streaming()
+    }
+
+    fn process_prompt_boundary(&mut self) -> String {
+        self.discard_through_prompt_boundary().unwrap_or_default()
+    }
+
+    fn discard_through_prompt_boundary(&mut self) -> Option<String> {
+        let prompt_end = self
+            .pending
+            .find(&self.prompt)
+            .map(|offset| offset + self.prompt.len())?;
+        self.pending.drain(..prompt_end);
+        self.mode = SidecarStdoutMode::Streaming;
+        Some(self.flush_streaming())
+    }
+
+    fn flush_streaming(&mut self) -> String {
+        self.trim_leading_before_first_emit();
+        let holdback_bytes = SIDECAR_EXIT_TRAILER_HOLDBACK_BYTES;
+        let target = self
+            .pending
+            .len()
+            .saturating_sub(holdback_bytes)
+            .min(STDOUT_STREAM_CHUNK_BYTES);
+        let emit_until = utf8_floor_boundary(&self.pending, target);
+        if emit_until == 0 {
+            return String::new();
+        }
+        let output = self.pending[..emit_until].to_owned();
+        self.pending.drain(..emit_until);
+        if !output.is_empty() {
+            self.emitted_text = true;
+        }
+        output
+    }
+
+    fn finish_streaming(&mut self) -> String {
+        self.trim_leading_before_first_emit();
+        let output = strip_llama_cli_trailer(&self.pending).trim_end().to_owned();
+        self.pending.clear();
+        if !output.is_empty() {
+            self.emitted_text = true;
+        }
+        output
+    }
+
+    fn trim_leading_before_first_emit(&mut self) {
+        if self.emitted_text {
+            return;
+        }
+        let trimmed = self.pending.trim_start();
+        if trimmed.len() != self.pending.len() {
+            self.pending = trimmed.to_owned();
+        }
+    }
+}
+
+fn ambiguous_sidecar_transcript() -> PortError {
+    PortError::InvalidData(
+        "llama sidecar emitted an interactive transcript without a prompt boundary".to_owned(),
+    )
+}
+
+fn utf8_floor_boundary(text: &str, target: usize) -> usize {
+    if target >= text.len() {
+        return text.len();
+    }
+    text.char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= target)
+        .last()
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
 fn sanitize_sidecar_stdout(stdout: &str, prompt: &str) -> Result<String, PortError> {
     let normalized_stdout = normalize_newlines(stdout);
     let normalized_prompt = normalize_newlines(prompt);
@@ -677,12 +953,7 @@ fn sanitize_sidecar_stdout(stdout: &str, prompt: &str) -> Result<String, PortErr
         let prompt_end = normalized_stdout
             .find(&normalized_prompt)
             .map(|offset| offset + normalized_prompt.len())
-            .ok_or_else(|| {
-                PortError::InvalidData(
-                    "llama sidecar emitted an interactive transcript without a prompt boundary"
-                        .to_owned(),
-                )
-            })?;
+            .ok_or_else(ambiguous_sidecar_transcript)?;
         &normalized_stdout[prompt_end..]
     } else {
         normalized_stdout.as_str()
@@ -694,31 +965,28 @@ fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+#[cfg(test)]
 fn looks_like_llama_cli_transcript(text: &str) -> bool {
-    text.contains("available commands:")
-        || (text.contains("Loading model") && text.lines().any(|line| line.starts_with("> ")))
+    looks_like_llama_cli_transcript_prefix(text)
+}
+
+fn looks_like_llama_cli_transcript_prefix(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("Loading model")
+        || text.contains("available commands:")
+        || text.lines().any(|line| line.starts_with("> "))
+}
+
+fn is_possible_llama_cli_transcript_prefix(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.is_empty() || "Loading model".starts_with(trimmed) || "> ".starts_with(trimmed)
 }
 
 fn strip_llama_cli_trailer(text: &str) -> &str {
     let trimmed = text.trim();
     trimmed
-        .strip_suffix("Exiting...")
+        .strip_suffix(SIDECAR_EXIT_TRAILER)
         .map_or(trimmed, str::trim)
-}
-
-fn sidecar_output_chunks(text: &str) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    for (index, _) in text.char_indices().skip(1) {
-        if index.saturating_sub(start) >= STDOUT_STREAM_CHUNK_BYTES {
-            chunks.push(text[start..index].to_owned());
-            start = index;
-        }
-    }
-    if start < text.len() {
-        chunks.push(text[start..].to_owned());
-    }
-    chunks
 }
 
 async fn read_sidecar_stdout(
@@ -829,9 +1097,11 @@ mod tests {
     };
 
     use super::{
-        GitHubAsset, GitHubRelease, asset_matches_windows_vulkan, build_llama_cli_args,
-        decode_sidecar_stdout, extract_zip_safely, extract_zip_safely_with_limit,
+        GitHubAsset, GitHubRelease, SidecarStdoutSanitizer, asset_matches_windows_vulkan,
+        build_llama_cli_args, checked_sidecar_download_size, decode_sidecar_stdout,
+        extract_zip_safely, extract_zip_safely_with_limit, find_installed_binary_for_release,
         release_api_url_from_override, sanitize_sidecar_stdout, select_release_asset,
+        write_install_metadata,
     };
 
     fn release(tag: &str, draft: bool, assets: &[&str]) -> GitHubRelease {
@@ -1044,7 +1314,54 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_command_args_keep_prompt_in_file_and_disable_reasoning() {
+    fn sidecar_streaming_sanitizer_yields_after_prompt_boundary() {
+        let prompt = "Answer only from local captures.\n\nQuestion: What was visible?";
+        let mut sanitizer = SidecarStdoutSanitizer::new(prompt);
+        let mut output = String::new();
+
+        output.push_str(
+            &sanitizer
+                .push(&format!(
+                    "\nLoading model...\n\navailable commands:\n  /exit or Ctrl+C     stop or exit\n\n\n> {prompt}"
+                )),
+        );
+        let first_answer = sanitizer
+            .push("\n\nThe visible screen showed a terminal with local logs and status text.");
+        assert!(!first_answer.is_empty());
+        output.push_str(&first_answer);
+        output.push_str(&sanitizer.push("\n\nExiting...\n"));
+        output.push_str(&sanitizer.finish().unwrap());
+
+        assert_eq!(
+            output,
+            "The visible screen showed a terminal with local logs and status text."
+        );
+    }
+
+    #[test]
+    fn sidecar_streaming_sanitizer_passes_clean_output_through() {
+        let mut sanitizer = SidecarStdoutSanitizer::new("Question?");
+        let mut output = String::new();
+
+        output.push_str(&sanitizer.push("Clean answer text without transcript."));
+        output.push_str(&sanitizer.finish().unwrap());
+
+        assert_eq!(output, "Clean answer text without transcript.");
+    }
+
+    #[test]
+    fn sidecar_streaming_sanitizer_rejects_loading_preamble_without_prompt_boundary() {
+        let mut sanitizer = SidecarStdoutSanitizer::new("Sensitive prompt");
+
+        let first = sanitizer.push("\nLoading model...\n\nbuild      : b9758");
+        let error = sanitizer.finish().unwrap_err();
+
+        assert_eq!(first, "");
+        assert!(error.to_string().contains("interactive transcript"));
+    }
+
+    #[test]
+    fn sidecar_command_args_keep_prompt_in_file_and_match_cpu_sampling() {
         let args = build_llama_cli_args(
             Path::new("C:/models/local.gguf"),
             Path::new("C:/Temp/prompt.txt"),
@@ -1060,6 +1377,36 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "--prompt"));
         assert!(args.windows(2).any(|pair| pair == ["--reasoning", "off"]));
         assert!(args.iter().any(|arg| arg == "--simple-io"));
+        assert!(args.windows(2).any(|pair| pair == ["--temp", "0"]));
+        assert!(args.windows(2).any(|pair| pair == ["--seed", "0"]));
+    }
+
+    #[test]
+    fn sidecar_download_size_limit_rejects_oversized_chunks_before_write() {
+        let error = checked_sidecar_download_size(8, 5, 12).unwrap_err();
+
+        assert!(error.to_string().contains("download exceeded size limit"));
+    }
+
+    #[test]
+    fn installed_sidecar_must_match_required_release_tag_when_pinned() {
+        let directory = TempDir::new().unwrap();
+        let current = directory.path().join("current");
+        let nested = current.join("llama-b9758");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("llama-cli.exe"), b"binary").unwrap();
+        write_install_metadata(&current, "b9758", "llama-b9758-bin-win-vulkan-x64.zip").unwrap();
+
+        assert!(
+            find_installed_binary_for_release(directory.path(), Some("b9758"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            find_installed_binary_for_release(directory.path(), Some("b9759"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
