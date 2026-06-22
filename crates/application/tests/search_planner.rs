@@ -69,6 +69,25 @@ fn planner_extracts_time_and_source_hints_from_acceptance_prompts() {
     assert_eq!(amazon.filters.captured_before, Some(local_utc(18)));
 }
 
+#[test]
+fn planner_preserves_unicode_retrieval_terms() {
+    let plan = plan_search("Beyoncé café", local_now()).unwrap();
+
+    assert_eq!(plan.retrieval_query, "beyoncé café");
+    assert!(plan.filters.source_terms.is_empty());
+    assert_eq!(plan.filters.captured_after, None);
+    assert_eq!(plan.filters.captured_before, None);
+}
+
+#[test]
+fn planner_does_not_anchor_unsupported_day_modifiers_to_today() {
+    let plan = plan_search("What did I see yesterday afternoon?", local_now()).unwrap();
+
+    assert_eq!(plan.retrieval_query, "yesterday");
+    assert_eq!(plan.filters.captured_after, None);
+    assert_eq!(plan.filters.captured_before, None);
+}
+
 struct FakeRepository {
     hits: Vec<SearchHit>,
 }

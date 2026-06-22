@@ -68,7 +68,7 @@ pub fn plan_search(query: &str, now: DateTime<FixedOffset>) -> Result<SearchPlan
         let (after, before) = local_window_utc(now, now.date_naive(), 12, 15)?;
         filters.captured_after = Some(after);
         filters.captured_before = Some(before);
-    } else if normalized.contains("this afternoon") || normalized.contains(" afternoon") {
+    } else if normalized.contains("this afternoon") {
         let (after, before) = local_window_utc(now, now.date_naive(), 12, 18)?;
         filters.captured_after = Some(after);
         filters.captured_before = Some(before);
@@ -132,8 +132,8 @@ fn local_midnight_utc(
 fn normalize_query(query: &str) -> String {
     let mut normalized = String::with_capacity(query.len());
     for character in query.chars() {
-        if character.is_ascii_alphanumeric() {
-            normalized.push(character.to_ascii_lowercase());
+        if character.is_alphanumeric() {
+            normalized.extend(character.to_lowercase());
         } else {
             normalized.push(' ');
         }

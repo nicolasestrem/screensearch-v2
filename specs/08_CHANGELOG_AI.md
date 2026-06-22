@@ -13,10 +13,12 @@ This log records meaningful AI-assisted repository changes and their reasons. It
 - Removed the unavailable display-name requirement from the advanced Hugging Face download button.
 - Made desktop `<think>` stripping hide content from the first unclosed streaming tag onward.
 - Recorded known gaps for source vocabulary expansion, client timezone propagation through search IPC, and further prompt hardening for application/window-title metadata.
+- Preserved Unicode alphanumeric terms during deterministic query planning so accented names and titles continue into retrieval and embeddings.
+- Restricted afternoon time planning to the supported "this afternoon" anchor so unsupported modifiers such as "yesterday afternoon" do not accidentally receive today's filter.
 
 ### Why
 
-PR review found one user-visible Settings bug, one prompt-context overflow risk, and several design-limit notes that should be explicit for future work.
+PR review found one user-visible Settings bug, one prompt-context overflow risk, two planner recall regressions, and several design-limit notes that should be explicit for future work.
 
 ## 2026-06-22 — Useful local answers and guided settings
 
