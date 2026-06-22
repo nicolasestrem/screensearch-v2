@@ -12,6 +12,10 @@
 - Added domain validation, content-free persistence, daemon orchestration, typed IPC/Tauri commands, native Windows UIA/keyboard emission, and the manual approval UI.
 - Added a gated synthetic Windows automation fixture for opt-in native verification.
 
+### Changed
+
+- Hardened llama.cpp Vulkan sidecar installs with serialized acquisition, bounded network and extraction work, prerelease filtering, and live stdout streaming before CPU fallback.
+
 ### Documentation
 
 - Addressed PR #10 review feedback by making the GGUF full-GPU-offload sentinel explicit and correcting stale Claude changelog guidance.

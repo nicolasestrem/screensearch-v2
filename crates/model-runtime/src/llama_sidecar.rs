@@ -3,18 +3,23 @@
 use std::{
     env,
     fs::{self, File},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_stream::try_stream;
 use async_trait::async_trait;
+use futures::StreamExt;
 use reqwest::{Client, header};
 use screensearch_ports::{PortError, TextGenerator, TokenStream};
 use serde::Deserialize;
 use tempfile::{Builder, TempDir};
-use tokio::io::AsyncWriteExt;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::{Instant as TokioInstant, timeout, timeout_at},
+};
 use tracing::{info, warn};
 use zip::ZipArchive;
 
@@ -30,11 +35,21 @@ const RELEASE_WEB_PREFIX: &str = "https://github.com/ggml-org/llama.cpp/releases
 const RELEASE_OVERRIDE_ENV: &str = "SSV2C_LLAMA_RELEASE_URL";
 const CURRENT_INSTALL_DIR: &str = "current";
 const LLAMA_CLI_EXE: &str = "llama-cli.exe";
-const STREAM_CHUNK_BYTES: usize = 512;
+const STDOUT_READ_BYTES: usize = 512;
+const MAX_EXTRACTED_BYTES: u64 = 500 * 1024 * 1024;
+const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+static SIDECAR_INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Ensures the Windows Vulkan llama.cpp sidecar is installed and returns `llama-cli.exe`.
 pub async fn ensure_binary(sidecar_root: impl AsRef<Path>) -> Result<PathBuf, PortError> {
     let sidecar_root = sidecar_root.as_ref().to_path_buf();
+    if let Some(binary) = find_installed_binary(&sidecar_root)? {
+        return Ok(binary);
+    }
+    let _install_guard = SIDECAR_INSTALL_LOCK.lock().await;
     if let Some(binary) = find_installed_binary(&sidecar_root)? {
         return Ok(binary);
     }
@@ -78,8 +93,7 @@ impl TextGenerator for LlamaSidecarTextGenerator {
             ));
         }
         let binary = ensure_binary(&self.sidecar_root).await?;
-        let output = run_llama_cli(&binary, &self.model_path, &prompt).await?;
-        Ok(buffered_output_stream(output))
+        run_llama_cli(&binary, &self.model_path, &prompt)
     }
 }
 
@@ -116,7 +130,13 @@ impl TextGenerator for PreferredLlamaTextGenerator {
     async fn generate(&self, prompt: String) -> Result<TokenStream, PortError> {
         if cfg!(windows) {
             match self.sidecar.generate(prompt.clone()).await {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    return Ok(sidecar_stream_with_cpu_fallback(
+                        stream,
+                        self.cpu.clone(),
+                        prompt,
+                    ));
+                }
                 Err(error) => {
                     warn!(
                         failure_kind = sidecar_failure_kind(&error),
@@ -133,6 +153,7 @@ impl TextGenerator for PreferredLlamaTextGenerator {
 struct GitHubRelease {
     tag_name: String,
     draft: bool,
+    prerelease: bool,
     assets: Vec<GitHubAsset>,
 }
 
@@ -152,6 +173,7 @@ struct SelectedReleaseAsset {
 fn github_client() -> Result<Client, PortError> {
     Client::builder()
         .user_agent(format!("ScreenSearchV2/{}", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .map_err(|error| sidecar_unavailable("create GitHub client", error))
 }
@@ -178,26 +200,25 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     client: &Client,
     url: &str,
 ) -> Result<T, PortError> {
-    client
-        .get(url)
-        .send()
+    let response = timeout(METADATA_TIMEOUT, client.get(url).send())
         .await
-        .map_err(|error| sidecar_unavailable("fetch llama.cpp release metadata", error))?
+        .map_err(|_| sidecar_timeout("fetch llama.cpp release metadata"))?
+        .map_err(|error| sidecar_unavailable("fetch llama.cpp release metadata", error))?;
+    let response = response
         .error_for_status()
-        .map_err(|error| sidecar_unavailable("fetch llama.cpp release metadata", error))?
-        .text()
+        .map_err(|error| sidecar_unavailable("fetch llama.cpp release metadata", error))?;
+    let body = timeout(METADATA_TIMEOUT, response.text())
         .await
-        .map_err(|error| sidecar_unavailable("read llama.cpp release metadata", error))
-        .and_then(|body| {
-            serde_json::from_str(&body)
-                .map_err(|error| sidecar_unavailable("parse llama.cpp release metadata", error))
-        })
+        .map_err(|_| sidecar_timeout("read llama.cpp release metadata"))?
+        .map_err(|error| sidecar_unavailable("read llama.cpp release metadata", error))?;
+    serde_json::from_str(&body)
+        .map_err(|error| sidecar_unavailable("parse llama.cpp release metadata", error))
 }
 
 fn select_release_asset(releases: &[GitHubRelease]) -> Option<SelectedReleaseAsset> {
     releases
         .iter()
-        .filter(|release| !release.draft)
+        .filter(|release| !release.draft && !release.prerelease)
         .find_map(|release| {
             release
                 .assets
@@ -228,18 +249,21 @@ fn release_api_url_from_override(value: &str) -> Result<String, PortError> {
             "llama sidecar release URL is empty".to_owned(),
         ));
     }
-    if value.starts_with(RELEASE_API_PREFIX) {
-        return Ok(value.to_owned());
+    match value.strip_prefix(RELEASE_API_PREFIX) {
+        Some(tag) if valid_release_tag(tag) => return Ok(value.to_owned()),
+        _ => {}
     }
-    if let Some(tag) = value.strip_prefix(RELEASE_WEB_PREFIX)
-        && !tag.is_empty()
-        && !tag.contains('/')
-    {
-        return Ok(format!("{RELEASE_API_PREFIX}{tag}"));
+    match value.strip_prefix(RELEASE_WEB_PREFIX) {
+        Some(tag) if valid_release_tag(tag) => return Ok(format!("{RELEASE_API_PREFIX}{tag}")),
+        _ => {}
     }
     Err(PortError::InvalidData(
         "llama sidecar release URL must be a ggml-org/llama.cpp GitHub release".to_owned(),
     ))
+}
+
+fn valid_release_tag(tag: &str) -> bool {
+    !tag.is_empty() && !tag.contains('/')
 }
 
 async fn install_release_asset(
@@ -260,15 +284,22 @@ async fn install_release_asset(
         .prefix("staging-")
         .tempdir_in(sidecar_root)
         .map_err(|error| sidecar_unavailable("create sidecar staging directory", error))?;
-    extract_zip_safely(download.path(), staging.path())?;
-    swap_staging_into_current(sidecar_root, staging)
+    let download_path = download.path().to_path_buf();
+    let staging_path = staging.path().to_path_buf();
+    let sidecar_root = sidecar_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        extract_zip_safely(&download_path, &staging_path)?;
+        swap_staging_into_current(&sidecar_root, staging)
+    })
+    .await
+    .map_err(|error| PortError::Internal(format!("sidecar install task failed: {error}")))?
 }
 
 async fn download_asset(client: &Client, url: &str, destination: &Path) -> Result<(), PortError> {
-    let mut response = client
-        .get(url)
-        .send()
+    let deadline = TokioInstant::now() + DOWNLOAD_TIMEOUT;
+    let mut response = timeout_at(deadline, client.get(url).send())
         .await
+        .map_err(|_| sidecar_timeout("download llama.cpp sidecar"))?
         .map_err(|error| sidecar_unavailable("download llama.cpp sidecar", error))?
         .error_for_status()
         .map_err(|error| sidecar_unavailable("download llama.cpp sidecar", error))?;
@@ -289,9 +320,9 @@ async fn download_asset(client: &Client, url: &str, destination: &Path) -> Resul
         .open(destination)
         .await
         .map_err(|error| sidecar_unavailable("open sidecar download file", error))?;
-    while let Some(chunk) = response
-        .chunk()
+    while let Some(chunk) = timeout_at(deadline, response.chunk())
         .await
+        .map_err(|_| sidecar_timeout("download llama.cpp sidecar"))?
         .map_err(|error| sidecar_unavailable("download llama.cpp sidecar", error))?
     {
         output
@@ -307,12 +338,21 @@ async fn download_asset(client: &Client, url: &str, destination: &Path) -> Resul
 }
 
 fn extract_zip_safely(archive_path: &Path, staging: &Path) -> Result<PathBuf, PortError> {
+    extract_zip_safely_with_limit(archive_path, staging, MAX_EXTRACTED_BYTES)
+}
+
+fn extract_zip_safely_with_limit(
+    archive_path: &Path,
+    staging: &Path,
+    maximum_extracted_bytes: u64,
+) -> Result<PathBuf, PortError> {
     fs::create_dir_all(staging)
         .map_err(|error| sidecar_unavailable("create sidecar staging directory", error))?;
     let file = File::open(archive_path)
         .map_err(|error| sidecar_unavailable("open sidecar zip archive", error))?;
     let mut archive = ZipArchive::new(file)
         .map_err(|error| sidecar_unavailable("read sidecar zip archive", error))?;
+    let mut extracted_bytes = 0_u64;
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -330,8 +370,17 @@ fn extract_zip_safely(archive_path: &Path, staging: &Path) -> Result<PathBuf, Po
         }
         let mut output = File::create(&output_path)
             .map_err(|error| sidecar_unavailable("create sidecar file", error))?;
-        io::copy(&mut entry, &mut output)
-            .map_err(|error| sidecar_unavailable("extract sidecar file", error))?;
+        if entry.size() > maximum_extracted_bytes.saturating_sub(extracted_bytes) {
+            return Err(PortError::InvalidData(
+                "llama sidecar archive exceeds extraction size limit".to_owned(),
+            ));
+        }
+        let copied = copy_zip_entry_with_limit(
+            &mut entry,
+            &mut output,
+            maximum_extracted_bytes.saturating_sub(extracted_bytes),
+        )?;
+        extracted_bytes = extracted_bytes.saturating_add(copied);
     }
     find_llama_cli_under(staging)?.ok_or_else(|| {
         PortError::Unavailable("llama sidecar archive did not contain llama-cli.exe".to_owned())
@@ -365,6 +414,32 @@ fn safe_zip_entry_path(name: &str) -> Result<PathBuf, PortError> {
     Ok(safe)
 }
 
+fn copy_zip_entry_with_limit(
+    input: &mut impl Read,
+    output: &mut File,
+    remaining_bytes: u64,
+) -> Result<u64, PortError> {
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|error| sidecar_unavailable("extract sidecar file", error))?;
+        if read == 0 {
+            return Ok(copied);
+        }
+        copied = copied.saturating_add(read as u64);
+        if copied > remaining_bytes {
+            return Err(PortError::InvalidData(
+                "llama sidecar archive exceeds extraction size limit".to_owned(),
+            ));
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|error| sidecar_unavailable("extract sidecar file", error))?;
+    }
+}
+
 fn swap_staging_into_current(sidecar_root: &Path, staging: TempDir) -> Result<PathBuf, PortError> {
     let staging_path = staging.keep();
     let current = sidecar_root.join(CURRENT_INSTALL_DIR);
@@ -388,17 +463,22 @@ fn swap_staging_into_current(sidecar_root: &Path, staging: TempDir) -> Result<Pa
             error,
         ));
     }
-    if previous.exists()
-        && let Err(error) = fs::remove_dir_all(&previous)
-    {
+    remove_previous_install_backup(&previous);
+    find_llama_cli_under(&current)?.ok_or_else(|| {
+        PortError::Unavailable("llama sidecar archive did not contain llama-cli.exe".to_owned())
+    })
+}
+
+fn remove_previous_install_backup(previous: &Path) {
+    if !previous.exists() {
+        return;
+    }
+    if let Err(error) = fs::remove_dir_all(previous) {
         warn!(
             failure_kind = io_error_kind(&error),
             "could not remove previous llama sidecar install"
         );
     }
-    find_llama_cli_under(&current)?.ok_or_else(|| {
-        PortError::Unavailable("llama sidecar archive did not contain llama-cli.exe".to_owned())
-    })
 }
 
 fn find_installed_binary(sidecar_root: &Path) -> Result<Option<PathBuf>, PortError> {
@@ -438,11 +518,7 @@ fn find_llama_cli_under(root: &Path) -> Result<Option<PathBuf>, PortError> {
     Ok(None)
 }
 
-async fn run_llama_cli(
-    binary: &Path,
-    model_path: &Path,
-    prompt: &str,
-) -> Result<String, PortError> {
+fn run_llama_cli(binary: &Path, model_path: &Path, prompt: &str) -> Result<TokenStream, PortError> {
     let mut prompt_file = Builder::new()
         .prefix("screensearch-llama-prompt-")
         .suffix(".txt")
@@ -473,6 +549,8 @@ async fn run_llama_cli(
         .arg("all")
         .arg("--predict")
         .arg(token_cap)
+        // Together these flags make chat-template models produce one assistant turn and exit.
+        // If upstream behavior regresses, the generation deadline still kills the sidecar.
         .arg("--conversation")
         .arg("--single-turn")
         .arg("--no-display-prompt")
@@ -480,39 +558,112 @@ async fn run_llama_cli(
         .arg("--color")
         .arg("off")
         .arg("--log-disable")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .kill_on_drop(true);
     if let Some(directory) = binary.parent() {
         command.current_dir(directory);
     }
-    let output = tokio::time::timeout(GENERATION_DEADLINE, command.output())
-        .await
-        .map_err(|_| PortError::Transient("llama sidecar generation timed out".to_owned()))?
+    let mut child = command
+        .spawn()
         .map_err(|error| sidecar_unavailable("run llama sidecar", error))?;
-    if !output.status.success() {
-        return Err(PortError::Unavailable(format!(
-            "llama sidecar exited with status {}",
-            output
-                .status
-                .code()
-                .map_or_else(|| "terminated".to_owned(), |code| code.to_string())
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn buffered_output_stream(output: String) -> TokenStream {
-    Box::pin(try_stream! {
-        let mut chunk = String::new();
-        for character in output.chars() {
-            chunk.push(character);
-            if chunk.len() >= STREAM_CHUNK_BYTES {
-                yield std::mem::take(&mut chunk);
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| PortError::Internal("llama sidecar stdout was not piped".to_owned()))?;
+    Ok(Box::pin(try_stream! {
+        let _prompt_file = prompt_file;
+        let mut stdout = stdout;
+        let mut buffer = [0_u8; STDOUT_READ_BYTES];
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let deadline = TokioInstant::now() + GENERATION_DEADLINE;
+        loop {
+            let read =
+                read_sidecar_stdout(&mut stdout, &mut child, &mut buffer, deadline).await?;
+            if read == 0 {
+                break;
+            }
+            let mut text = String::new();
+            let _ = decoder.decode_to_string(&buffer[..read], &mut text, false);
+            if !text.is_empty() {
+                yield text;
             }
         }
-        if !chunk.is_empty() {
-            yield chunk;
+        let mut trailing = String::new();
+        let _ = decoder.decode_to_string(&[], &mut trailing, true);
+        if !trailing.is_empty() {
+            yield trailing;
+        }
+        let status = wait_for_sidecar_exit(&mut child, deadline).await?;
+        if !status.success() {
+            Err(PortError::Unavailable(format!(
+                "llama sidecar exited with status {}",
+                status
+                    .code()
+                    .map_or_else(|| "terminated".to_owned(), |code| code.to_string())
+            )))?;
+        }
+    }))
+}
+
+async fn read_sidecar_stdout(
+    stdout: &mut tokio::process::ChildStdout,
+    child: &mut tokio::process::Child,
+    buffer: &mut [u8],
+    deadline: TokioInstant,
+) -> Result<usize, PortError> {
+    match timeout_at(deadline, stdout.read(buffer)).await {
+        Ok(Ok(read)) => Ok(read),
+        Ok(Err(error)) => Err(sidecar_unavailable("read llama sidecar stdout", error)),
+        Err(_) => Err(sidecar_generation_timeout(child).await),
+    }
+}
+
+async fn wait_for_sidecar_exit(
+    child: &mut tokio::process::Child,
+    deadline: TokioInstant,
+) -> Result<std::process::ExitStatus, PortError> {
+    match timeout_at(deadline, child.wait()).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(sidecar_unavailable("wait for llama sidecar", error)),
+        Err(_) => Err(sidecar_generation_timeout(child).await),
+    }
+}
+
+fn sidecar_stream_with_cpu_fallback(
+    mut sidecar: TokenStream,
+    cpu: LlamaCppTextGenerator,
+    prompt: String,
+) -> TokenStream {
+    Box::pin(try_stream! {
+        let mut emitted_sidecar_text = false;
+        while let Some(piece) = sidecar.next().await {
+            match piece {
+                Ok(text) => {
+                    emitted_sidecar_text = true;
+                    yield text;
+                }
+                Err(error) if !emitted_sidecar_text => {
+                    warn!(
+                        failure_kind = sidecar_failure_kind(&error),
+                        "llama.cpp Vulkan sidecar stream failed before output; falling back to embedded CPU provider"
+                    );
+                    let mut fallback = cpu.generate(prompt).await?;
+                    while let Some(token) = fallback.next().await {
+                        yield token?;
+                    }
+                    return;
+                }
+                Err(error) => Err(error)?,
+            }
         }
     })
+}
+
+async fn sidecar_generation_timeout(child: &mut tokio::process::Child) -> PortError {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    PortError::Transient("llama sidecar generation timed out".to_owned())
 }
 
 fn unique_suffix() -> String {
@@ -535,6 +686,10 @@ fn sidecar_failure_kind(error: &PortError) -> &'static str {
 
 fn sidecar_unavailable(context: &str, error: impl std::fmt::Display) -> PortError {
     PortError::Unavailable(format!("{context}: {error}"))
+}
+
+fn sidecar_timeout(context: &str) -> PortError {
+    PortError::Transient(format!("{context}: timed out"))
 }
 
 fn io_error_kind(error: &io::Error) -> &'static str {
@@ -560,13 +715,23 @@ mod tests {
 
     use super::{
         GitHubAsset, GitHubRelease, asset_matches_windows_vulkan, extract_zip_safely,
-        release_api_url_from_override, select_release_asset,
+        extract_zip_safely_with_limit, release_api_url_from_override, select_release_asset,
     };
 
     fn release(tag: &str, draft: bool, assets: &[&str]) -> GitHubRelease {
+        release_with_flags(tag, draft, false, assets)
+    }
+
+    fn release_with_flags(
+        tag: &str,
+        draft: bool,
+        prerelease: bool,
+        assets: &[&str],
+    ) -> GitHubRelease {
         GitHubRelease {
             tag_name: tag.to_owned(),
             draft,
+            prerelease,
             assets: assets
                 .iter()
                 .map(|name| GitHubAsset {
@@ -625,6 +790,24 @@ mod tests {
     }
 
     #[test]
+    fn release_selection_skips_prereleases() {
+        let releases = vec![
+            release_with_flags(
+                "b9759",
+                false,
+                true,
+                &["llama-b9759-bin-win-vulkan-x64.zip"],
+            ),
+            release("b9758", false, &["llama-b9758-bin-win-vulkan-x64.zip"]),
+        ];
+
+        let selected = select_release_asset(&releases).expect("asset should be selected");
+
+        assert_eq!(selected.release_tag, "b9758");
+        assert_eq!(selected.asset_name, "llama-b9758-bin-win-vulkan-x64.zip");
+    }
+
+    #[test]
     fn override_release_url_accepts_github_release_forms() {
         assert_eq!(
             release_api_url_from_override(
@@ -640,6 +823,24 @@ mod tests {
             .unwrap(),
             "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/b9758"
         );
+    }
+
+    #[test]
+    fn override_release_url_rejects_non_release_forms() {
+        for value in [
+            "",
+            "https://github.com/ggml-org/llama.cpp/releases/tag/",
+            "https://github.com/ggml-org/llama.cpp/releases/latest",
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9758/llama-b9758-bin-win-vulkan-x64.zip",
+            "https://github.com/example/llama.cpp/releases/tag/b9758",
+            "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/",
+            "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/b9758/extra",
+        ] {
+            assert!(
+                release_api_url_from_override(value).is_err(),
+                "{value} should not be accepted as a llama.cpp release override"
+            );
+        }
     }
 
     #[test]
@@ -672,6 +873,21 @@ mod tests {
 
         assert!(error.to_string().contains("unsafe zip entry"));
         assert!(!directory.path().join("llama-cli.exe").exists());
+    }
+
+    #[test]
+    fn safe_zip_extraction_rejects_archives_over_size_limit() {
+        let directory = TempDir::new().unwrap();
+        let archive = directory.path().join("llama.zip");
+        write_zip(
+            &archive,
+            &[("llama-b9758-bin-win-vulkan-x64/llama-cli.exe", b"binary")],
+        );
+        let staging = directory.path().join("staging");
+
+        let error = extract_zip_safely_with_limit(&archive, &staging, 5).unwrap_err();
+
+        assert!(error.to_string().contains("size limit"));
     }
 
     fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
