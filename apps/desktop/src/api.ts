@@ -76,6 +76,37 @@ export interface GenerationModel {
   active: boolean;
 }
 
+export interface AutomationStatus {
+  enabled: boolean;
+  abortAvailable: boolean;
+  abortActive: boolean;
+  running: boolean;
+}
+
+export interface AutomationTarget {
+  processId: number;
+  windowHandle: number;
+  executableName: string;
+  displayTitle: string;
+}
+
+export type AutomationAction =
+  | { kind: "uia_invoke"; automationId: string }
+  | { kind: "uia_set_value"; automationId: string; value: string }
+  | { kind: "key_chord"; modifiers: Array<"control" | "alt" | "shift">; key: string }
+  | { kind: "type_text"; text: string };
+
+export interface AutomationPlan {
+  target: AutomationTarget;
+  actions: AutomationAction[];
+}
+
+export interface AutomationApproval {
+  approvalId: string;
+  expiresAt: string;
+  actionCount: number;
+}
+
 export type SearchEvent =
   | {
       kind: "citation";
@@ -105,6 +136,13 @@ export const isTauri = "__TAURI_INTERNALS__" in window;
 let previewPaused = false;
 let previewHotkey = DEFAULT_HOTKEY;
 let previewModels: GenerationModel[] = [];
+let previewAutomationStatus: AutomationStatus = {
+  enabled: false,
+  abortAvailable: true,
+  abortActive: false,
+  running: false,
+};
+let previewAutomationApproval: AutomationApproval | null = null;
 let previewSettings: ArchiveSettings = {
   retentionDays: null,
   diskBudgetBytes: null,
@@ -281,4 +319,47 @@ export const api = {
   unloadGenerationModel: () => isTauri
     ? invoke<boolean>("unload_generation_model")
     : Promise.resolve(true),
+  automationStatus: () => isTauri
+    ? invoke<AutomationStatus>("automation_status")
+    : Promise.resolve({ ...previewAutomationStatus }),
+  setAutomationEnabled: async (enabled: boolean) => {
+    if (isTauri) return invoke<AutomationStatus>("set_automation_enabled", { enabled });
+    previewAutomationStatus = { ...previewAutomationStatus, enabled };
+    return { ...previewAutomationStatus };
+  },
+  automationForegroundTarget: () => isTauri
+    ? invoke<AutomationTarget>("automation_foreground_target")
+    : Promise.resolve({
+      processId: 4242,
+      windowHandle: 9001,
+      executableName: "fixture.exe",
+      displayTitle: "Preview automation fixture",
+    }),
+  approveAutomation: async (plan: AutomationPlan) => {
+    if (isTauri) return invoke<AutomationApproval>("approve_automation", { plan });
+    previewAutomationApproval = {
+      approvalId: `preview-${Date.now()}`,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      actionCount: plan.actions.length,
+    };
+    return previewAutomationApproval;
+  },
+  executeAutomation: async (approvalId: string, plan: AutomationPlan) => {
+    if (isTauri) return invoke<string>("execute_automation", { approvalId, plan });
+    if (!previewAutomationApproval || previewAutomationApproval.approvalId !== approvalId) {
+      throw { code: "approval_missing", message: "Approval is missing or already consumed." };
+    }
+    previewAutomationApproval = null;
+    return `preview executed ${plan.actions.length} action(s)`;
+  },
+  abortAutomation: async () => {
+    if (isTauri) return invoke<boolean>("abort_automation");
+    previewAutomationStatus = { ...previewAutomationStatus, abortActive: true };
+    return true;
+  },
+  resetAutomationAbort: async () => {
+    if (isTauri) return invoke<boolean>("reset_automation_abort");
+    previewAutomationStatus = { ...previewAutomationStatus, abortActive: false };
+    return false;
+  },
 };

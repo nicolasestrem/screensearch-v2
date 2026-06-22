@@ -1,13 +1,21 @@
 //! Dependency-inversion ports implemented by capture, storage, model, and automation adapters.
 
-use std::pin::Pin;
+use std::{
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use futures::Stream;
 use screensearch_domain::{
-    AnalysisJob, AnalysisResult, ArchiveSettings, AssetCleanupTask, AssetRef, CaptureDisposition,
-    CaptureId, CapturedFrame, DeleteCaptures, DeletionSummary, GenerationModel, NewCapture,
-    OcrBlock, QueueMetrics, SearchHit, StorageMetrics,
+    AnalysisJob, AnalysisResult, ArchiveSettings, AssetCleanupTask, AssetRef, AutomationAction,
+    AutomationFailureCode, AutomationRun, AutomationRunId, AutomationRunStatus, AutomationSettings,
+    AutomationTarget, CaptureDisposition, CaptureId, CapturedFrame, DeleteCaptures,
+    DeletionSummary, GenerationModel, NewCapture, OcrBlock, QueueMetrics, SearchHit,
+    StorageMetrics,
 };
 use thiserror::Error;
 
@@ -143,22 +151,101 @@ pub trait TextGenerator: Send + Sync {
     async fn generate(&self, prompt: String) -> Result<TokenStream, PortError>;
 }
 
-/// A validated, explicitly approved automation action.
+/// Result of atomically claiming a one-shot automation approval.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ApprovedAutomationAction {
-    /// Identifier of the approval record.
-    pub approval_id: String,
-    /// Expected foreground window title.
-    pub expected_window: String,
-    /// Deterministic action description.
-    pub action: String,
+pub enum AutomationClaimOutcome {
+    /// Exact, live approval was transitioned to running.
+    Claimed(AutomationRun),
+    /// Approval does not exist or was already consumed.
+    Missing,
+    /// Approval elapsed and was transitioned to expired.
+    Expired,
+    /// Approval exists but its canonical digest differs.
+    PlanMismatch,
 }
 
-/// Executes a guarded OS automation action.
+/// Durable default-off settings and content-free automation run ledger.
 #[async_trait]
-pub trait AutomationExecutor: Send + Sync {
-    /// Executes only after approval, foreground, and abort checks pass.
-    async fn execute(&self, action: &ApprovedAutomationAction) -> Result<(), PortError>;
+pub trait AutomationRepository: Send + Sync {
+    /// Loads daemon-owned automation enablement.
+    async fn automation_settings(&self) -> Result<AutomationSettings, PortError>;
+
+    /// Replaces daemon-owned automation enablement.
+    async fn update_automation_settings(
+        &self,
+        settings: AutomationSettings,
+    ) -> Result<(), PortError>;
+
+    /// Persists one exact digest approval.
+    async fn create_automation_approval(&self, run: AutomationRun) -> Result<(), PortError>;
+
+    /// Atomically validates and consumes one approval.
+    async fn claim_automation_run(
+        &self,
+        id: AutomationRunId,
+        plan_digest: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<AutomationClaimOutcome, PortError>;
+
+    /// Writes a terminal status and optional content-free failure code.
+    async fn finish_automation_run(
+        &self,
+        id: AutomationRunId,
+        status: AutomationRunStatus,
+        failure_code: Option<AutomationFailureCode>,
+        finished_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), PortError>;
+
+    /// Returns one content-free ledger record.
+    async fn automation_run(&self, id: AutomationRunId)
+    -> Result<Option<AutomationRun>, PortError>;
+
+    /// Converts orphaned running rows to aborted during daemon startup.
+    async fn recover_automation_runs(
+        &self,
+        recovered_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, PortError>;
+}
+
+/// Shared cancellation signal for one in-flight native automation action.
+#[derive(Clone, Debug, Default)]
+pub struct AutomationAbortSignal {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl AutomationAbortSignal {
+    /// Creates a clear cancellation signal.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marks the action cancelled. Native adapters must fail closed before emitting input.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns true once the action has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+/// Native platform observations and one typed action emission.
+#[async_trait]
+pub trait AutomationPlatform: Send + Sync {
+    /// Captures the exact current foreground HWND/PID/executable identity.
+    async fn foreground_target(&self) -> Result<AutomationTarget, PortError>;
+
+    /// Returns true only when Windows positively reports the interactive session unlocked.
+    async fn session_is_unlocked(&self) -> Result<bool, PortError>;
+
+    /// Executes exactly one already validated action against the approved target.
+    async fn execute_action(
+        &self,
+        target: &AutomationTarget,
+        action: &AutomationAction,
+        abort_signal: AutomationAbortSignal,
+    ) -> Result<(), PortError>;
 }
 
 /// Errors crossing an adapter boundary.
@@ -176,6 +263,9 @@ pub enum PortError {
     /// A policy gate rejected the operation.
     #[error("operation denied: {0}")]
     Denied(String),
+    /// Guarded automation failed with a stable content-free category.
+    #[error("automation denied: {0}")]
+    Automation(screensearch_domain::AutomationFailureCode),
     /// An unexpected adapter failure occurred.
     #[error("adapter failure: {0}")]
     Internal(String),

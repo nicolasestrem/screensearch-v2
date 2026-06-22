@@ -74,6 +74,494 @@ impl std::fmt::Display for ChunkId {
     }
 }
 
+/// Stable identifier for one automation approval and its optional run.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct AutomationRunId(pub Uuid);
+
+impl AutomationRunId {
+    /// Creates a time-sortable automation run identifier.
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for AutomationRunId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for AutomationRunId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Exact foreground identity approved for one automation plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationTarget {
+    /// Operating-system process identifier.
+    pub process_id: u32,
+    /// Native window handle represented without pointer semantics.
+    pub window_handle: u64,
+    /// Bounded executable file name, without a directory.
+    pub executable_name: String,
+    /// User-visible title used only for review and live IPC.
+    pub display_title: String,
+}
+
+impl AutomationTarget {
+    /// Returns true when two targets have the same HWND/PID/executable identity.
+    ///
+    /// The display title is intentionally excluded because it is user-visible review context and
+    /// can legitimately change while the same process/window remains selected.
+    pub fn matches_identity(&self, other: &Self) -> bool {
+        self.process_id == other.process_id
+            && self.window_handle == other.window_handle
+            && self
+                .executable_name
+                .eq_ignore_ascii_case(&other.executable_name)
+    }
+
+    /// Validates a complete, bounded target identity.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.process_id == 0 || self.window_handle == 0 {
+            return Err(DomainError::InvalidAutomation(
+                "target process and window handle must be non-zero".to_owned(),
+            ));
+        }
+        validate_automation_text("target executable", &self.executable_name, 1, 260)?;
+        if self.executable_name.contains(['/', '\\']) {
+            return Err(DomainError::InvalidAutomation(
+                "target executable must be a file name, not a path".to_owned(),
+            ));
+        }
+        validate_automation_text("target display title", &self.display_title, 1, 512)
+    }
+}
+
+/// Modifier accepted by an explicit keyboard fallback action.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyModifier {
+    /// Control key.
+    Control,
+    /// Alternate key.
+    Alt,
+    /// Shift key.
+    Shift,
+}
+
+/// Bounded non-modifier key accepted by an explicit chord action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationKey {
+    /// A key.
+    A,
+    /// B key.
+    B,
+    /// C key.
+    C,
+    /// D key.
+    D,
+    /// E key.
+    E,
+    /// F key.
+    F,
+    /// G key.
+    G,
+    /// H key.
+    H,
+    /// I key.
+    I,
+    /// J key.
+    J,
+    /// K key.
+    K,
+    /// L key.
+    L,
+    /// M key.
+    M,
+    /// N key.
+    N,
+    /// O key.
+    O,
+    /// P key.
+    P,
+    /// Q key.
+    Q,
+    /// R key.
+    R,
+    /// S key.
+    S,
+    /// T key.
+    T,
+    /// U key.
+    U,
+    /// V key.
+    V,
+    /// W key.
+    W,
+    /// X key.
+    X,
+    /// Y key.
+    Y,
+    /// Z key.
+    Z,
+    /// Digit zero.
+    Digit0,
+    /// Digit one.
+    Digit1,
+    /// Digit two.
+    Digit2,
+    /// Digit three.
+    Digit3,
+    /// Digit four.
+    Digit4,
+    /// Digit five.
+    Digit5,
+    /// Digit six.
+    Digit6,
+    /// Digit seven.
+    Digit7,
+    /// Digit eight.
+    Digit8,
+    /// Digit nine.
+    Digit9,
+    /// Enter key.
+    Enter,
+    /// Escape key.
+    Escape,
+    /// Tab key.
+    Tab,
+    /// Space key.
+    Space,
+    /// Backspace key.
+    Backspace,
+    /// Delete key.
+    Delete,
+    /// Left arrow.
+    ArrowLeft,
+    /// Right arrow.
+    ArrowRight,
+    /// Up arrow.
+    ArrowUp,
+    /// Down arrow.
+    ArrowDown,
+    /// Home key.
+    Home,
+    /// End key.
+    End,
+    /// Function key F1.
+    F1,
+    /// Function key F2.
+    F2,
+    /// Function key F3.
+    F3,
+    /// Function key F4.
+    F4,
+    /// Function key F5.
+    F5,
+    /// Function key F6.
+    F6,
+    /// Function key F7.
+    F7,
+    /// Function key F8.
+    F8,
+    /// Function key F9.
+    F9,
+    /// Function key F10.
+    F10,
+    /// Function key F11.
+    F11,
+    /// Function key F12.
+    F12,
+}
+
+/// One deterministic automation operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AutomationAction {
+    /// Invokes one uniquely resolved UI Automation control.
+    UiaInvoke {
+        /// Exact Automation ID below the approved target window.
+        automation_id: String,
+    },
+    /// Sets the writable Value pattern of one uniquely resolved control.
+    UiaSetValue {
+        /// Exact Automation ID below the approved target window.
+        automation_id: String,
+        /// Value passed to the UI Automation Value pattern.
+        value: String,
+    },
+    /// Emits one explicit key chord.
+    KeyChord {
+        /// Zero to three unique non-Windows modifiers.
+        modifiers: Vec<KeyModifier>,
+        /// Non-modifier key pressed once.
+        key: AutomationKey,
+    },
+    /// Emits Unicode text using UTF-16 keyboard input records.
+    TypeText {
+        /// Bounded text emitted exactly as reviewed.
+        text: String,
+    },
+}
+
+impl AutomationAction {
+    fn validate(&self) -> Result<(), DomainError> {
+        match self {
+            Self::UiaInvoke { automation_id } => {
+                validate_automation_text("automation id", automation_id, 1, 512)
+            }
+            Self::UiaSetValue {
+                automation_id,
+                value,
+            } => {
+                validate_automation_text("automation id", automation_id, 1, 512)?;
+                validate_automation_text("UI Automation value", value, 1, 512)
+            }
+            Self::KeyChord { modifiers, .. } => {
+                if modifiers.len() > 3 {
+                    return Err(DomainError::InvalidAutomation(
+                        "key chord accepts at most three modifiers".to_owned(),
+                    ));
+                }
+                let mut normalized = modifiers.clone();
+                normalized.sort_unstable();
+                normalized.dedup();
+                if normalized.len() != modifiers.len() {
+                    return Err(DomainError::InvalidAutomation(
+                        "key chord modifiers must be unique".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::TypeText { text } => validate_automation_text("typed text", text, 1, 512),
+        }
+    }
+}
+
+/// Version-one manual automation plan reviewed and approved as one unit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationPlanV1 {
+    /// Exact foreground target.
+    pub target: AutomationTarget,
+    /// Ordered deterministic actions.
+    pub actions: Vec<AutomationAction>,
+}
+
+impl AutomationPlanV1 {
+    /// Maximum action count accepted by V1.
+    pub const MAX_ACTIONS: usize = 10;
+    /// Hard execution deadline in seconds.
+    pub const EXECUTION_TIMEOUT_SECONDS: u64 = 10;
+    /// Minimum pacing between emitted native actions.
+    pub const ACTION_PACING_MILLISECONDS: u64 = 100;
+    /// One-shot approval lifetime in seconds.
+    pub const APPROVAL_TTL_SECONDS: i64 = 60;
+
+    /// Validates the complete plan before hashing, approval, or execution.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        self.target.validate()?;
+        if self.actions.is_empty() || self.actions.len() > Self::MAX_ACTIONS {
+            return Err(DomainError::InvalidAutomation(format!(
+                "automation plan must contain 1 to {} actions",
+                Self::MAX_ACTIONS
+            )));
+        }
+        for action in &self.actions {
+            action.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Computes the stable lowercase BLAKE3 digest of the versioned plan encoding.
+    pub fn canonical_digest(&self) -> Result<String, DomainError> {
+        self.validate()?;
+        let encoded = serde_json::to_vec(&("screensearch.automation.v1", self))
+            .map_err(|error| DomainError::InvalidAutomation(error.to_string()))?;
+        Ok(blake3::hash(&encoded).to_hex().to_string())
+    }
+}
+
+fn validate_automation_text(
+    label: &str,
+    value: &str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<(), DomainError> {
+    let length = value.chars().count();
+    if length < minimum || length > maximum {
+        return Err(DomainError::InvalidAutomation(format!(
+            "{label} must contain {minimum} to {maximum} characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Durable default-off automation setting.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationSettings {
+    /// Whether guarded automation may be approved or executed.
+    pub enabled: bool,
+}
+
+/// Content-free lifecycle of one approval and run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationRunStatus {
+    /// Exact digest approved but not claimed.
+    Approved,
+    /// Approval was atomically claimed for execution.
+    Running,
+    /// Every action completed.
+    Succeeded,
+    /// Execution stopped on a non-abort failure.
+    Failed,
+    /// Execution stopped because abort was active or recovery found an orphan.
+    Aborted,
+    /// Approval elapsed before it was claimed.
+    Expired,
+}
+
+impl AutomationRunStatus {
+    /// Stable persistence value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Aborted => "aborted",
+            Self::Expired => "expired",
+        }
+    }
+
+    /// Parses a stable persistence value.
+    pub fn parse(value: &str) -> Result<Self, DomainError> {
+        match value {
+            "approved" => Ok(Self::Approved),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "aborted" => Ok(Self::Aborted),
+            "expired" => Ok(Self::Expired),
+            _ => Err(DomainError::InvalidAutomation(format!(
+                "unknown automation run status {value}"
+            ))),
+        }
+    }
+}
+
+/// Stable content-free automation failure category.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationFailureCode {
+    /// Automation is disabled.
+    Disabled,
+    /// Abort shortcut heartbeat is missing or stale.
+    AbortUnavailable,
+    /// Emergency abort is latched.
+    AbortActive,
+    /// Approval does not exist or was already consumed.
+    ApprovalMissing,
+    /// Approval elapsed before execution.
+    ApprovalExpired,
+    /// Resubmitted plan digest differs from the approval.
+    PlanMismatch,
+    /// Foreground HWND, PID, or executable changed.
+    TargetChanged,
+    /// Interactive session is locked or its state is unknown.
+    SessionLocked,
+    /// Action pacing or single-flight policy rejected execution.
+    RateLimited,
+    /// Execution exceeded its deadline.
+    Timeout,
+    /// Windows rejected or partially injected input.
+    InputBlocked,
+    /// UI Automation selector found no control.
+    ControlMissing,
+    /// UI Automation selector found multiple controls.
+    ControlAmbiguous,
+    /// UI Automation control lacks the requested writable pattern.
+    ControlUnsupported,
+}
+
+impl AutomationFailureCode {
+    /// Stable persistence and IPC value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::AbortUnavailable => "abort_unavailable",
+            Self::AbortActive => "abort_active",
+            Self::ApprovalMissing => "approval_missing",
+            Self::ApprovalExpired => "approval_expired",
+            Self::PlanMismatch => "plan_mismatch",
+            Self::TargetChanged => "target_changed",
+            Self::SessionLocked => "session_locked",
+            Self::RateLimited => "rate_limited",
+            Self::Timeout => "timeout",
+            Self::InputBlocked => "input_blocked",
+            Self::ControlMissing => "control_missing",
+            Self::ControlAmbiguous => "control_ambiguous",
+            Self::ControlUnsupported => "control_unsupported",
+        }
+    }
+
+    /// Parses a stable persistence or IPC value.
+    pub fn parse(value: &str) -> Result<Self, DomainError> {
+        match value {
+            "disabled" => Ok(Self::Disabled),
+            "abort_unavailable" => Ok(Self::AbortUnavailable),
+            "abort_active" => Ok(Self::AbortActive),
+            "approval_missing" => Ok(Self::ApprovalMissing),
+            "approval_expired" => Ok(Self::ApprovalExpired),
+            "plan_mismatch" => Ok(Self::PlanMismatch),
+            "target_changed" => Ok(Self::TargetChanged),
+            "session_locked" => Ok(Self::SessionLocked),
+            "rate_limited" => Ok(Self::RateLimited),
+            "timeout" => Ok(Self::Timeout),
+            "input_blocked" => Ok(Self::InputBlocked),
+            "control_missing" => Ok(Self::ControlMissing),
+            "control_ambiguous" => Ok(Self::ControlAmbiguous),
+            "control_unsupported" => Ok(Self::ControlUnsupported),
+            _ => Err(DomainError::InvalidAutomation(format!(
+                "unknown automation failure code {value}"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for AutomationFailureCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Content-free durable approval/run record.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationRun {
+    /// Approval and run identifier.
+    pub id: AutomationRunId,
+    /// Canonical plan digest.
+    pub plan_digest: String,
+    /// Number of ordered actions in the plan.
+    pub action_count: u32,
+    /// Current lifecycle status.
+    pub status: AutomationRunStatus,
+    /// Approval creation time.
+    pub approved_at: DateTime<Utc>,
+    /// Approval expiry.
+    pub expires_at: DateTime<Utc>,
+    /// Atomic run-claim time.
+    pub started_at: Option<DateTime<Utc>>,
+    /// Terminal transition time.
+    pub finished_at: Option<DateTime<Utc>>,
+    /// Stable terminal failure code, when applicable.
+    pub failure_code: Option<AutomationFailureCode>,
+}
+
 /// An unpersisted screen frame returned by a capture adapter.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CapturedFrame {
@@ -577,11 +1065,17 @@ pub enum DomainError {
     /// Model catalog metadata exceeded a documented bound.
     #[error("invalid model catalog: {0}")]
     InvalidModelCatalog(String),
+    /// Automation input or persisted automation metadata violated V1 bounds.
+    #[error("invalid automation: {0}")]
+    InvalidAutomation(String),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ArchiveSettings, BoundingBox, DomainError, GenerationModel, ModelSourceKind};
+    use super::{
+        ArchiveSettings, AutomationAction, AutomationKey, AutomationPlanV1, AutomationTarget,
+        BoundingBox, DomainError, GenerationModel, KeyModifier, ModelSourceKind,
+    };
 
     fn valid_generation_model() -> GenerationModel {
         GenerationModel {
@@ -686,6 +1180,121 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+
+    fn automation_target() -> AutomationTarget {
+        AutomationTarget {
+            process_id: 42,
+            window_handle: 9001,
+            executable_name: "notepad.exe".to_owned(),
+            display_title: "Notes".to_owned(),
+        }
+    }
+
+    fn automation_plan(actions: Vec<AutomationAction>) -> AutomationPlanV1 {
+        AutomationPlanV1 {
+            target: automation_target(),
+            actions,
+        }
+    }
+
+    #[test]
+    fn automation_target_identity_ignores_title_but_requires_hwnd_pid_and_executable() {
+        let target = automation_target();
+        let mut same_identity = target.clone();
+        same_identity.display_title = "Renamed window".to_owned();
+        same_identity.executable_name = "NOTEPAD.EXE".to_owned();
+        assert!(target.matches_identity(&same_identity));
+
+        same_identity.window_handle = 7;
+        assert!(!target.matches_identity(&same_identity));
+    }
+
+    #[test]
+    fn automation_plan_accepts_the_bounded_typed_action_set() {
+        let plan = automation_plan(vec![
+            AutomationAction::UiaInvoke {
+                automation_id: "save".to_owned(),
+            },
+            AutomationAction::UiaSetValue {
+                automation_id: "name".to_owned(),
+                value: "Quarterly notes".to_owned(),
+            },
+            AutomationAction::KeyChord {
+                modifiers: vec![KeyModifier::Control, KeyModifier::Shift],
+                key: AutomationKey::S,
+            },
+            AutomationAction::TypeText {
+                text: "Ready".to_owned(),
+            },
+        ]);
+
+        assert!(plan.validate().is_ok());
+        assert_eq!(plan.canonical_digest().unwrap().len(), 64);
+        assert_eq!(
+            plan.canonical_digest().unwrap(),
+            plan.clone().canonical_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn automation_plan_rejects_empty_and_oversized_action_lists() {
+        assert!(automation_plan(Vec::new()).validate().is_err());
+        assert!(
+            automation_plan(
+                (0..11)
+                    .map(|_| AutomationAction::TypeText {
+                        text: "x".to_owned()
+                    })
+                    .collect()
+            )
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn automation_plan_rejects_oversized_content_and_duplicate_modifiers() {
+        assert!(
+            automation_plan(vec![AutomationAction::TypeText {
+                text: "x".repeat(513)
+            }])
+            .validate()
+            .is_err()
+        );
+        assert!(
+            automation_plan(vec![AutomationAction::KeyChord {
+                modifiers: vec![KeyModifier::Control, KeyModifier::Control],
+                key: AutomationKey::Enter,
+            }])
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn automation_digest_is_order_sensitive() {
+        let first = automation_plan(vec![
+            AutomationAction::TypeText {
+                text: "one".to_owned(),
+            },
+            AutomationAction::TypeText {
+                text: "two".to_owned(),
+            },
+        ]);
+        let second = automation_plan(vec![
+            AutomationAction::TypeText {
+                text: "two".to_owned(),
+            },
+            AutomationAction::TypeText {
+                text: "one".to_owned(),
+            },
+        ]);
+
+        assert_ne!(
+            first.canonical_digest().unwrap(),
+            second.canonical_digest().unwrap()
         );
     }
 }

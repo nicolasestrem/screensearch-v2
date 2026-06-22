@@ -224,6 +224,49 @@ Execution requires:
 
 Prefer Windows UI Automation for semantic controls. `SendInput` is a fallback. Any focus change, abort, timeout, lock, or plan mismatch stops execution safely.
 
+### 14.1 V1 action and target contract
+
+The user manually creates an `AutomationPlanV1` for one target containing the captured HWND,
+process identifier, executable file name, and display title. A plan contains one to ten actions:
+
+- `UiaInvoke` with one exact Automation ID;
+- `UiaSetValue` with one exact Automation ID and value;
+- `KeyChord` with typed modifier and key enums; or
+- `TypeText` with Unicode text.
+
+Selectors and text values contain 1–512 Unicode scalar values. Mouse coordinates, clipboard,
+shell execution, arbitrary key codes, Windows-key chords, and model-generated plans are rejected.
+UI Automation actions do not fall back implicitly; keyboard/text behavior must be an explicit
+action in the reviewed plan.
+
+### 14.2 Approval and execution contract
+
+The daemon computes the canonical BLAKE3 digest over the versioned normalized plan and persists
+only the digest and content-free metadata. Approval is one-shot and expires after 60 seconds.
+Execution is single-flight, limited to ten seconds, and spaces emitted input by at least 100
+milliseconds.
+
+The desktop shell owns the fixed `Ctrl+Alt+Shift+Esc` global abort registration and sends a
+content-free heartbeat every three seconds. A heartbeat older than ten seconds blocks approval and
+execution. Abort is latched until the user explicitly resets it.
+
+Before every action the daemon verifies enablement, heartbeat freshness, abort state, known
+unlocked session state, exact foreground HWND/PID/executable identity, deadline, and pacing.
+Unknown lock or target state fails closed.
+
+### 14.3 Automation storage and failures
+
+Automation is disabled in durable settings by default. The V1 ledger stores only approval/run ID,
+plan digest, action count, status, timestamps, expiry, and one stable failure code. It never stores
+titles, executable paths, target handles, UI Automation selectors, set values, typed text, key
+sequences, or plan JSON. Startup converts orphaned running rows to `aborted`.
+
+Stable failures are `disabled`, `abort_unavailable`, `abort_active`, `approval_missing`,
+`approval_expired`, `plan_mismatch`, `target_changed`, `session_locked`, `rate_limited`, `timeout`,
+`input_blocked`, `control_missing`, `control_ambiguous`, and `control_unsupported`.
+
+The complete P4 contract is recorded in `docs/design/p4-guarded-automation.md` and ADR 0004.
+
 ## 15. Configuration
 
 Production-significant settings must have one documented owner and default. Do not invent environment variables ad hoc.

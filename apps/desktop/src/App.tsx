@@ -29,6 +29,9 @@ import {
   DEFAULT_HOTKEY,
   isTauri,
   type ArchiveSettings,
+  type AutomationAction,
+  type AutomationPlan,
+  type AutomationTarget,
   type GenerationModel,
   type SearchEvent,
   type ShellSettings,
@@ -36,7 +39,7 @@ import {
 
 type Citation = Extract<SearchEvent, { kind: "citation" }>;
 type DetailTab = "text" | "metadata" | "source";
-type ModalName = "privacy" | "settings" | null;
+type ModalName = "privacy" | "settings" | "automation" | null;
 type SettingsDraft = {
   retentionDays: number | null;
   diskBudgetBytes: number | null;
@@ -241,6 +244,9 @@ export function App() {
           <span className={`capture-state ${paused || backpressured ? "is-paused" : ""}`}>
             <i /> {paused ? "Paused" : backpressured ? "Catching up" : "Capturing"}
           </span>
+          <button className="automation-button" type="button" onClick={() => openModal("automation")}>
+            <ShieldCheck /> Automation
+          </button>
           <IconButton label="Settings" onClick={() => openModal("settings")}><Gear /></IconButton>
         </div>
       </header>
@@ -350,7 +356,8 @@ export function App() {
         </div>
       )}
       {error && <div className="error-toast" role="alert">{String(error)}</div>}
-      {modal && <SettingsModal name={modal} paused={paused} onClose={closeModal} onCapture={() => capture.mutate()} />}
+      {modal === "automation" && <AutomationModal onClose={closeModal} />}
+      {modal && modal !== "automation" && <SettingsModal name={modal} paused={paused} onClose={closeModal} onCapture={() => capture.mutate()} />}
     </main>
   );
 }
@@ -543,7 +550,205 @@ function IconButton({ label, active = false, onClick, children }: { label: strin
   return <button className={`icon-button ${active ? "active" : ""}`} type="button" aria-label={label} title={label} onClick={onClick}>{children}</button>;
 }
 
-function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<ModalName, null>; paused: boolean; onClose: () => void; onCapture: () => void }) {
+function AutomationModal({ onClose }: { onClose: () => void }) {
+  const queryClient = useQueryClient();
+  const dialogRef = useRef<HTMLElement>(null);
+  const [warningAccepted, setWarningAccepted] = useState(false);
+  const [target, setTarget] = useState<AutomationTarget | null>(null);
+  const [actions, setActions] = useState<AutomationAction[]>([{ kind: "type_text", text: "preview" }]);
+  const [approvalId, setApprovalId] = useState<string>();
+  const [result, setResult] = useState<string>();
+  const status = useQuery({ queryKey: ["automation-status"], queryFn: api.automationStatus, refetchInterval: 2_500 });
+  const enable = useMutation({
+    mutationFn: (enabled: boolean) => api.setAutomationEnabled(enabled),
+    onSuccess: (value) => queryClient.setQueryData(["automation-status"], value),
+  });
+  const captureTarget = useMutation({
+    mutationFn: api.automationForegroundTarget,
+    onSuccess: (value) => {
+      setTarget(value);
+      setApprovalId(undefined);
+      setResult(undefined);
+    },
+  });
+  const approve = useMutation({
+    mutationFn: (plan: AutomationPlan) => api.approveAutomation(plan),
+    onSuccess: (approval) => {
+      setApprovalId(approval.approvalId);
+      setResult(`Approved ${approval.actionCount} action(s) until ${formatTime(approval.expiresAt)}.`);
+    },
+  });
+  const execute = useMutation({
+    mutationFn: ({ id, plan }: { id: string; plan: AutomationPlan }) => api.executeAutomation(id, plan),
+    onSuccess: (value) => {
+      setApprovalId(undefined);
+      setResult(value || "Execution succeeded.");
+      void queryClient.invalidateQueries({ queryKey: ["automation-status"] });
+    },
+  });
+  const abort = useMutation({
+    mutationFn: api.abortAutomation,
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["automation-status"] }),
+  });
+  const resetAbort = useMutation({
+    mutationFn: api.resetAutomationAbort,
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["automation-status"] }),
+  });
+
+  useEffect(() => {
+    dialogRef.current?.querySelector<HTMLElement>("button, input, select, textarea")?.focus();
+  }, []);
+
+  const plan = target ? { target, actions } : null;
+  const planReady = Boolean(plan && actions.length > 0 && actions.length <= 10);
+  const busy = enable.isPending || captureTarget.isPending || approve.isPending || execute.isPending || abort.isPending || resetAbort.isPending;
+  const modalError = status.error || enable.error || captureTarget.error || approve.error || execute.error || abort.error || resetAbort.error;
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section ref={dialogRef} className="modal automation-modal" role="dialog" aria-modal="true" aria-labelledby="automation-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-heading">
+          <div>
+            <span><ShieldCheck /></span>
+            <div><h2 id="automation-title">Guarded automation</h2><p>Manual, default-off actions with foreground and abort checks.</p></div>
+          </div>
+          <IconButton label="Close" onClick={onClose}><X /></IconButton>
+        </div>
+        <div className="modal-content">
+          <div className="notice automation-warning">
+            <Info weight="fill" />
+            <p><strong>Automation emits real input only after approval.</strong><span>Use it only on the captured foreground app. Emergency abort is <kbd>Ctrl Alt Shift Esc</kbd>.</span></p>
+          </div>
+          <div className="setting-row">
+            <span><strong>Enable guarded automation</strong><small>Requires a live abort shortcut heartbeat and remains off by default.</small></span>
+            <span className={`state-pill ${status.data?.enabled ? "" : "paused"}`}>{status.data?.enabled ? "Enabled" : "Disabled"}</span>
+          </div>
+          <label className="automation-confirm">
+            <input type="checkbox" checked={warningAccepted} onChange={(event) => setWarningAccepted(event.target.checked)} />
+            <span>I understand this can send keyboard/UI Automation input to the foreground application.</span>
+          </label>
+          <div className="automation-actions">
+            <button type="button" onClick={() => enable.mutate(true)} disabled={!warningAccepted || busy || status.data?.enabled}>{enable.isPending ? "Enabling…" : "Enable"}</button>
+            <button type="button" className="secondary" onClick={() => enable.mutate(false)} disabled={busy || !status.data?.enabled}>Disable</button>
+            <button type="button" className="danger" onClick={() => abort.mutate()} disabled={busy}>Abort now</button>
+            <button type="button" className="secondary" onClick={() => resetAbort.mutate()} disabled={busy || !status.data?.abortActive}>Reset abort</button>
+          </div>
+          <div className="automation-safety-grid">
+            <span><strong>{status.data?.abortAvailable ? "Live" : "Unavailable"}</strong><small>Abort shortcut</small></span>
+            <span><strong>{status.data?.abortActive ? "Latched" : "Clear"}</strong><small>Abort state</small></span>
+            <span><strong>{status.data?.running ? "Running" : "Idle"}</strong><small>Execution gate</small></span>
+          </div>
+          <div className="setting-row">
+            <span><strong>Target application</strong><small>ScreenSearch hides briefly so the previous app can regain foreground.</small></span>
+            <button type="button" onClick={() => captureTarget.mutate()} disabled={busy || !status.data?.enabled}>{captureTarget.isPending ? "Capturing…" : "Capture target"}</button>
+          </div>
+          {target && <div className="automation-target"><strong>{target.displayTitle}</strong><small>{target.executableName} · PID {target.processId} · HWND {target.windowHandle}</small></div>}
+          <AutomationActionList actions={actions} onChange={(next) => { setActions(next); setApprovalId(undefined); }} />
+          <section className="automation-review" aria-label="Automation plan review">
+            <strong>Exact review</strong>
+            <pre>{plan ? JSON.stringify(plan, null, 2) : "Capture a target before approving."}</pre>
+          </section>
+          <div className="modal-actions">
+            <span>{result ?? "Approve and execute are separate steps. Approval expires after 60 seconds."}</span>
+            <div className="automation-actions compact">
+              <button type="button" onClick={() => plan && approve.mutate(plan)} disabled={!planReady || busy || !status.data?.enabled}>{approve.isPending ? "Approving…" : "Approve"}</button>
+              <button type="button" onClick={() => plan && approvalId && execute.mutate({ id: approvalId, plan })} disabled={!planReady || !approvalId || busy}>{execute.isPending ? "Executing…" : "Execute approved"}</button>
+            </div>
+          </div>
+        </div>
+        {modalError && <div className="modal-error" role="alert">{errorText(modalError)}</div>}
+      </section>
+    </div>
+  );
+}
+
+function AutomationActionList({ actions, onChange }: { actions: AutomationAction[]; onChange: (actions: AutomationAction[]) => void }) {
+  function update(index: number, action: AutomationAction) {
+    onChange(actions.map((item, itemIndex) => itemIndex === index ? action : item));
+  }
+  function move(index: number, direction: -1 | 1) {
+    const target = index + direction;
+    if (target < 0 || target >= actions.length) return;
+    const next = [...actions];
+    [next[index], next[target]] = [next[target], next[index]];
+    onChange(next);
+  }
+  return (
+    <section className="automation-builder" aria-label="Automation action builder">
+      <div className="model-heading">
+        <span><strong>Actions</strong><small>1–10 ordered typed actions. Keyboard fallback is explicit.</small></span>
+        <button type="button" onClick={() => onChange([...actions, { kind: "type_text", text: "" }])} disabled={actions.length >= 10}>Add action</button>
+      </div>
+      {actions.map((action, index) => (
+        <div className="automation-action-row" key={index}>
+          <select aria-label={`Action ${index + 1} type`} value={action.kind} onChange={(event) => update(index, defaultAutomationAction(event.target.value))}>
+            <option value="type_text">Type text</option>
+            <option value="key_chord">Key chord</option>
+            <option value="uia_invoke">UIA invoke</option>
+            <option value="uia_set_value">UIA set value</option>
+          </select>
+          <AutomationActionFields action={action} onChange={(next) => update(index, next)} />
+          <div>
+            <button type="button" className="secondary" onClick={() => move(index, -1)} disabled={index === 0}>↑</button>
+            <button type="button" className="secondary" onClick={() => move(index, 1)} disabled={index === actions.length - 1}>↓</button>
+            <button type="button" className="danger" onClick={() => onChange(actions.filter((_, itemIndex) => itemIndex !== index))} disabled={actions.length <= 1}>Remove</button>
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function AutomationActionFields({ action, onChange }: { action: AutomationAction; onChange: (action: AutomationAction) => void }) {
+  if (action.kind === "uia_invoke") {
+    return <input aria-label="Automation ID" value={action.automationId} onChange={(event) => onChange({ ...action, automationId: event.target.value })} placeholder="Exact Automation ID" />;
+  }
+  if (action.kind === "uia_set_value") {
+    return (
+      <div className="automation-field-pair">
+        <input aria-label="Automation ID" value={action.automationId} onChange={(event) => onChange({ ...action, automationId: event.target.value })} placeholder="Exact Automation ID" />
+        <input aria-label="Value" value={action.value} onChange={(event) => onChange({ ...action, value: event.target.value })} placeholder="Value" />
+      </div>
+    );
+  }
+  if (action.kind === "key_chord") {
+    return (
+      <div className="automation-field-pair">
+        <div className="modifier-list">
+          {(["control", "alt", "shift"] as const).map((modifier) => (
+            <label key={modifier}>
+              <input type="checkbox" checked={action.modifiers.includes(modifier)} onChange={(event) => {
+                const modifiers = event.target.checked
+                  ? [...action.modifiers, modifier]
+                  : action.modifiers.filter((item) => item !== modifier);
+                onChange({ ...action, modifiers });
+              }} />
+              {modifier}
+            </label>
+          ))}
+        </div>
+        <input aria-label="Key" value={action.key} onChange={(event) => onChange({ ...action, key: event.target.value })} placeholder="S, Enter, F5…" />
+      </div>
+    );
+  }
+  return <input aria-label="Text to type" value={action.text} onChange={(event) => onChange({ ...action, text: event.target.value })} placeholder="Text to type" maxLength={512} />;
+}
+
+function defaultAutomationAction(kind: string): AutomationAction {
+  if (kind === "uia_invoke") return { kind: "uia_invoke", automationId: "" };
+  if (kind === "uia_set_value") return { kind: "uia_set_value", automationId: "", value: "" };
+  if (kind === "key_chord") return { kind: "key_chord", modifiers: ["control"], key: "enter" };
+  return { kind: "type_text", text: "" };
+}
+
+function errorText(error: unknown) {
+  if (error && typeof error === "object" && "message" in error) {
+    return String((error as { message: unknown }).message);
+  }
+  return String(error);
+}
+
+function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<ModalName, null | "automation">; paused: boolean; onClose: () => void; onCapture: () => void }) {
   const queryClient = useQueryClient();
   const dialogRef = useRef<HTMLElement>(null);
   const settings = useQuery({ queryKey: ["archive-settings"], queryFn: api.archiveSettings });

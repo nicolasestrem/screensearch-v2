@@ -11,6 +11,7 @@ This repository is a clean-room V2 implementation. It contains no legacy code, c
 - A model-worker process owns OCR, embedding, and generation runtimes; the daemon supervises it — detecting crashes, restarting it within a bounded budget, and tying its lifetime to the daemon — while keeping durable archive state.
 - Protobuf messages travel over local-only Windows named pipes; screen buffers and model files never cross IPC inline.
 - libSQL stores relational metadata, FTS5 text, vector indexes, jobs, and transactional outbox events.
+- Guarded automation is daemon-owned, disabled by default, and can emit only approved UI Automation or keyboard actions against the captured foreground target.
 
 Architecture decisions are recorded in [`docs/adr`](docs/adr).
 
@@ -38,8 +39,10 @@ cargo run -p screensearch-daemon
 
 The current vertical slice automatically captures the focused monitor, runs Windows Media OCR, produces local quantized MiniLM embeddings, and returns screenshot-backed hybrid-search evidence. Deterministic providers are test-only; optional answer generation uses a selected local GGUF model imported from disk, downloaded explicitly from Hugging Face, or discovered from packaged resources.
 
-The desktop uses the selected **Memory Timeline** interface: search and filters lead to chronologically grouped screenshot evidence, positioned OCR highlights, provenance, and an optional cited answer. Automatic capture can be paused and resumed through a durable daemon control; retention and application exclusions remain explicitly unconfigured.
+The desktop uses the selected **Memory Timeline** interface: search and filters lead to chronologically grouped screenshot evidence, positioned OCR highlights, provenance, and an optional cited answer. Automatic capture can be paused and resumed through a durable daemon control, with retention, storage budget, and application exclusions configured through local privacy/settings controls.
+
+Guarded automation is a complete opt-in path but not an autonomous feature. A user must enable it after confirming the warning and live abort shortcut, capture the foreground target, review an exact typed plan, approve it, then execute the same plan before its one-shot approval expires. Supported actions are exact UIA invoke/set-value, typed key chords, and UTF-16 text input; mouse coordinates, clipboard, shell commands, Windows-key chords, and generated action plans are intentionally unsupported.
 
 ## Data safety
 
-Never commit captures, databases, logs, API keys, model files, or other user screen data. Automation is disabled unless a structured plan is explicitly approved, the expected foreground window still matches, and the emergency abort flag is clear.
+Never commit captures, databases, logs, API keys, model files, or other user screen data. Automation is disabled unless a structured plan is explicitly approved, the expected foreground window still matches, the interactive session is unlocked, and the emergency abort flag is clear. The automation ledger stores only content-free digests, counts, timestamps, statuses, and failure codes.

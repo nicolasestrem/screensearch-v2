@@ -14,15 +14,21 @@ use screensearch_ipc::{
     IpcError,
     transport::{DEFAULT_PIPE_NAME, IpcClient},
     v1::{
-        CaptureRequest, DeleteCapturesRequest, DeleteGenerationModelRequest,
-        DownloadGenerationModelRequest, GetArchiveSettingsRequest, GetCaptureAssetRequest,
-        HealthRequest, ImportLocalGenerationModelRequest, ListGenerationModelsRequest,
-        ProcessJobsRequest, RequestEnvelope, SearchRequest, SelectGenerationModelRequest,
-        SetCapturePausedRequest, UnloadGenerationModelRequest, UpdateArchiveSettingsRequest,
-        request_envelope, response_envelope, search_event,
+        AbortAutomationRequest, ApproveAutomationRequest, AutomationAction as IpcAutomationAction,
+        AutomationKey as IpcAutomationKey, AutomationKeyChord, AutomationKeyModifier,
+        AutomationPlanV1 as IpcAutomationPlan, AutomationSafetyHeartbeatRequest,
+        AutomationStatusRequest, AutomationTarget as IpcAutomationTarget, CaptureRequest,
+        DeleteCapturesRequest, DeleteGenerationModelRequest, DownloadGenerationModelRequest,
+        ExecuteAutomationRequest, GetArchiveSettingsRequest, GetAutomationForegroundTargetRequest,
+        GetCaptureAssetRequest, HealthRequest, ImportLocalGenerationModelRequest,
+        ListGenerationModelsRequest, ProcessJobsRequest, RequestEnvelope,
+        ResetAutomationAbortRequest, SearchRequest, SelectGenerationModelRequest,
+        SetAutomationEnabledRequest, SetCapturePausedRequest, TypeTextAction, UiaInvokeAction,
+        UiaSetValueAction, UnloadGenerationModelRequest, UpdateArchiveSettingsRequest,
+        automation_action, request_envelope, response_envelope, search_event,
     },
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Emitter, Manager, WindowEvent, Wry,
     ipc::Channel,
@@ -31,6 +37,8 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_notification::NotificationExt;
+
+const ABORT_SHORTCUT: &str = "Ctrl+Alt+Shift+Esc";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,6 +126,86 @@ struct GenerationModel {
     active: bool,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutomationTarget {
+    process_id: u32,
+    window_handle: u64,
+    executable_name: String,
+    display_title: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum AutomationAction {
+    UiaInvoke {
+        automation_id: String,
+    },
+    UiaSetValue {
+        automation_id: String,
+        value: String,
+    },
+    KeyChord {
+        modifiers: Vec<String>,
+        key: String,
+    },
+    TypeText {
+        text: String,
+    },
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutomationPlan {
+    target: AutomationTarget,
+    actions: Vec<AutomationAction>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
+struct AutomationStatus {
+    enabled: bool,
+    abort_available: bool,
+    abort_active: bool,
+    running: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutomationApproval {
+    approval_id: String,
+    expires_at: String,
+    action_count: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutomationCommandError {
+    code: String,
+    message: String,
+}
+
+impl AutomationCommandError {
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_automation".to_owned(),
+            message: message.into(),
+        }
+    }
+
+    fn daemon(error: impl std::fmt::Display) -> Self {
+        Self {
+            code: "daemon_unavailable".to_owned(),
+            message: error.to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 // `rename_all` on a tagged enum renames the variant tags ("citation", …); the per-variant
 // `rename_all_fields` renames the struct-variant fields so the UI receives camelCase keys.
@@ -151,6 +239,394 @@ enum SearchUiEvent {
         answer_status: String,
         answer_message: String,
     },
+}
+
+fn map_automation_plan(plan: AutomationPlan) -> Result<IpcAutomationPlan, AutomationCommandError> {
+    Ok(IpcAutomationPlan {
+        target: Some(IpcAutomationTarget {
+            process_id: plan.target.process_id,
+            window_handle: plan.target.window_handle,
+            executable_name: plan.target.executable_name,
+            display_title: plan.target.display_title,
+        }),
+        actions: plan
+            .actions
+            .into_iter()
+            .map(map_automation_action)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn map_automation_action(
+    action: AutomationAction,
+) -> Result<IpcAutomationAction, AutomationCommandError> {
+    let action = match action {
+        AutomationAction::UiaInvoke { automation_id } => {
+            automation_action::Action::UiaInvoke(UiaInvokeAction { automation_id })
+        }
+        AutomationAction::UiaSetValue {
+            automation_id,
+            value,
+        } => automation_action::Action::UiaSetValue(UiaSetValueAction {
+            automation_id,
+            value,
+        }),
+        AutomationAction::KeyChord { modifiers, key } => {
+            automation_action::Action::KeyChord(AutomationKeyChord {
+                modifiers: modifiers
+                    .into_iter()
+                    .map(|modifier| map_automation_modifier(&modifier).map(i32::from))
+                    .collect::<Result<Vec<_>, _>>()?,
+                key: i32::from(map_automation_key(&key)?),
+            })
+        }
+        AutomationAction::TypeText { text } => {
+            automation_action::Action::TypeText(TypeTextAction { text })
+        }
+    };
+    Ok(IpcAutomationAction {
+        action: Some(action),
+    })
+}
+
+fn map_automation_modifier(value: &str) -> Result<AutomationKeyModifier, AutomationCommandError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "control" => Ok(AutomationKeyModifier::Control),
+        "alt" => Ok(AutomationKeyModifier::Alt),
+        "shift" => Ok(AutomationKeyModifier::Shift),
+        _ => Err(AutomationCommandError::invalid(
+            "unknown automation key modifier",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn map_automation_key(value: &str) -> Result<IpcAutomationKey, AutomationCommandError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "a" => Ok(IpcAutomationKey::A),
+        "b" => Ok(IpcAutomationKey::B),
+        "c" => Ok(IpcAutomationKey::C),
+        "d" => Ok(IpcAutomationKey::D),
+        "e" => Ok(IpcAutomationKey::E),
+        "f" => Ok(IpcAutomationKey::F),
+        "g" => Ok(IpcAutomationKey::G),
+        "h" => Ok(IpcAutomationKey::H),
+        "i" => Ok(IpcAutomationKey::I),
+        "j" => Ok(IpcAutomationKey::J),
+        "k" => Ok(IpcAutomationKey::K),
+        "l" => Ok(IpcAutomationKey::L),
+        "m" => Ok(IpcAutomationKey::M),
+        "n" => Ok(IpcAutomationKey::N),
+        "o" => Ok(IpcAutomationKey::O),
+        "p" => Ok(IpcAutomationKey::P),
+        "q" => Ok(IpcAutomationKey::Q),
+        "r" => Ok(IpcAutomationKey::R),
+        "s" => Ok(IpcAutomationKey::S),
+        "t" => Ok(IpcAutomationKey::T),
+        "u" => Ok(IpcAutomationKey::U),
+        "v" => Ok(IpcAutomationKey::V),
+        "w" => Ok(IpcAutomationKey::W),
+        "x" => Ok(IpcAutomationKey::X),
+        "y" => Ok(IpcAutomationKey::Y),
+        "z" => Ok(IpcAutomationKey::Z),
+        "0" => Ok(IpcAutomationKey::Digit0),
+        "1" => Ok(IpcAutomationKey::Digit1),
+        "2" => Ok(IpcAutomationKey::Digit2),
+        "3" => Ok(IpcAutomationKey::Digit3),
+        "4" => Ok(IpcAutomationKey::Digit4),
+        "5" => Ok(IpcAutomationKey::Digit5),
+        "6" => Ok(IpcAutomationKey::Digit6),
+        "7" => Ok(IpcAutomationKey::Digit7),
+        "8" => Ok(IpcAutomationKey::Digit8),
+        "9" => Ok(IpcAutomationKey::Digit9),
+        "enter" => Ok(IpcAutomationKey::Enter),
+        "escape" | "esc" => Ok(IpcAutomationKey::Escape),
+        "tab" => Ok(IpcAutomationKey::Tab),
+        "space" => Ok(IpcAutomationKey::Space),
+        "backspace" => Ok(IpcAutomationKey::Backspace),
+        "delete" => Ok(IpcAutomationKey::Delete),
+        "arrowleft" => Ok(IpcAutomationKey::ArrowLeft),
+        "arrowright" => Ok(IpcAutomationKey::ArrowRight),
+        "arrowup" => Ok(IpcAutomationKey::ArrowUp),
+        "arrowdown" => Ok(IpcAutomationKey::ArrowDown),
+        "home" => Ok(IpcAutomationKey::Home),
+        "end" => Ok(IpcAutomationKey::End),
+        "f1" => Ok(IpcAutomationKey::F1),
+        "f2" => Ok(IpcAutomationKey::F2),
+        "f3" => Ok(IpcAutomationKey::F3),
+        "f4" => Ok(IpcAutomationKey::F4),
+        "f5" => Ok(IpcAutomationKey::F5),
+        "f6" => Ok(IpcAutomationKey::F6),
+        "f7" => Ok(IpcAutomationKey::F7),
+        "f8" => Ok(IpcAutomationKey::F8),
+        "f9" => Ok(IpcAutomationKey::F9),
+        "f10" => Ok(IpcAutomationKey::F10),
+        "f11" => Ok(IpcAutomationKey::F11),
+        "f12" => Ok(IpcAutomationKey::F12),
+        _ => Err(AutomationCommandError::invalid("unknown automation key")),
+    }
+}
+
+fn automation_command_error(error: screensearch_ipc::v1::ErrorResponse) -> AutomationCommandError {
+    AutomationCommandError {
+        code: error.code,
+        message: error.message,
+    }
+}
+
+fn map_automation_status_response(
+    status: screensearch_ipc::v1::AutomationStatusResponse,
+) -> AutomationStatus {
+    AutomationStatus {
+        enabled: status.enabled,
+        abort_available: status.abort_available,
+        abort_active: status.abort_active,
+        running: status.running,
+    }
+}
+
+fn map_automation_target_response(target: IpcAutomationTarget) -> AutomationTarget {
+    AutomationTarget {
+        process_id: target.process_id,
+        window_handle: target.window_handle,
+        executable_name: target.executable_name,
+        display_title: target.display_title,
+    }
+}
+
+#[tauri::command]
+async fn automation_status() -> Result<AutomationStatus, AutomationCommandError> {
+    let responses = request(request_envelope::Body::AutomationStatus(
+        AutomationStatusRequest {},
+    ))
+    .await
+    .map_err(AutomationCommandError::daemon)?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::AutomationStatus(status)) => {
+                return Ok(map_automation_status_response(status));
+            }
+            Some(response_envelope::Body::Error(error)) => {
+                return Err(automation_command_error(error));
+            }
+            _ => {}
+        }
+    }
+    Err(AutomationCommandError::daemon(
+        "daemon returned no automation status",
+    ))
+}
+
+#[tauri::command]
+async fn set_automation_enabled(enabled: bool) -> Result<AutomationStatus, AutomationCommandError> {
+    let responses = request(request_envelope::Body::SetAutomationEnabled(
+        SetAutomationEnabledRequest { enabled },
+    ))
+    .await
+    .map_err(AutomationCommandError::daemon)?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::SetAutomationEnabled(result)) => {
+                let status = result.status.ok_or_else(|| {
+                    AutomationCommandError::daemon("daemon returned empty automation status")
+                })?;
+                return Ok(map_automation_status_response(status));
+            }
+            Some(response_envelope::Body::Error(error)) => {
+                return Err(automation_command_error(error));
+            }
+            _ => {}
+        }
+    }
+    Err(AutomationCommandError::daemon(
+        "daemon returned no automation enablement response",
+    ))
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+async fn automation_foreground_target(
+    app: AppHandle,
+) -> Result<AutomationTarget, AutomationCommandError> {
+    let window = app.get_webview_window("main");
+    if let Some(window) = &window {
+        let _ = window.hide();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let result = async {
+        let responses = request(request_envelope::Body::GetAutomationForegroundTarget(
+            GetAutomationForegroundTargetRequest {},
+        ))
+        .await
+        .map_err(AutomationCommandError::daemon)?;
+        for response in responses {
+            match response.body {
+                Some(response_envelope::Body::AutomationForegroundTarget(result)) => {
+                    let target = result.target.ok_or_else(|| {
+                        AutomationCommandError::daemon("daemon returned empty automation target")
+                    })?;
+                    return Ok(map_automation_target_response(target));
+                }
+                Some(response_envelope::Body::Error(error)) => {
+                    return Err(automation_command_error(error));
+                }
+                _ => {}
+            }
+        }
+        Err(AutomationCommandError::daemon(
+            "daemon returned no automation target",
+        ))
+    }
+    .await;
+    if let Some(window) = window {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    result
+}
+
+#[tauri::command]
+async fn approve_automation(
+    plan: AutomationPlan,
+) -> Result<AutomationApproval, AutomationCommandError> {
+    let responses = request(request_envelope::Body::ApproveAutomation(
+        ApproveAutomationRequest {
+            plan: Some(map_automation_plan(plan)?),
+        },
+    ))
+    .await
+    .map_err(AutomationCommandError::daemon)?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::ApproveAutomation(result)) => {
+                return Ok(AutomationApproval {
+                    approval_id: result.approval_id,
+                    expires_at: result.expires_at,
+                    action_count: result.action_count,
+                });
+            }
+            Some(response_envelope::Body::Error(error)) => {
+                return Err(automation_command_error(error));
+            }
+            _ => {}
+        }
+    }
+    Err(AutomationCommandError::daemon(
+        "daemon returned no automation approval",
+    ))
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+async fn execute_automation(
+    app: AppHandle,
+    approval_id: String,
+    plan: AutomationPlan,
+) -> Result<String, AutomationCommandError> {
+    let ipc_plan = map_automation_plan(plan)?;
+    let window = app.get_webview_window("main");
+    if let Some(window) = &window {
+        let _ = window.hide();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let result = async {
+        let responses = request(request_envelope::Body::ExecuteAutomation(
+            ExecuteAutomationRequest {
+                approval_id,
+                plan: Some(ipc_plan),
+            },
+        ))
+        .await
+        .map_err(AutomationCommandError::daemon)?;
+        for response in responses {
+            match response.body {
+                Some(response_envelope::Body::ExecuteAutomation(result)) => {
+                    return Ok(result.status);
+                }
+                Some(response_envelope::Body::Error(error)) => {
+                    return Err(automation_command_error(error));
+                }
+                _ => {}
+            }
+        }
+        Err(AutomationCommandError::daemon(
+            "daemon returned no automation execution result",
+        ))
+    }
+    .await;
+    if let Some(window) = window {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    result
+}
+
+#[tauri::command]
+async fn abort_automation() -> Result<bool, AutomationCommandError> {
+    let responses = request(request_envelope::Body::AbortAutomation(
+        AbortAutomationRequest {},
+    ))
+    .await
+    .map_err(AutomationCommandError::daemon)?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::AbortAutomation(result)) => {
+                return Ok(result.abort_active);
+            }
+            Some(response_envelope::Body::Error(error)) => {
+                return Err(automation_command_error(error));
+            }
+            _ => {}
+        }
+    }
+    Err(AutomationCommandError::daemon(
+        "daemon returned no abort response",
+    ))
+}
+
+#[tauri::command]
+async fn reset_automation_abort() -> Result<bool, AutomationCommandError> {
+    let responses = request(request_envelope::Body::ResetAutomationAbort(
+        ResetAutomationAbortRequest {},
+    ))
+    .await
+    .map_err(AutomationCommandError::daemon)?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::ResetAutomationAbort(result)) => {
+                return Ok(result.abort_active);
+            }
+            Some(response_envelope::Body::Error(error)) => {
+                return Err(automation_command_error(error));
+            }
+            _ => {}
+        }
+    }
+    Err(AutomationCommandError::daemon(
+        "daemon returned no abort reset response",
+    ))
+}
+
+async fn send_automation_heartbeat(abort_registered: bool) -> Result<(), AutomationCommandError> {
+    let responses = request(request_envelope::Body::AutomationSafetyHeartbeat(
+        AutomationSafetyHeartbeatRequest { abort_registered },
+    ))
+    .await
+    .map_err(AutomationCommandError::daemon)?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::AutomationSafetyHeartbeat(result)) if result.accepted => {
+                return Ok(());
+            }
+            Some(response_envelope::Body::Error(error)) => {
+                return Err(automation_command_error(error));
+            }
+            _ => {}
+        }
+    }
+    Err(AutomationCommandError::daemon(
+        "daemon returned no automation heartbeat response",
+    ))
 }
 
 #[tauri::command]
@@ -614,6 +1090,12 @@ struct TrayHandles {
 /// The currently registered global summon shortcut, so a change unregisters only the old binding.
 struct ActiveShortcut(Mutex<Option<Shortcut>>);
 
+/// Fixed emergency-abort registration state reported to the daemon heartbeat.
+struct AbortShortcutState {
+    shortcut: Shortcut,
+    registered: AtomicBool,
+}
+
 /// Brings the main window to the foreground (used by the tray, hotkey, and menu).
 fn summon_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -735,6 +1217,19 @@ fn spawn_health_poll(app: AppHandle) {
     });
 }
 
+/// Keeps the daemon informed that the shell still owns the fixed emergency-abort shortcut.
+fn spawn_automation_heartbeat(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let registered = app
+                .try_state::<AbortShortcutState>()
+                .is_some_and(|state| state.registered.load(Ordering::SeqCst));
+            let _ = send_automation_heartbeat(registered).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    });
+}
+
 /// Builds the tray icon, its menu, and the live status poller during application setup.
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let handle = app.handle().clone();
@@ -796,7 +1291,17 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
         let _ = apply_shortcut(&handle, shortcut);
     }
 
+    let abort_shortcut = ABORT_SHORTCUT
+        .parse::<Shortcut>()
+        .expect("fixed guarded automation abort shortcut is valid");
+    let abort_registered = handle.global_shortcut().register(abort_shortcut).is_ok();
+    app.manage(AbortShortcutState {
+        shortcut: abort_shortcut,
+        registered: AtomicBool::new(abort_registered),
+    });
+
     spawn_health_poll(handle);
+    spawn_automation_heartbeat(app.handle().clone());
     Ok(())
 }
 
@@ -805,8 +1310,17 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
+                .with_handler(|app, shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
+                        if app
+                            .try_state::<AbortShortcutState>()
+                            .is_some_and(|state| state.shortcut == *shortcut)
+                        {
+                            tauri::async_runtime::spawn(async {
+                                let _ = abort_automation().await;
+                            });
+                            return;
+                        }
                         summon_main_window(app);
                         let _ = app.emit("summon-search", ());
                     }
@@ -841,7 +1355,14 @@ fn main() {
             unload_generation_model,
             search,
             get_shell_settings,
-            set_shell_settings
+            set_shell_settings,
+            automation_status,
+            set_automation_enabled,
+            automation_foreground_target,
+            approve_automation,
+            execute_automation,
+            abort_automation,
+            reset_automation_abort
         ])
         .run(tauri::generate_context!())
         .expect("run ScreenSearch V2 desktop application");
@@ -849,7 +1370,12 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{NormalizedRect, SearchUiEvent};
+    use screensearch_ipc::v1::automation_action;
+
+    use super::{
+        ABORT_SHORTCUT, AutomationAction, AutomationPlan, AutomationTarget, NormalizedRect,
+        SearchUiEvent, map_automation_plan,
+    };
 
     #[test]
     fn citation_event_serializes_with_camel_case_fields() {
@@ -900,5 +1426,41 @@ mod tests {
         assert_eq!(value["citationCount"], 3);
         assert_eq!(value["answerStatus"], "answered");
         assert!(value.get("citation_count").is_none());
+    }
+
+    #[test]
+    fn automation_plan_maps_to_typed_protobuf_actions() {
+        let plan = map_automation_plan(AutomationPlan {
+            target: AutomationTarget {
+                process_id: 42,
+                window_handle: 9001,
+                executable_name: "fixture.exe".to_owned(),
+                display_title: "Fixture".to_owned(),
+            },
+            actions: vec![
+                AutomationAction::KeyChord {
+                    modifiers: vec!["control".to_owned(), "shift".to_owned()],
+                    key: "s".to_owned(),
+                },
+                AutomationAction::TypeText {
+                    text: "hello".to_owned(),
+                },
+            ],
+        })
+        .unwrap();
+        assert_eq!(plan.actions.len(), 2);
+        let Some(automation_action::Action::KeyChord(chord)) = &plan.actions[0].action else {
+            panic!("expected key chord");
+        };
+        assert_eq!(chord.key, 19);
+    }
+
+    #[test]
+    fn fixed_abort_shortcut_is_parseable() {
+        assert!(
+            ABORT_SHORTCUT
+                .parse::<tauri_plugin_global_shortcut::Shortcut>()
+                .is_ok()
+        );
     }
 }

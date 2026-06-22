@@ -13,12 +13,12 @@ futures.workspace = true
 image.workspace = true
 screensearch-domain = { path = "../domain" }
 screensearch-ports = { path = "../ports" }
+tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true

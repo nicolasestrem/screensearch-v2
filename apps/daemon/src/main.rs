@@ -15,10 +15,12 @@ use anyhow::Context;
 use async_stream::try_stream;
 use futures::{StreamExt, stream};
 use screensearch_application::{
-    AnalysisService, CapturePolicy, CapturePolicyConfig, IngestService, SearchService,
+    AnalysisService, AutomationService, CapturePolicy, CapturePolicyConfig, IngestService,
+    SearchService,
 };
 use screensearch_domain::{
-    ArchiveSettings, CaptureDisposition, CaptureId, DeleteCaptures, GenerationModel,
+    ArchiveSettings, AutomationAction, AutomationKey, AutomationPlanV1, AutomationRunId,
+    AutomationTarget, CaptureDisposition, CaptureId, DeleteCaptures, GenerationModel, KeyModifier,
     ModelSourceKind, SearchEvent, SearchMatchKind, StorageMetrics,
 };
 use screensearch_ipc::{
@@ -28,21 +30,27 @@ use screensearch_ipc::{
         create_worker_lifeline, serve,
     },
     v1::{
-        ArchiveSettingsResponse, CaptureAssetResponse, CaptureResponse, Citation,
-        DeleteCapturesResponse, DeleteGenerationModelResponse, ErrorResponse,
-        GenerationModel as IpcGenerationModel, GenerationModelResponse, GenerationModelsResponse,
-        HealthResponse, NormalizedRect, ProcessJobsResponse, ResponseEnvelope, SearchCompleted,
-        SearchEvent as IpcSearchEvent, SetCapturePausedResponse, Token,
-        UnloadGenerationModelResponse, UpdateArchiveSettingsResponse, WorkerEmbeddingRequest,
-        WorkerGenerationRequest, WorkerHealthRequest, WorkerOcrRequest, WorkerUnloadRequest,
-        request_envelope, response_envelope, search_event, worker_generation_event,
+        AbortAutomationResponse, ApproveAutomationResponse, ArchiveSettingsResponse,
+        AutomationAction as IpcAutomationAction, AutomationForegroundTargetResponse,
+        AutomationKey as IpcAutomationKey, AutomationKeyModifier as IpcAutomationKeyModifier,
+        AutomationPlanV1 as IpcAutomationPlan, AutomationSafetyHeartbeatResponse,
+        AutomationStatusResponse, AutomationTarget as IpcAutomationTarget, CaptureAssetResponse,
+        CaptureResponse, Citation, DeleteCapturesResponse, DeleteGenerationModelResponse,
+        ErrorResponse, ExecuteAutomationResponse, GenerationModel as IpcGenerationModel,
+        GenerationModelResponse, GenerationModelsResponse, HealthResponse, NormalizedRect,
+        ProcessJobsResponse, ResetAutomationAbortResponse, ResponseEnvelope, SearchCompleted,
+        SearchEvent as IpcSearchEvent, SetAutomationEnabledResponse, SetCapturePausedResponse,
+        Token, UnloadGenerationModelResponse, UpdateArchiveSettingsResponse,
+        WorkerEmbeddingRequest, WorkerGenerationRequest, WorkerHealthRequest, WorkerOcrRequest,
+        WorkerUnloadRequest, automation_action, request_envelope, response_envelope, search_event,
+        worker_generation_event,
     },
 };
 use screensearch_persistence::{FileAssetStore, LibSqlArchive};
 use screensearch_ports::{
     ArchiveRepository, EmbeddingEngine, OcrEngine, PortError, TextGenerator, TokenStream,
 };
-use screensearch_windows::WindowsGraphicsCaptureSource;
+use screensearch_windows::{WindowsAutomationPlatform, WindowsGraphicsCaptureSource};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
@@ -65,6 +73,7 @@ struct DaemonHandler {
     repository: Arc<LibSqlArchive>,
     assets: Arc<FileAssetStore>,
     capture_policy: Arc<CapturePolicy>,
+    automation: Arc<AutomationService>,
     model_root: PathBuf,
 }
 
@@ -876,6 +885,181 @@ impl RequestHandler for DaemonHandler {
                     )),
                 }))
             }
+            request_envelope::Body::AutomationStatus(_) => {
+                let status = match self.automation.status(chrono::Utc::now()).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        return Ok(single_response(automation_error_response(
+                            request_id, &error,
+                        )));
+                    }
+                };
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::AutomationStatus(
+                        map_automation_status(status),
+                    )),
+                }))
+            }
+            request_envelope::Body::SetAutomationEnabled(command) => {
+                if let Err(error) = self
+                    .automation
+                    .set_enabled(command.enabled, chrono::Utc::now())
+                    .await
+                {
+                    return Ok(single_response(automation_error_response(
+                        request_id, &error,
+                    )));
+                }
+                let status = self
+                    .automation
+                    .status(chrono::Utc::now())
+                    .await
+                    .map_err(|error| IpcError::Handler(error.to_string()))?;
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::SetAutomationEnabled(
+                        SetAutomationEnabledResponse {
+                            status: Some(map_automation_status(status)),
+                        },
+                    )),
+                }))
+            }
+            request_envelope::Body::GetAutomationForegroundTarget(_) => {
+                let target = match self.automation.foreground_target(chrono::Utc::now()).await {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return Ok(single_response(automation_error_response(
+                            request_id, &error,
+                        )));
+                    }
+                };
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::AutomationForegroundTarget(
+                        AutomationForegroundTargetResponse {
+                            target: Some(map_automation_target(target)),
+                        },
+                    )),
+                }))
+            }
+            request_envelope::Body::ApproveAutomation(command) => {
+                let plan = match command.plan.map(parse_automation_plan).transpose() {
+                    Ok(Some(plan)) => plan,
+                    Ok(None) => {
+                        return Ok(single_response(error_response(
+                            request_id,
+                            "invalid_automation",
+                            "automation plan is missing",
+                            false,
+                        )));
+                    }
+                    Err(error) => {
+                        return Ok(single_response(automation_error_response(
+                            request_id, &error,
+                        )));
+                    }
+                };
+                let approval = match self.automation.approve(plan, chrono::Utc::now()).await {
+                    Ok(approval) => approval,
+                    Err(error) => {
+                        return Ok(single_response(automation_error_response(
+                            request_id, &error,
+                        )));
+                    }
+                };
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::ApproveAutomation(
+                        ApproveAutomationResponse {
+                            approval_id: approval.id.to_string(),
+                            expires_at: approval.expires_at.to_rfc3339(),
+                            action_count: approval.action_count,
+                        },
+                    )),
+                }))
+            }
+            request_envelope::Body::ExecuteAutomation(command) => {
+                let approval_id = match uuid::Uuid::parse_str(&command.approval_id) {
+                    Ok(id) => AutomationRunId(id),
+                    Err(_) => {
+                        return Ok(single_response(error_response(
+                            request_id,
+                            "approval_missing",
+                            "automation approval is missing or invalid",
+                            false,
+                        )));
+                    }
+                };
+                let plan = match command.plan.map(parse_automation_plan).transpose() {
+                    Ok(Some(plan)) => plan,
+                    Ok(None) => {
+                        return Ok(single_response(error_response(
+                            request_id,
+                            "invalid_automation",
+                            "automation plan is missing",
+                            false,
+                        )));
+                    }
+                    Err(error) => {
+                        return Ok(single_response(automation_error_response(
+                            request_id, &error,
+                        )));
+                    }
+                };
+                if let Err(error) = self.automation.execute(approval_id, plan).await {
+                    return Ok(single_response(automation_error_response(
+                        request_id, &error,
+                    )));
+                }
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::ExecuteAutomation(
+                        ExecuteAutomationResponse {
+                            status: "succeeded".to_owned(),
+                        },
+                    )),
+                }))
+            }
+            request_envelope::Body::AbortAutomation(_) => {
+                self.automation.abort();
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::AbortAutomation(
+                        AbortAutomationResponse { abort_active: true },
+                    )),
+                }))
+            }
+            request_envelope::Body::ResetAutomationAbort(_) => {
+                self.automation.reset_abort();
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::ResetAutomationAbort(
+                        ResetAutomationAbortResponse {
+                            abort_active: false,
+                        },
+                    )),
+                }))
+            }
+            request_envelope::Body::AutomationSafetyHeartbeat(command) => {
+                self.automation
+                    .safety_heartbeat(command.abort_registered, chrono::Utc::now())
+                    .await;
+                Ok(single_response(ResponseEnvelope {
+                    request_id,
+                    terminal: true,
+                    body: Some(response_envelope::Body::AutomationSafetyHeartbeat(
+                        AutomationSafetyHeartbeatResponse { accepted: true },
+                    )),
+                }))
+            }
             request_envelope::Body::WorkerHealth(_)
             | request_envelope::Body::WorkerOcr(_)
             | request_envelope::Body::WorkerEmbedding(_)
@@ -887,6 +1071,167 @@ impl RequestHandler for DaemonHandler {
             ))),
         }
     }
+}
+
+fn map_automation_status(
+    status: screensearch_application::AutomationServiceStatus,
+) -> AutomationStatusResponse {
+    AutomationStatusResponse {
+        enabled: status.enabled,
+        abort_available: status.abort_available,
+        abort_active: status.abort_active,
+        running: status.running,
+    }
+}
+
+fn map_automation_target(target: AutomationTarget) -> IpcAutomationTarget {
+    IpcAutomationTarget {
+        process_id: target.process_id,
+        window_handle: target.window_handle,
+        executable_name: target.executable_name,
+        display_title: target.display_title,
+    }
+}
+
+fn parse_automation_plan(plan: IpcAutomationPlan) -> Result<AutomationPlanV1, PortError> {
+    let target = plan.target.ok_or_else(|| {
+        PortError::InvalidData("automation target is missing from the plan".to_owned())
+    })?;
+    let plan = AutomationPlanV1 {
+        target: AutomationTarget {
+            process_id: target.process_id,
+            window_handle: target.window_handle,
+            executable_name: target.executable_name,
+            display_title: target.display_title,
+        },
+        actions: plan
+            .actions
+            .into_iter()
+            .map(parse_automation_action)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    plan.validate()
+        .map_err(|error| PortError::InvalidData(error.to_string()))?;
+    Ok(plan)
+}
+
+fn parse_automation_action(action: IpcAutomationAction) -> Result<AutomationAction, PortError> {
+    match action.action {
+        Some(automation_action::Action::UiaInvoke(action)) => Ok(AutomationAction::UiaInvoke {
+            automation_id: action.automation_id,
+        }),
+        Some(automation_action::Action::UiaSetValue(action)) => Ok(AutomationAction::UiaSetValue {
+            automation_id: action.automation_id,
+            value: action.value,
+        }),
+        Some(automation_action::Action::KeyChord(action)) => Ok(AutomationAction::KeyChord {
+            modifiers: action
+                .modifiers
+                .into_iter()
+                .map(parse_automation_modifier)
+                .collect::<Result<Vec<_>, _>>()?,
+            key: parse_automation_key(action.key)?,
+        }),
+        Some(automation_action::Action::TypeText(action)) => {
+            Ok(AutomationAction::TypeText { text: action.text })
+        }
+        None => Err(PortError::InvalidData(
+            "automation action body is missing".to_owned(),
+        )),
+    }
+}
+
+fn parse_automation_modifier(value: i32) -> Result<KeyModifier, PortError> {
+    match IpcAutomationKeyModifier::try_from(value)
+        .map_err(|_| PortError::InvalidData("unknown automation key modifier".to_owned()))?
+    {
+        IpcAutomationKeyModifier::Control => Ok(KeyModifier::Control),
+        IpcAutomationKeyModifier::Alt => Ok(KeyModifier::Alt),
+        IpcAutomationKeyModifier::Shift => Ok(KeyModifier::Shift),
+        IpcAutomationKeyModifier::Unspecified => Err(PortError::InvalidData(
+            "automation key modifier is unspecified".to_owned(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_automation_key(value: i32) -> Result<AutomationKey, PortError> {
+    let key = IpcAutomationKey::try_from(value)
+        .map_err(|_| PortError::InvalidData("unknown automation key".to_owned()))?;
+    match key {
+        IpcAutomationKey::Unspecified => Err(PortError::InvalidData(
+            "automation key is unspecified".to_owned(),
+        )),
+        IpcAutomationKey::A => Ok(AutomationKey::A),
+        IpcAutomationKey::B => Ok(AutomationKey::B),
+        IpcAutomationKey::C => Ok(AutomationKey::C),
+        IpcAutomationKey::D => Ok(AutomationKey::D),
+        IpcAutomationKey::E => Ok(AutomationKey::E),
+        IpcAutomationKey::F => Ok(AutomationKey::F),
+        IpcAutomationKey::G => Ok(AutomationKey::G),
+        IpcAutomationKey::H => Ok(AutomationKey::H),
+        IpcAutomationKey::I => Ok(AutomationKey::I),
+        IpcAutomationKey::J => Ok(AutomationKey::J),
+        IpcAutomationKey::K => Ok(AutomationKey::K),
+        IpcAutomationKey::L => Ok(AutomationKey::L),
+        IpcAutomationKey::M => Ok(AutomationKey::M),
+        IpcAutomationKey::N => Ok(AutomationKey::N),
+        IpcAutomationKey::O => Ok(AutomationKey::O),
+        IpcAutomationKey::P => Ok(AutomationKey::P),
+        IpcAutomationKey::Q => Ok(AutomationKey::Q),
+        IpcAutomationKey::R => Ok(AutomationKey::R),
+        IpcAutomationKey::S => Ok(AutomationKey::S),
+        IpcAutomationKey::T => Ok(AutomationKey::T),
+        IpcAutomationKey::U => Ok(AutomationKey::U),
+        IpcAutomationKey::V => Ok(AutomationKey::V),
+        IpcAutomationKey::W => Ok(AutomationKey::W),
+        IpcAutomationKey::X => Ok(AutomationKey::X),
+        IpcAutomationKey::Y => Ok(AutomationKey::Y),
+        IpcAutomationKey::Z => Ok(AutomationKey::Z),
+        IpcAutomationKey::Digit0 => Ok(AutomationKey::Digit0),
+        IpcAutomationKey::Digit1 => Ok(AutomationKey::Digit1),
+        IpcAutomationKey::Digit2 => Ok(AutomationKey::Digit2),
+        IpcAutomationKey::Digit3 => Ok(AutomationKey::Digit3),
+        IpcAutomationKey::Digit4 => Ok(AutomationKey::Digit4),
+        IpcAutomationKey::Digit5 => Ok(AutomationKey::Digit5),
+        IpcAutomationKey::Digit6 => Ok(AutomationKey::Digit6),
+        IpcAutomationKey::Digit7 => Ok(AutomationKey::Digit7),
+        IpcAutomationKey::Digit8 => Ok(AutomationKey::Digit8),
+        IpcAutomationKey::Digit9 => Ok(AutomationKey::Digit9),
+        IpcAutomationKey::Enter => Ok(AutomationKey::Enter),
+        IpcAutomationKey::Escape => Ok(AutomationKey::Escape),
+        IpcAutomationKey::Tab => Ok(AutomationKey::Tab),
+        IpcAutomationKey::Space => Ok(AutomationKey::Space),
+        IpcAutomationKey::Backspace => Ok(AutomationKey::Backspace),
+        IpcAutomationKey::Delete => Ok(AutomationKey::Delete),
+        IpcAutomationKey::ArrowLeft => Ok(AutomationKey::ArrowLeft),
+        IpcAutomationKey::ArrowRight => Ok(AutomationKey::ArrowRight),
+        IpcAutomationKey::ArrowUp => Ok(AutomationKey::ArrowUp),
+        IpcAutomationKey::ArrowDown => Ok(AutomationKey::ArrowDown),
+        IpcAutomationKey::Home => Ok(AutomationKey::Home),
+        IpcAutomationKey::End => Ok(AutomationKey::End),
+        IpcAutomationKey::F1 => Ok(AutomationKey::F1),
+        IpcAutomationKey::F2 => Ok(AutomationKey::F2),
+        IpcAutomationKey::F3 => Ok(AutomationKey::F3),
+        IpcAutomationKey::F4 => Ok(AutomationKey::F4),
+        IpcAutomationKey::F5 => Ok(AutomationKey::F5),
+        IpcAutomationKey::F6 => Ok(AutomationKey::F6),
+        IpcAutomationKey::F7 => Ok(AutomationKey::F7),
+        IpcAutomationKey::F8 => Ok(AutomationKey::F8),
+        IpcAutomationKey::F9 => Ok(AutomationKey::F9),
+        IpcAutomationKey::F10 => Ok(AutomationKey::F10),
+        IpcAutomationKey::F11 => Ok(AutomationKey::F11),
+        IpcAutomationKey::F12 => Ok(AutomationKey::F12),
+    }
+}
+
+fn automation_error_response(request_id: String, error: &PortError) -> ResponseEnvelope {
+    let code = match &error {
+        PortError::Automation(code) => code.as_str(),
+        PortError::InvalidData(_) => "invalid_automation",
+        _ => "automation_failed",
+    };
+    error_response(request_id, code, &error.to_string(), false)
 }
 
 fn map_archive_settings(
@@ -1337,6 +1682,14 @@ async fn compose_handler(
         worker_client.clone(),
         "daemon-windows-worker",
     ));
+    let automation = Arc::new(AutomationService::new(
+        repository.clone(),
+        Arc::new(WindowsAutomationPlatform),
+    ));
+    let recovered = automation.recover_startup(chrono::Utc::now()).await?;
+    if recovered > 0 {
+        warn!(recovered, "recovered interrupted guarded automation runs");
+    }
     Ok(Arc::new(DaemonHandler {
         ingest,
         analysis,
@@ -1348,6 +1701,7 @@ async fn compose_handler(
         repository,
         assets,
         capture_policy,
+        automation,
         model_root: generator_root,
     }))
 }
@@ -1516,6 +1870,73 @@ async fn maintenance_loop(ingest: Arc<IngestService>, mut shutdown: watch::Recei
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod automation_tests {
+    use screensearch_domain::{
+        AutomationAction, AutomationFailureCode, AutomationKey, KeyModifier,
+    };
+    use screensearch_ipc::v1::{
+        AutomationAction as IpcAutomationAction, AutomationKeyChord,
+        AutomationPlanV1 as IpcAutomationPlan, AutomationTarget as IpcAutomationTarget,
+        TypeTextAction, automation_action, response_envelope,
+    };
+    use screensearch_ports::PortError;
+
+    use super::{automation_error_response, parse_automation_plan};
+
+    #[test]
+    fn parses_automation_plan_into_typed_domain_actions() {
+        let parsed = parse_automation_plan(IpcAutomationPlan {
+            target: Some(IpcAutomationTarget {
+                process_id: 42,
+                window_handle: 9001,
+                executable_name: "fixture.exe".to_owned(),
+                display_title: "Fixture".to_owned(),
+            }),
+            actions: vec![
+                IpcAutomationAction {
+                    action: Some(automation_action::Action::KeyChord(AutomationKeyChord {
+                        modifiers: vec![1, 3],
+                        key: 19,
+                    })),
+                },
+                IpcAutomationAction {
+                    action: Some(automation_action::Action::TypeText(TypeTextAction {
+                        text: "hello".to_owned(),
+                    })),
+                },
+            ],
+        })
+        .unwrap();
+
+        assert!(matches!(
+            &parsed.actions[0],
+            AutomationAction::KeyChord {
+                modifiers,
+                key: AutomationKey::S
+            } if modifiers == &[KeyModifier::Control, KeyModifier::Shift]
+        ));
+        assert!(matches!(
+            &parsed.actions[1],
+            AutomationAction::TypeText { text } if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn automation_errors_use_the_stable_failure_code() {
+        let response = automation_error_response(
+            "request".to_owned(),
+            &PortError::Automation(AutomationFailureCode::TargetChanged),
+        );
+        let Some(response_envelope::Body::Error(error)) = response.body else {
+            panic!("expected error response");
+        };
+        assert_eq!(error.code, "target_changed");
+        assert!(!error.retryable);
     }
 }
 
