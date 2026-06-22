@@ -11,8 +11,8 @@ use chrono::{Duration, SecondsFormat, Utc};
 use libsql::{Builder, params};
 use screensearch_domain::{
     AnalysisJob, AnalysisResult, ArchiveSettings, AssetCleanupTask, AssetRef, BoundingBox,
-    CaptureDisposition, CaptureId, ChunkId, DeleteCaptures, DeletionSummary, JobId, NewCapture,
-    QueueMetrics, SearchHit, SearchMatchKind, StorageMetrics,
+    CaptureDisposition, CaptureId, ChunkId, DeleteCaptures, DeletionSummary, GenerationModel,
+    JobId, ModelSourceKind, NewCapture, QueueMetrics, SearchHit, SearchMatchKind, StorageMetrics,
 };
 use screensearch_ports::{ArchiveRepository, AssetStore, PortError};
 use tokio::fs;
@@ -25,6 +25,7 @@ const MIGRATION_0002: &str = include_str!("../migrations/0002_nullable_ocr_confi
 const MIGRATION_0003: &str = include_str!("../migrations/0003_search_evidence.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_real_embedding_model.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_archive_policy.sql");
+const MIGRATION_0006: &str = include_str!("../migrations/0006_generation_model_catalog.sql");
 const MAX_JOB_ATTEMPTS: u32 = 5;
 const BRUTE_FORCE_VECTOR_THRESHOLD: u64 = 50_000;
 
@@ -300,6 +301,20 @@ impl ArchiveRepository for LibSqlArchive {
         if rows.next().await.map_err(database_error)?.is_none() {
             self.connection()
                 .execute_batch(MIGRATION_0005)
+                .await
+                .map_err(database_error)?;
+        }
+        let mut rows = self
+            .connection()
+            .query(
+                "SELECT 1 FROM schema_migration WHERE version = 6 LIMIT 1",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        if rows.next().await.map_err(database_error)?.is_none() {
+            self.connection()
+                .execute_batch(MIGRATION_0006)
                 .await
                 .map_err(database_error)?;
         }
@@ -993,6 +1008,205 @@ impl ArchiveRepository for LibSqlArchive {
         debug!(result_count = hits.len(), "hybrid search complete");
         Ok(hits)
     }
+
+    async fn generation_models(&self) -> Result<Vec<GenerationModel>, PortError> {
+        let mut rows = self
+            .connection()
+            .query(
+                "SELECT
+                    id, display_name, source_kind, repository, filename, relative_path,
+                    content_hash, byte_length, architecture, quantization, context_tokens,
+                    supports_vision, active
+                 FROM generation_model
+                 ORDER BY active DESC, display_name COLLATE NOCASE, id",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        let mut models = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            models.push(map_generation_model(&row)?);
+        }
+        Ok(models)
+    }
+
+    async fn upsert_generation_model(&self, model: GenerationModel) -> Result<(), PortError> {
+        model
+            .validate()
+            .map_err(|error| PortError::InvalidData(error.to_string()))?;
+        let byte_length = i64::try_from(model.byte_length)
+            .map_err(|_| PortError::InvalidData("model is too large".to_owned()))?;
+        let context_tokens = model.context_tokens.map(i64::from);
+        let now = timestamp(Utc::now());
+        let _write_guard = self.write_gate.lock().await;
+        let connection = self.connection();
+        let transaction = connection.transaction().await.map_err(database_error)?;
+        if model.active {
+            transaction
+                .execute(
+                    "UPDATE generation_model SET active = 0 WHERE active = 1",
+                    (),
+                )
+                .await
+                .map_err(database_error)?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO generation_model(
+                    id, display_name, source_kind, repository, filename, relative_path,
+                    content_hash, byte_length, architecture, quantization, context_tokens,
+                    supports_vision, active, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    source_kind = excluded.source_kind,
+                    repository = excluded.repository,
+                    filename = excluded.filename,
+                    relative_path = excluded.relative_path,
+                    content_hash = excluded.content_hash,
+                    byte_length = excluded.byte_length,
+                    architecture = excluded.architecture,
+                    quantization = excluded.quantization,
+                    context_tokens = excluded.context_tokens,
+                    supports_vision = excluded.supports_vision,
+                    active = excluded.active,
+                    updated_at = excluded.updated_at",
+                params![
+                    model.id,
+                    model.display_name,
+                    model.source.as_str(),
+                    model.repository,
+                    model.filename,
+                    model.relative_path,
+                    model.content_hash,
+                    byte_length,
+                    model.architecture,
+                    model.quantization,
+                    context_tokens,
+                    bool_i64(model.supports_vision),
+                    bool_i64(model.active),
+                    now.clone(),
+                    now,
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn select_generation_model(&self, model_id: &str) -> Result<(), PortError> {
+        let model_id = model_id.trim();
+        if model_id.is_empty() {
+            return Err(PortError::InvalidData("model id is empty".to_owned()));
+        }
+        let _write_guard = self.write_gate.lock().await;
+        let connection = self.connection();
+        let transaction = connection.transaction().await.map_err(database_error)?;
+        transaction
+            .execute(
+                "UPDATE generation_model SET active = 0 WHERE active = 1",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        let selected = transaction
+            .execute(
+                "UPDATE generation_model SET active = 1, updated_at = ? WHERE id = ?",
+                params![timestamp(Utc::now()), model_id],
+            )
+            .await
+            .map_err(database_error)?;
+        if selected == 0 {
+            transaction.rollback().await.map_err(database_error)?;
+            return Err(PortError::InvalidData(format!(
+                "generation model {model_id} is not registered"
+            )));
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn clear_active_generation_model(&self) -> Result<(), PortError> {
+        let _write_guard = self.write_gate.lock().await;
+        self.connection()
+            .execute(
+                "UPDATE generation_model SET active = 0 WHERE active = 1",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn active_generation_model(&self) -> Result<Option<GenerationModel>, PortError> {
+        let mut rows = self
+            .connection()
+            .query(
+                "SELECT
+                    id, display_name, source_kind, repository, filename, relative_path,
+                    content_hash, byte_length, architecture, quantization, context_tokens,
+                    supports_vision, active
+                 FROM generation_model
+                 WHERE active = 1
+                 LIMIT 1",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        rows.next()
+            .await
+            .map_err(database_error)?
+            .map(|row| map_generation_model(&row))
+            .transpose()
+    }
+
+    async fn delete_generation_model(
+        &self,
+        model_id: &str,
+    ) -> Result<Option<GenerationModel>, PortError> {
+        let model_id = model_id.trim();
+        if model_id.is_empty() {
+            return Err(PortError::InvalidData("model id is empty".to_owned()));
+        }
+        let _write_guard = self.write_gate.lock().await;
+        let connection = self.connection();
+        let transaction = connection.transaction().await.map_err(database_error)?;
+        let mut rows = transaction
+            .query(
+                "SELECT
+                    id, display_name, source_kind, repository, filename, relative_path,
+                    content_hash, byte_length, architecture, quantization, context_tokens,
+                    supports_vision, active
+                 FROM generation_model
+                 WHERE id = ?
+                 LIMIT 1",
+                params![model_id],
+            )
+            .await
+            .map_err(database_error)?;
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            transaction.rollback().await.map_err(database_error)?;
+            return Ok(None);
+        };
+        let model = map_generation_model(&row)?;
+        drop(rows);
+        if model.active {
+            transaction.rollback().await.map_err(database_error)?;
+            return Err(PortError::Denied(
+                "active generation model must be deactivated before deletion".to_owned(),
+            ));
+        }
+        transaction
+            .execute(
+                "DELETE FROM generation_model WHERE id = ?",
+                params![model_id],
+            )
+            .await
+            .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(Some(model))
+    }
 }
 
 struct RankedHit {
@@ -1170,6 +1384,43 @@ fn parse_search_hit(
         ocr_model_id: row.get(16).map_err(database_error)?,
         embedding_model_id: embedding_model_id.to_owned(),
     })
+}
+
+fn map_generation_model(row: &libsql::Row) -> Result<GenerationModel, PortError> {
+    let source_value: String = row.get(2).map_err(database_error)?;
+    let byte_length = non_negative_u64(row.get(7).map_err(database_error)?, "model bytes")?;
+    let context_tokens = row
+        .get::<Option<i64>>(10)
+        .map_err(database_error)?
+        .map(|value| {
+            u32::try_from(value)
+                .map_err(|_| PortError::InvalidData("invalid model context size".to_owned()))
+        })
+        .transpose()?;
+    let model = GenerationModel {
+        id: row.get(0).map_err(database_error)?,
+        display_name: row.get(1).map_err(database_error)?,
+        source: ModelSourceKind::parse(&source_value)
+            .map_err(|error| PortError::InvalidData(error.to_string()))?,
+        repository: row.get(3).map_err(database_error)?,
+        filename: row.get(4).map_err(database_error)?,
+        relative_path: row.get(5).map_err(database_error)?,
+        content_hash: row.get(6).map_err(database_error)?,
+        byte_length,
+        architecture: row.get(8).map_err(database_error)?,
+        quantization: row.get(9).map_err(database_error)?,
+        context_tokens,
+        supports_vision: row.get::<i64>(11).map_err(database_error)? != 0,
+        active: row.get::<i64>(12).map_err(database_error)? != 0,
+    };
+    model
+        .validate()
+        .map_err(|error| PortError::InvalidData(error.to_string()))?;
+    Ok(model)
+}
+
+fn bool_i64(value: bool) -> i64 {
+    i64::from(value)
 }
 
 fn vector_text(vector: &[f32]) -> String {

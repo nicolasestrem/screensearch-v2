@@ -239,3 +239,80 @@ Patch-plan item 14 stays **open**: the native tray, global hotkey, and hide-to-t
 ### Remaining boundary
 
 Unchanged: patch-plan item 14 stays open pending the manual Windows tray/hotkey runtime check (spec §18). The pause/resume notification is best confirmed in a packaged build.
+
+## 2026-06-21 — P3 model selection and worker boundary implementation
+
+### Changed
+
+- Created the `p3-model-selection-worker` branch.
+- Added migration `0006_generation_model_catalog.sql` for selectable generation models with source kind, file metadata, hash, quantization, context, vision capability, and single-active selection.
+- Extended domain and port contracts with generation-model catalog operations.
+- Extended protobuf IPC additively with model-management requests, answer completion status fields, and worker-only OCR/embedding/generation messages.
+- Added daemon model-management operations for local GGUF import, explicit Hugging Face download, active selection, inactive deletion, and unload.
+- Added a real `screensearch-model-worker` named-pipe endpoint for Windows OCR, MiniLM embeddings, and llama.cpp generation.
+- Changed daemon composition so production OCR, embedding, and generation ports call the model-worker pipe.
+- Updated the desktop proxy, TypeScript API, Settings modal, and answer panel for model management and answer terminal states.
+
+### Why
+
+P3 needs model choice to be measured against the screen-memory use case rather than hard-coded. The branch supports local sample models, explicit Hugging Face downloads, and later bundled discovery while keeping evidence-first search usable without generation.
+
+### Verification evidence
+
+Not run in this implementation session. The Windows sandbox failed before launching commands, and the escalation reviewer rejected further command approval due to usage limits. Required follow-up commands remain `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `npm run lint`, and `npm run build`.
+
+### Remaining boundary
+
+Items 15 and 16 remain open until the branch compiles cleanly, the model-worker is verified against local GGUF candidates, and a benchmark report selects a default model for the use case. Legal/license approval remains intentionally deferred for this engineering slice.
+
+## 2026-06-22 — P3 review-and-harden: worker supervision and model memory lifecycle
+
+### Changed
+
+- **Worker supervision (item 16).** Added `apps/daemon/src/supervisor.rs` with a sliding-window bounded `RestartPolicy` (exponential backoff, capped; failures outside the window decay) and a daemon `worker_supervisor_loop` that detects worker exits via `Child::wait`, restarts within budget, owns the clean-shutdown kill/reap, and surfaces budget exhaustion as a loud non-zero daemon exit. The worker is no longer spawned once and forgotten.
+- **Orphan prevention (item 16).** Added a per-instance parent **lifeline pipe**: the daemon creates it (`create_worker_lifeline`) before spawning and passes `--lifeline-pipe`; the worker watches it (`watch_worker_lifeline`) and self-exits on EOF, so a daemon crash cannot leave an orphaned worker squatting the worker pipe. Pure safe Rust over the existing named-pipe transport — no new `unsafe`.
+- **Memory lifecycle (item 15).** Added a daemon `idle_unload_loop` that, after an idle timeout, issues a **raw** worker unload (not the catalog-clearing daemon handler) so the active selection survives and the next query reloads lazily. Added a generation wall-clock deadline in `LlamaCppTextGenerator`, and made `is_loaded()` lock-free (an `AtomicBool`) so a health probe never blocks behind an in-flight generation holding the model mutex.
+- **Revision integrity (ADR 0002).** `WorkerModelClient` now compares the worker-reported OCR/embedding revision against the expected id and fails loudly (`PortError::Internal` + content-free `warn!`) on drift instead of silently stamping derived records with a constant.
+- **README.** Tightened the architecture line so the now-true "the daemon supervises it" claim describes crash detection, bounded restarts, and the lifeline.
+
+### Tests
+
+- New CI tests: `crates/persistence/tests/generation_model_catalog.rs` (catalog ordering, single-active invariant, delete-active denied, select-unregistered rejected, clear-active keeps rows), domain `GenerationModel::validate`/`ModelSourceKind::parse` cases, `crates/application/tests/answer_status.rs` (every terminal status branch via test doubles), `supervisor::tests` (restart-policy backoff/give-up/decay), and a model-runtime deadline-predicate test — 24 new CI-run tests.
+- New gated `apps/daemon/tests/worker_supervision.rs` (5 `#[ignore]` cases, opt-in `SCREENSEARCH_RUN_WORKER_IT=1`; generation cases on `SCREENSEARCH_TEST_GGUF`): readiness + lifeline-exit, kill→restart recovery, generation round-trip after restart, cancellation keeps health responsive, and the idle-unload primitive.
+
+### Decisions made
+
+- Tunables (restart budget/backoff, idle timeout, generation deadline) are **code constants**, not environment variables (operating rule 5; the spec names none).
+- Chose a parent-lifeline pipe over a Windows Job Object to keep the workspace free of `unsafe`.
+- Memory-pressure-triggered unload is deferred (idle-timeout unload ships); the pressure-signal source is recorded as **GAP-008** so item 15's "memory lifecycle" is honestly scoped.
+- The `answer_status` test uses an inline fake `ArchiveRepository` (test double) rather than adding `application → persistence` as a dev-dependency.
+
+### Verification evidence
+
+- `cargo fmt --check` — clean (exit 0); the only earlier breakage was rustfmt/CRLF drift left by the prior session, fixed by `cargo fmt`.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean (exit 0).
+- `cargo test --workspace` — **52 passed, 0 failed, 7 ignored** (the 5 new gated worker-supervision cases plus the pre-existing scale and live-archive tests). Includes the new catalog (7), answer-status (7), domain generation-model (5), supervisor (4), and deadline (1) tests.
+- `npm run lint` and `npm run build` (`apps/desktop`) — clean (exit 0).
+
+### Remaining boundary
+
+Items 15 and 16 **stay open**. Closing them additionally requires a live-Windows GGUF benchmark of a selected candidate model (the harness exists; candidate measurements are pending), the GAP-002/GAP-003 model/licensing decisions, and the memory-pressure unload path (GAP-008). The gated worker-supervision tests must also be run on Windows with a test GGUF to confirm the runtime end to end.
+
+## 2026-06-22 — PR #6 review follow-ups (model-management polish)
+
+### Changed
+
+- **Deleting a model now removes its directory too.** `delete_generation_model` removed the GGUF file but left the empty `{model_root}/{model_id}/` directory behind to accumulate. It now best-effort-removes the parent directory after the file delete (ignoring `NotFound`; a still-populated or busy directory is logged content-free and left in place rather than failing the delete).
+- **Hugging Face downloads reject HTML/error pages.** `download_and_hash` now checks the response `Content-Type` and bails with a clear message when the server returns a `text/*` page (e.g. a gated-model authentication wall) instead of writing a bogus file that would only fail later with an opaque "invalid GGUF magic" error. `error_for_status()` already rejected explicit 401/403 responses; this closes the 200-with-HTML case.
+
+### Not changed (reviewed and intentionally left)
+
+- **`context_tokens = 2048`** is correct as stored: the domain field is documented as "context window *configured for evaluation*", and the worker's llama.cpp context is a fixed conservative `n_ctx = 2048` with a `1792`-token prompt cap. The stored value matches the effective runtime context, so it is truthful rather than a fabricated capability. Reading the model's GGUF-declared `context_length` and raising the evaluation window is tracked as a follow-up (see patch plan).
+- **Import/download progress feedback** and **a Hugging Face `revision` pin / gated-model token auth** are deferred: both require additive IPC contract plus Tauri/UI plumbing (progress) or a wire/UI argument (revision/token) and are larger than this review-fix pass. Recorded in the patch plan; revision/auth ties to GAP-003. Provenance is already captured today via the stored BLAKE3 `content_hash`.
+
+### Verification evidence
+
+- `cargo fmt --check` — clean (exit 0).
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean (exit 0).
+- `cargo test --workspace` — 52 passed, 0 failed, 7 ignored (unchanged; the two fixes are in daemon binary helpers that touch the filesystem/network and are not unit-testable in CI).
+- `npm run lint` and `npm run build` (`apps/desktop`) — clean (exit 0); no desktop code changed.

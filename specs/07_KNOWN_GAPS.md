@@ -1,25 +1,27 @@
 # ScreenSearch V2 Known Gaps
 
-Last updated: 2026-06-21
+Last updated: 2026-06-22
 
 This file contains decisions or external inputs that cannot be safely invented by an implementation agent.
 
 | ID | Gap | Owner | Needed by | Status |
 |---|---|---|---|---|
 | GAP-001 | Select one of three product visual directions for the tray/hotkey search experience. | Product owner | Before production UI implementation | Resolved: Memory Timeline |
-| GAP-002 | Approve redistribution of the Apache-2.0 `Xenova/all-MiniLM-L6-v2` quantized ONNX files and select/approve a GGUF generation model. | Product owner / legal | Before packaging model weights | Open |
-| GAP-003 | Choose whether models ship in the installer or download through an explicit first-run flow. | Product owner | Before release packaging | Open |
+| GAP-002 | Approve redistribution of the Apache-2.0 `Xenova/all-MiniLM-L6-v2` quantized ONNX files and approve the final selected GGUF generation model for release. | Product owner / legal | Before packaging model weights | Open; ignored for engineering model comparison |
+| GAP-003 | Choose the release default between bundled model resources, explicit Hugging Face download, or both. | Product owner | Before release packaging | Open; engineering branch supports both acquisition paths |
 | GAP-004 | Define the default retention period or disk budget shown during first-run/settings. | Product owner | Before retention defaults ship | Resolved for P1: explicit `Keep all` / `No limit` conservative default |
 | GAP-005 | Provide Windows code-signing identity and release ownership. | Product owner | Before public distribution | Open |
 | GAP-006 | Decide whether guarded automation belongs in the first public release or remains feature-disabled. | Product owner | Before release scope freeze | Open |
 | GAP-007 | Name the reference Windows hardware profile for latency and resource budgets. | Product owner / engineering | Before performance acceptance | Resolved for P1 engineering baseline: Ryzen 7 7800X3D, 32 GB RAM, Kingston NVMe, Windows 11 Pro |
+| GAP-008 | Choose the Windows memory-pressure signal that triggers an early generation-model unload (e.g. a memory-resource-notification or working-set threshold) and its policy. | Engineering | Before item 15 closes | Open; idle-timeout unload is implemented, the memory-pressure path is deferred |
 
 ## Current safe assumptions
 
 - Development uses Windows-provided offline OCR without redistributing separate weights.
 - Development uses quantized `Xenova/all-MiniLM-L6-v2` at model revision `751bff37182d3f1213fa05d7196b954e230abad9`, advertised as Apache-2.0; release redistribution still requires approval.
-- The GGUF adapter expects `models/generator/model.gguf`; a missing file fails explicitly and never falls back to a fake.
+- The legacy GGUF adapter path `models/generator/model.gguf` remains a compatibility fallback. New engineering work uses the generation-model catalog below the app data model root, with explicit local import or Hugging Face download.
 - Evidence-only search remains fully usable when generation models are absent.
+- The model worker is daemon-supervised: crashes trigger sliding-window bounded restarts, a parent lifeline pipe ties the worker's lifetime to the daemon, and the resident generation model unloads after an idle timeout (a code constant) while keeping the catalog selection for lazy reload. Memory-pressure-triggered unload is deferred to GAP-008.
 - Automation remains disabled until GAP-006 is resolved and all safety tests pass.
 - Development backpressure uses daemon-owned high/low-water marks of 100/50 active jobs. The P1 baseline is accepted on the named GAP-007 engineering machine; release-hardware soak budgets remain a separate hardening task.
 - The shell summon hotkey is a shell-local setting (default `Ctrl+Shift+Space`) stored as JSON under the Tauri app-config directory, not in the daemon archive. Window close hides to the tray; only tray Quit exits the shell. Both defaults were product-owner confirmed on 2026-06-21. The native tray and global-hotkey runtime still need a manual Windows end-to-end check (spec §18) before patch-plan item 14 closes.

@@ -10,7 +10,8 @@ use std::{
     },
 };
 
-use futures::{Stream, StreamExt, lock::Mutex, stream};
+use async_stream::try_stream;
+use futures::{Stream, StreamExt, lock::Mutex};
 use image::imageops::FilterType;
 use screensearch_domain::{
     AnalysisResult, ArchiveSettings, CaptureDisposition, CaptureId, CaptureSkipReason,
@@ -568,20 +569,66 @@ impl SearchService {
             .await?;
         let citation_count = hits.len();
         let prompt = assemble_prompt(query, &hits);
-        let tokens = if generate_answer && citation_count > 0 {
-            self.generator.generate(prompt).await?
-        } else {
-            Box::pin(stream::empty())
-        };
+        let generator = Arc::clone(&self.generator);
 
-        let citations = stream::iter(
-            hits.into_iter()
-                .map(|hit| Ok(SearchEvent::Citation(Box::new(hit)))),
-        );
-        let tokens = tokens.map(|result| result.map(SearchEvent::Token));
-        let completed = stream::once(async move { Ok(SearchEvent::Completed { citation_count }) });
+        Ok(Box::pin(try_stream! {
+            for hit in hits {
+                yield SearchEvent::Citation(Box::new(hit));
+            }
 
-        Ok(Box::pin(citations.chain(tokens).chain(completed)))
+            if !generate_answer {
+                yield SearchEvent::Completed {
+                    citation_count,
+                    answer_status: "evidence_only".to_owned(),
+                    answer_message: None,
+                };
+                return;
+            }
+
+            if citation_count == 0 {
+                yield SearchEvent::Completed {
+                    citation_count,
+                    answer_status: "no_evidence".to_owned(),
+                    answer_message: Some("No local evidence matched the query.".to_owned()),
+                };
+                return;
+            }
+
+            match generator.generate(prompt).await {
+                Ok(mut tokens) => {
+                    while let Some(token) = tokens.next().await {
+                        match token {
+                            Ok(text) => yield SearchEvent::Token(text),
+                            Err(error) => {
+                                yield SearchEvent::Completed {
+                                    citation_count,
+                                    answer_status: "generation_failed".to_owned(),
+                                    answer_message: Some(error.to_string()),
+                                };
+                                return;
+                            }
+                        }
+                    }
+                    yield SearchEvent::Completed {
+                        citation_count,
+                        answer_status: "answered".to_owned(),
+                        answer_message: None,
+                    };
+                }
+                Err(error) => {
+                    let status = match &error {
+                        PortError::Unavailable(_) => "model_missing",
+                        PortError::Transient(_) => "cancelled",
+                        _ => "generation_failed",
+                    };
+                    yield SearchEvent::Completed {
+                        citation_count,
+                        answer_status: status.to_owned(),
+                        answer_message: Some(error.to_string()),
+                    };
+                }
+            }
+        }))
     }
 }
 

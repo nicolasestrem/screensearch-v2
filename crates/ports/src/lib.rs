@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use futures::Stream;
 use screensearch_domain::{
     AnalysisJob, AnalysisResult, ArchiveSettings, AssetCleanupTask, AssetRef, CaptureDisposition,
-    CaptureId, CapturedFrame, DeleteCaptures, DeletionSummary, NewCapture, OcrBlock, QueueMetrics,
-    SearchHit, StorageMetrics,
+    CaptureId, CapturedFrame, DeleteCaptures, DeletionSummary, GenerationModel, NewCapture,
+    OcrBlock, QueueMetrics, SearchHit, StorageMetrics,
 };
 use thiserror::Error;
 
@@ -90,6 +90,27 @@ pub trait ArchiveRepository: Send + Sync {
         model_id: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>, PortError>;
+
+    /// Lists known generation models and their active state.
+    async fn generation_models(&self) -> Result<Vec<GenerationModel>, PortError>;
+
+    /// Inserts or replaces one generation model catalog entry.
+    async fn upsert_generation_model(&self, model: GenerationModel) -> Result<(), PortError>;
+
+    /// Marks one generation model active and deactivates all others.
+    async fn select_generation_model(&self, model_id: &str) -> Result<(), PortError>;
+
+    /// Clears the active generation model selection.
+    async fn clear_active_generation_model(&self) -> Result<(), PortError>;
+
+    /// Returns the active generation model, if one is selected.
+    async fn active_generation_model(&self) -> Result<Option<GenerationModel>, PortError>;
+
+    /// Deletes an inactive generation model catalog entry.
+    async fn delete_generation_model(
+        &self,
+        model_id: &str,
+    ) -> Result<Option<GenerationModel>, PortError>;
 }
 
 /// Performs OCR for one immutable asset.

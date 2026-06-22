@@ -3,7 +3,11 @@
 use std::{
     num::NonZeroU32,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use async_stream::try_stream;
@@ -190,11 +194,23 @@ impl TextGenerator for FakeTextGenerator {
     }
 }
 
+/// Backstop wall-clock budget for a single generation request.
+///
+/// A code constant rather than a tunable: the spec adds no generation-deadline
+/// environment variable, so this stays an internal safety limit.
+const GENERATION_DEADLINE: Duration = Duration::from_secs(120);
+
 /// Local GGUF generator backed by llama.cpp.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LlamaCppTextGenerator {
     model_path: PathBuf,
-    generation_gate: Arc<Mutex<()>>,
+    model: Arc<Mutex<Option<LoadedLlamaModel>>>,
+    loaded: Arc<AtomicBool>,
+}
+
+struct LoadedLlamaModel {
+    backend: LlamaBackend,
+    model: LlamaModel,
 }
 
 impl LlamaCppTextGenerator {
@@ -202,8 +218,27 @@ impl LlamaCppTextGenerator {
     pub fn new(model_path: impl Into<PathBuf>) -> Self {
         Self {
             model_path: model_path.into(),
-            generation_gate: Arc::new(Mutex::new(())),
+            model: Arc::new(Mutex::new(None)),
+            loaded: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Returns whether this generator currently has a GGUF model resident in memory.
+    ///
+    /// Reads a lock-free flag so a health probe never blocks behind an in-flight
+    /// generation that holds the model mutex for its entire token loop.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded.load(Ordering::Acquire)
+    }
+
+    /// Drops any loaded GGUF model and releases its memory.
+    pub fn unload(&self) -> Result<(), PortError> {
+        *self
+            .model
+            .lock()
+            .map_err(|_| PortError::Internal("generation lock was poisoned".to_owned()))? = None;
+        self.loaded.store(false, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -216,7 +251,9 @@ impl TextGenerator for LlamaCppTextGenerator {
             ));
         }
         let model_path = self.model_path.clone();
-        let generation_gate = self.generation_gate.clone();
+        let model = self.model.clone();
+        let loaded = self.loaded.clone();
+        let deadline = Instant::now() + GENERATION_DEADLINE;
         let (send, receive) = tokio::sync::mpsc::channel(32);
         tokio::task::spawn_blocking(move || {
             let result = generate_gguf(
@@ -227,7 +264,9 @@ impl TextGenerator for LlamaCppTextGenerator {
                         PortError::Transient("generation consumer disconnected".to_owned())
                     })
                 },
-                &generation_gate,
+                &model,
+                &loaded,
+                deadline,
             );
             if let Err(error) = result {
                 let _ = send.blocking_send(Err(error));
@@ -241,23 +280,32 @@ fn generate_gguf(
     model_path: &std::path::Path,
     prompt: &str,
     mut emit: impl FnMut(String) -> Result<(), PortError>,
-    generation_gate: &Mutex<()>,
+    model_cache: &Mutex<Option<LoadedLlamaModel>>,
+    loaded: &AtomicBool,
+    deadline: Instant,
 ) -> Result<(), PortError> {
-    let _guard = generation_gate
+    let mut cached = model_cache
         .lock()
         .map_err(|_| PortError::Internal("generation lock was poisoned".to_owned()))?;
-    let backend = LlamaBackend::init()
-        .map_err(|error| PortError::Internal(format!("initialize llama.cpp: {error}")))?;
-    let model = LlamaModel::load_from_file(&backend, model_path, &LlamaModelParams::default())
-        .map_err(|error| PortError::Unavailable(format!("load local GGUF model: {error}")))?;
+    if cached.is_none() {
+        let backend = LlamaBackend::init()
+            .map_err(|error| PortError::Internal(format!("initialize llama.cpp: {error}")))?;
+        let model = LlamaModel::load_from_file(&backend, model_path, &LlamaModelParams::default())
+            .map_err(|error| PortError::Unavailable(format!("load local GGUF model: {error}")))?;
+        *cached = Some(LoadedLlamaModel { backend, model });
+    }
+    loaded.store(true, Ordering::Release);
+    let cached = cached.as_mut().expect("llama model initialized");
     let context_parameters = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(2_048))
         .with_n_threads(2)
         .with_n_threads_batch(2);
-    let mut context = model
-        .new_context(&backend, context_parameters)
+    let mut context = cached
+        .model
+        .new_context(&cached.backend, context_parameters)
         .map_err(|error| PortError::Internal(format!("create llama.cpp context: {error}")))?;
-    let tokens = model
+    let tokens = cached
+        .model
         .str_to_token(prompt, AddBos::Always)
         .map_err(|error| PortError::InvalidData(format!("tokenize generation prompt: {error}")))?;
     let maximum_prompt_tokens = 1_792_usize;
@@ -289,12 +337,16 @@ fn generate_gguf(
     let mut sampler = LlamaSampler::greedy();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     for position in (batch.n_tokens()..).take(256) {
-        let token = sampler.sample(&context, batch.n_tokens() - 1);
-        sampler.accept(token);
-        if model.is_eog_token(token) {
+        if should_stop_generation(deadline, Instant::now()) {
             break;
         }
-        let piece = model
+        let token = sampler.sample(&context, batch.n_tokens() - 1);
+        sampler.accept(token);
+        if cached.model.is_eog_token(token) {
+            break;
+        }
+        let piece = cached
+            .model
             .token_to_piece(token, &mut decoder, true, None)
             .map_err(|error| PortError::Internal(format!("decode generated token: {error}")))?;
         if !piece.is_empty() {
@@ -311,6 +363,14 @@ fn generate_gguf(
     Ok(())
 }
 
+/// Returns whether token generation should stop because its wall-clock deadline elapsed.
+///
+/// Factored out of the token loop so the deadline policy is unit-testable without a
+/// live GGUF model.
+fn should_stop_generation(deadline: Instant, now: Instant) -> bool {
+    now >= deadline
+}
+
 /// Explicit marker for the still-unimplemented generic ONNX vision-provider boundary.
 pub struct OnnxRuntimeProvider;
 
@@ -323,9 +383,11 @@ impl OnnxRuntimeProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use screensearch_ports::EmbeddingEngine;
 
-    use super::FakeEmbeddingEngine;
+    use super::{FakeEmbeddingEngine, should_stop_generation};
 
     #[tokio::test]
     async fn fake_embeddings_are_normalized_and_fixed_width() {
@@ -334,5 +396,22 @@ mod tests {
 
         assert_eq!(vector.len(), 384);
         assert!((norm - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn generation_stops_only_once_its_deadline_elapses() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(120);
+
+        assert!(!should_stop_generation(deadline, start));
+        assert!(!should_stop_generation(
+            deadline,
+            start + Duration::from_secs(119)
+        ));
+        assert!(should_stop_generation(deadline, deadline));
+        assert!(should_stop_generation(
+            deadline,
+            start + Duration::from_secs(121)
+        ));
     }
 }

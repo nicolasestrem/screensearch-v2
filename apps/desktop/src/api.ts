@@ -60,6 +60,22 @@ export interface CaptureAsset {
   content: number[];
 }
 
+export interface GenerationModel {
+  id: string;
+  displayName: string;
+  source: "local" | "hf" | "bundled" | string;
+  repository: string;
+  filename: string;
+  relativePath: string;
+  contentHash: string;
+  byteLength: number;
+  architecture: string;
+  quantization: string;
+  contextTokens: number;
+  supportsVision: boolean;
+  active: boolean;
+}
+
 export type SearchEvent =
   | {
       kind: "citation";
@@ -78,11 +94,17 @@ export type SearchEvent =
       embeddingModelId: string;
     }
   | { kind: "token"; text: string }
-  | { kind: "completed"; citationCount: number };
+  | {
+      kind: "completed";
+      citationCount: number;
+      answerStatus: "evidence_only" | "answered" | "no_evidence" | "model_missing" | "cancelled" | "generation_failed" | string;
+      answerMessage: string;
+    };
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
 let previewPaused = false;
 let previewHotkey = DEFAULT_HOTKEY;
+let previewModels: GenerationModel[] = [];
 let previewSettings: ArchiveSettings = {
   retentionDays: null,
   diskBudgetBytes: null,
@@ -199,11 +221,64 @@ export const api = {
       if (generateAnswer) {
         receive({ kind: "token", text: "The selected evidence shows the V2 architecture and its locally verified capture, OCR, and search pipeline." });
       }
-      receive({ kind: "completed", citationCount: previewCitations.length });
+      receive({
+        kind: "completed",
+        citationCount: previewCitations.length,
+        answerStatus: generateAnswer ? "answered" : "evidence_only",
+        answerMessage: "",
+      });
       return;
     }
     const onEvent = new Channel<SearchEvent>();
     onEvent.onmessage = receive;
     await invoke<void>("search", { query, generateAnswer, onEvent });
   },
+  generationModels: () => isTauri
+    ? invoke<GenerationModel[]>("generation_models")
+    : Promise.resolve(previewModels),
+  importLocalGenerationModel: async (sourcePath: string, displayName: string, select: boolean) => {
+    if (isTauri) {
+      return invoke<GenerationModel>("import_local_generation_model", { sourcePath, displayName, select });
+    }
+    const model: GenerationModel = {
+      id: displayName.toLowerCase().replace(/\W+/g, "-"),
+      displayName,
+      source: "local",
+      repository: "",
+      filename: sourcePath.split(/[\\/]/).pop() ?? "model.gguf",
+      relativePath: sourcePath,
+      contentHash: "preview",
+      byteLength: 2_147_021_472,
+      architecture: "Preview",
+      quantization: "Q4_K_M",
+      contextTokens: 2048,
+      supportsVision: false,
+      active: select,
+    };
+    previewModels = select ? previewModels.map((item) => ({ ...item, active: false })) : previewModels;
+    previewModels = [...previewModels.filter((item) => item.id !== model.id), model];
+    return model;
+  },
+  downloadGenerationModel: async (repository: string, filename: string, displayName: string, select: boolean) => {
+    if (isTauri) {
+      return invoke<GenerationModel>("download_generation_model", { repository, filename, displayName, select });
+    }
+    return api.importLocalGenerationModel(filename, displayName, select);
+  },
+  selectGenerationModel: async (modelId: string) => {
+    if (isTauri) return invoke<GenerationModel>("select_generation_model", { modelId });
+    previewModels = previewModels.map((model) => ({ ...model, active: model.id === modelId }));
+    const selected = previewModels.find((model) => model.active);
+    if (!selected) throw new Error("model not found");
+    return selected;
+  },
+  deleteGenerationModel: async (modelId: string) => {
+    if (isTauri) return invoke<boolean>("delete_generation_model", { modelId });
+    const before = previewModels.length;
+    previewModels = previewModels.filter((model) => model.id !== modelId || model.active);
+    return previewModels.length !== before;
+  },
+  unloadGenerationModel: () => isTauri
+    ? invoke<boolean>("unload_generation_model")
+    : Promise.resolve(true),
 };

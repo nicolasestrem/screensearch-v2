@@ -7,11 +7,16 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+screensearch-domain = { path = "../../crates/domain" }
+screensearch-ipc = { path = "../../crates/ipc" }
 screensearch-model-runtime = { path = "../../crates/model-runtime" }
+screensearch-ports = { path = "../../crates/ports" }
+screensearch-windows = { path = "../../crates/windows" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
-

@@ -14,9 +14,12 @@ use screensearch_ipc::{
     IpcError,
     transport::{DEFAULT_PIPE_NAME, IpcClient},
     v1::{
-        CaptureRequest, DeleteCapturesRequest, GetArchiveSettingsRequest, GetCaptureAssetRequest,
-        HealthRequest, ProcessJobsRequest, RequestEnvelope, SearchRequest, SetCapturePausedRequest,
-        UpdateArchiveSettingsRequest, request_envelope, response_envelope, search_event,
+        CaptureRequest, DeleteCapturesRequest, DeleteGenerationModelRequest,
+        DownloadGenerationModelRequest, GetArchiveSettingsRequest, GetCaptureAssetRequest,
+        HealthRequest, ImportLocalGenerationModelRequest, ListGenerationModelsRequest,
+        ProcessJobsRequest, RequestEnvelope, SearchRequest, SelectGenerationModelRequest,
+        SetCapturePausedRequest, UnloadGenerationModelRequest, UpdateArchiveSettingsRequest,
+        request_envelope, response_envelope, search_event,
     },
 };
 use serde::Serialize;
@@ -98,6 +101,24 @@ struct CaptureAsset {
 }
 
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerationModel {
+    id: String,
+    display_name: String,
+    source: String,
+    repository: String,
+    filename: String,
+    relative_path: String,
+    content_hash: String,
+    byte_length: u64,
+    architecture: String,
+    quantization: String,
+    context_tokens: u32,
+    supports_vision: bool,
+    active: bool,
+}
+
+#[derive(Clone, Serialize)]
 // `rename_all` on a tagged enum renames the variant tags ("citation", …); the per-variant
 // `rename_all_fields` renames the struct-variant fields so the UI receives camelCase keys.
 #[serde(
@@ -127,6 +148,8 @@ enum SearchUiEvent {
     },
     Completed {
         citation_count: u32,
+        answer_status: String,
+        answer_message: String,
     },
 }
 
@@ -359,6 +382,141 @@ async fn capture_asset(capture_id: String) -> Result<CaptureAsset, String> {
 }
 
 #[tauri::command]
+async fn generation_models() -> Result<Vec<GenerationModel>, String> {
+    let responses = request(request_envelope::Body::ListGenerationModels(
+        ListGenerationModelsRequest {},
+    ))
+    .await?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::GenerationModels(result)) => {
+                return Ok(result
+                    .models
+                    .into_iter()
+                    .map(map_generation_model)
+                    .collect());
+            }
+            Some(response_envelope::Body::Error(error)) => return Err(error.message),
+            _ => {}
+        }
+    }
+    Err("daemon returned no generation model list".to_owned())
+}
+
+#[tauri::command]
+async fn import_local_generation_model(
+    source_path: String,
+    display_name: String,
+    select: bool,
+) -> Result<GenerationModel, String> {
+    generation_model_command(request_envelope::Body::ImportLocalGenerationModel(
+        ImportLocalGenerationModelRequest {
+            source_path,
+            display_name,
+            select,
+        },
+    ))
+    .await
+}
+
+#[tauri::command]
+async fn download_generation_model(
+    repository: String,
+    filename: String,
+    display_name: String,
+    select: bool,
+) -> Result<GenerationModel, String> {
+    generation_model_command(request_envelope::Body::DownloadGenerationModel(
+        DownloadGenerationModelRequest {
+            repository,
+            filename,
+            display_name,
+            select,
+        },
+    ))
+    .await
+}
+
+#[tauri::command]
+async fn select_generation_model(model_id: String) -> Result<GenerationModel, String> {
+    generation_model_command(request_envelope::Body::SelectGenerationModel(
+        SelectGenerationModelRequest { model_id },
+    ))
+    .await
+}
+
+#[tauri::command]
+async fn delete_generation_model(model_id: String) -> Result<bool, String> {
+    let responses = request(request_envelope::Body::DeleteGenerationModel(
+        DeleteGenerationModelRequest { model_id },
+    ))
+    .await?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::DeleteGenerationModel(result)) => {
+                return Ok(result.deleted);
+            }
+            Some(response_envelope::Body::Error(error)) => return Err(error.message),
+            _ => {}
+        }
+    }
+    Err("daemon returned no model deletion result".to_owned())
+}
+
+#[tauri::command]
+async fn unload_generation_model() -> Result<bool, String> {
+    let responses = request(request_envelope::Body::UnloadGenerationModel(
+        UnloadGenerationModelRequest {},
+    ))
+    .await?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::UnloadGenerationModel(result)) => {
+                return Ok(result.unloaded);
+            }
+            Some(response_envelope::Body::Error(error)) => return Err(error.message),
+            _ => {}
+        }
+    }
+    Err("daemon returned no model unload result".to_owned())
+}
+
+async fn generation_model_command(body: request_envelope::Body) -> Result<GenerationModel, String> {
+    let responses = request(body).await?;
+    for response in responses {
+        match response.body {
+            Some(response_envelope::Body::GenerationModel(result)) => {
+                let model = result
+                    .model
+                    .ok_or_else(|| "daemon returned an empty generation model".to_owned())?;
+                return Ok(map_generation_model(model));
+            }
+            Some(response_envelope::Body::Error(error)) => return Err(error.message),
+            _ => {}
+        }
+    }
+    Err("daemon returned no generation model".to_owned())
+}
+
+fn map_generation_model(model: screensearch_ipc::v1::GenerationModel) -> GenerationModel {
+    GenerationModel {
+        id: model.id,
+        display_name: model.display_name,
+        source: model.source,
+        repository: model.repository,
+        filename: model.filename,
+        relative_path: model.relative_path,
+        content_hash: model.content_hash,
+        byte_length: model.byte_length,
+        architecture: model.architecture,
+        quantization: model.quantization,
+        context_tokens: model.context_tokens,
+        supports_vision: model.supports_vision,
+        active: model.active,
+    }
+}
+
+#[tauri::command]
 async fn search(
     query: String,
     generate_answer: bool,
@@ -409,6 +567,8 @@ async fn search(
                     Some(search_event::Event::Completed(completed)) => on_event
                         .send(SearchUiEvent::Completed {
                             citation_count: completed.citation_count,
+                            answer_status: completed.answer_status,
+                            answer_message: completed.answer_message,
                         })
                         .map_err(channel_error)?,
                     None => {}
@@ -673,6 +833,12 @@ fn main() {
             archive_settings,
             update_archive_settings,
             delete_all_captures,
+            generation_models,
+            import_local_generation_model,
+            download_generation_model,
+            select_generation_model,
+            delete_generation_model,
+            unload_generation_model,
             search,
             get_shell_settings,
             set_shell_settings
@@ -724,10 +890,15 @@ mod tests {
 
     #[test]
     fn completed_event_serializes_with_camel_case_fields() {
-        let value = serde_json::to_value(SearchUiEvent::Completed { citation_count: 3 })
-            .expect("serialize completed event");
+        let value = serde_json::to_value(SearchUiEvent::Completed {
+            citation_count: 3,
+            answer_status: "answered".to_owned(),
+            answer_message: String::new(),
+        })
+        .expect("serialize completed event");
         assert_eq!(value["kind"], "completed");
         assert_eq!(value["citationCount"], 3);
+        assert_eq!(value["answerStatus"], "answered");
         assert!(value.get("citation_count").is_none());
     }
 }

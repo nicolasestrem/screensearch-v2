@@ -64,6 +64,8 @@ pub mod transport {
 
     /// Default per-user daemon pipe name.
     pub const DEFAULT_PIPE_NAME: &str = r"\\.\pipe\screensearch-v2";
+    /// Default per-user model-worker pipe name.
+    pub const DEFAULT_WORKER_PIPE_NAME: &str = r"\\.\pipe\screensearch-v2-model-worker";
     const MAX_FRAME_LENGTH: usize = 20 * 1024 * 1024;
 
     /// Serves requests until the task is cancelled.
@@ -178,6 +180,59 @@ pub mod transport {
         }
         Err(last_error.unwrap_or_else(|| std::io::Error::other("pipe connection failed")))
     }
+
+    /// A daemon-held lifeline whose closure tells the worker to exit.
+    ///
+    /// While the daemon holds this handle the worker's lifeline read blocks. When the
+    /// daemon process dies the operating system closes the handle, the worker observes
+    /// EOF, and the worker self-exits instead of orphaning and squatting the worker pipe.
+    pub struct WorkerLifeline {
+        _server: NamedPipeServer,
+    }
+
+    /// A lifeline pipe created before the worker is spawned, awaiting its connection.
+    pub struct PendingWorkerLifeline {
+        server: NamedPipeServer,
+    }
+
+    impl PendingWorkerLifeline {
+        /// Waits for the worker to connect its end of the lifeline.
+        pub async fn accept(self) -> Result<WorkerLifeline, IpcError> {
+            self.server.connect().await?;
+            Ok(WorkerLifeline {
+                _server: self.server,
+            })
+        }
+    }
+
+    /// Creates a per-instance lifeline pipe; call before spawning the worker.
+    ///
+    /// The pipe name is unique per daemon instance, so additional instances are allowed
+    /// (`first_pipe_instance(false)`): on restart a fresh lifeline is created while the
+    /// previous one is still held, and exclusivity is unnecessary.
+    pub fn create_worker_lifeline(pipe_name: &str) -> Result<PendingWorkerLifeline, IpcError> {
+        let server = ServerOptions::new()
+            .first_pipe_instance(false)
+            .create(pipe_name)?;
+        Ok(PendingWorkerLifeline { server })
+    }
+
+    /// Watches a daemon lifeline and resolves once the daemon closes it.
+    ///
+    /// Used by the worker: the future resolves on EOF or a broken pipe, both of which
+    /// mean the parent daemon is gone and the worker should exit.
+    pub async fn watch_worker_lifeline(pipe_name: &str) -> Result<(), IpcError> {
+        use tokio::io::AsyncReadExt;
+
+        let mut client = connect_with_retry(pipe_name).await?;
+        let mut buffer = [0_u8; 1];
+        loop {
+            match client.read(&mut buffer).await {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(_) => {}
+            }
+        }
+    }
 }
 
 /// Non-Windows transport stubs that keep contract crates buildable for documentation tools.
@@ -187,6 +242,8 @@ pub mod transport {
 
     /// Symbolic pipe name used only for shared configuration.
     pub const DEFAULT_PIPE_NAME: &str = "screensearch-v2";
+    /// Symbolic worker pipe name used only for shared configuration.
+    pub const DEFAULT_WORKER_PIPE_NAME: &str = "screensearch-v2-model-worker";
 
     /// Reports that the bootstrap transport is Windows-only.
     pub async fn serve(_pipe_name: &str, _handler: SharedHandler) -> Result<(), IpcError> {
@@ -227,6 +284,35 @@ pub mod transport {
                 "V2 bootstrap supports Windows named pipes only".to_owned(),
             ))
         }
+    }
+
+    /// Lifeline placeholder for non-Windows documentation builds.
+    pub struct WorkerLifeline;
+
+    /// Pending lifeline placeholder for non-Windows documentation builds.
+    pub struct PendingWorkerLifeline;
+
+    impl PendingWorkerLifeline {
+        /// Reports that the bootstrap transport is Windows-only.
+        pub async fn accept(self) -> Result<WorkerLifeline, IpcError> {
+            Err(IpcError::Unsupported(
+                "V2 bootstrap supports Windows named pipes only".to_owned(),
+            ))
+        }
+    }
+
+    /// Reports that the bootstrap transport is Windows-only.
+    pub fn create_worker_lifeline(_pipe_name: &str) -> Result<PendingWorkerLifeline, IpcError> {
+        Err(IpcError::Unsupported(
+            "V2 bootstrap supports Windows named pipes only".to_owned(),
+        ))
+    }
+
+    /// Reports that the bootstrap transport is Windows-only.
+    pub async fn watch_worker_lifeline(_pipe_name: &str) -> Result<(), IpcError> {
+        Err(IpcError::Unsupported(
+            "V2 bootstrap supports Windows named pipes only".to_owned(),
+        ))
     }
 }
 

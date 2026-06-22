@@ -47,6 +47,7 @@ These are `#[ignore]`d and require explicit opt-in:
 
 - `crates/persistence/tests/synthetic_scale.rs` — set `SCREENSEARCH_RUN_SCALE_BENCH=1` (optionally `SCREENSEARCH_SCALE_ROWS`). Long-running 10M-row benchmark.
 - `crates/persistence/tests/live_windows_archive.rs` — needs a populated `SCREENSEARCH_DATA_DIR` and local model cache; optional `SCREENSEARCH_SMOKE_QUERY`.
+- `apps/daemon/tests/worker_supervision.rs` — set `SCREENSEARCH_RUN_WORKER_IT=1` and first build the worker (`cargo build -p screensearch-model-worker`). Spawns the real model worker to exercise readiness, the parent lifeline, kill→restart recovery, cancellation, and idle unload. Generation cases also need `SCREENSEARCH_TEST_GGUF` (a path to a local `.gguf`) and skip cleanly if it is unset.
 
 ## Architecture
 

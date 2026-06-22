@@ -14,6 +14,17 @@ message RequestEnvelope {
     GetArchiveSettingsRequest get_archive_settings = 16;
     UpdateArchiveSettingsRequest update_archive_settings = 17;
     DeleteCapturesRequest delete_captures = 18;
+    ListGenerationModelsRequest list_generation_models = 19;
+    ImportLocalGenerationModelRequest import_local_generation_model = 20;
+    DownloadGenerationModelRequest download_generation_model = 21;
+    SelectGenerationModelRequest select_generation_model = 22;
+    DeleteGenerationModelRequest delete_generation_model = 23;
+    UnloadGenerationModelRequest unload_generation_model = 24;
+    WorkerHealthRequest worker_health = 100;
+    WorkerOcrRequest worker_ocr = 101;
+    WorkerEmbeddingRequest worker_embedding = 102;
+    WorkerGenerationRequest worker_generation = 103;
+    WorkerUnloadRequest worker_unload = 104;
   }
 }
 
@@ -31,6 +42,15 @@ message ResponseEnvelope {
     ArchiveSettingsResponse archive_settings = 17;
     UpdateArchiveSettingsResponse update_archive_settings = 18;
     DeleteCapturesResponse delete_captures = 19;
+    GenerationModelsResponse generation_models = 20;
+    GenerationModelResponse generation_model = 21;
+    DeleteGenerationModelResponse delete_generation_model = 22;
+    UnloadGenerationModelResponse unload_generation_model = 23;
+    WorkerHealthResponse worker_health = 100;
+    WorkerOcrResponse worker_ocr = 101;
+    WorkerEmbeddingResponse worker_embedding = 102;
+    WorkerGenerationEvent worker_generation = 103;
+    WorkerUnloadResponse worker_unload = 104;
   }
 }
 
@@ -165,10 +185,128 @@ message Token {
 
 message SearchCompleted {
   uint32 citation_count = 1;
+  string answer_status = 2;
+  string answer_message = 3;
 }
 
 message ErrorResponse {
   string code = 1;
   string message = 2;
   bool retryable = 3;
+}
+
+message ListGenerationModelsRequest {}
+
+message ImportLocalGenerationModelRequest {
+  string source_path = 1;
+  string display_name = 2;
+  bool select = 3;
+}
+
+message DownloadGenerationModelRequest {
+  string repository = 1;
+  string filename = 2;
+  string display_name = 3;
+  bool select = 4;
+}
+
+message SelectGenerationModelRequest {
+  string model_id = 1;
+}
+
+message DeleteGenerationModelRequest {
+  string model_id = 1;
+}
+
+message UnloadGenerationModelRequest {}
+
+message GenerationModelsResponse {
+  repeated GenerationModel models = 1;
+}
+
+message GenerationModelResponse {
+  GenerationModel model = 1;
+}
+
+message DeleteGenerationModelResponse {
+  bool deleted = 1;
+}
+
+message UnloadGenerationModelResponse {
+  bool unloaded = 1;
+}
+
+message GenerationModel {
+  string id = 1;
+  string display_name = 2;
+  string source = 3;
+  string repository = 4;
+  string filename = 5;
+  string relative_path = 6;
+  string content_hash = 7;
+  uint64 byte_length = 8;
+  string architecture = 9;
+  string quantization = 10;
+  uint32 context_tokens = 11;
+  bool supports_vision = 12;
+  bool active = 13;
+}
+
+message WorkerHealthRequest {}
+
+message WorkerHealthResponse {
+  string status = 1;
+  string active_generation_model_id = 2;
+  bool generation_loaded = 3;
+}
+
+message WorkerOcrRequest {
+  string asset_relative_path = 1;
+  string media_type = 2;
+}
+
+message WorkerOcrResponse {
+  string model_id = 1;
+  repeated WorkerOcrBlock blocks = 2;
+}
+
+message WorkerOcrBlock {
+  uint32 reading_order = 1;
+  NormalizedRect bounds = 2;
+  string text = 3;
+  optional float confidence = 4;
+  string language = 5;
+}
+
+message WorkerEmbeddingRequest {
+  string text = 1;
+}
+
+message WorkerEmbeddingResponse {
+  string model_id = 1;
+  uint32 dimensions = 2;
+  repeated float vector = 3;
+}
+
+message WorkerGenerationRequest {
+  string model_id = 1;
+  string model_relative_path = 2;
+  string prompt = 3;
+}
+
+message WorkerGenerationEvent {
+  oneof event {
+    Token token = 1;
+    WorkerGenerationCompleted completed = 2;
+  }
+}
+
+message WorkerGenerationCompleted {
+  string status = 1;
+}
+
+message WorkerUnloadRequest {}
+
+message WorkerUnloadResponse {
+  bool unloaded = 1;
 }

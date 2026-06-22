@@ -218,9 +218,9 @@ dd { min-width: 0; margin: 0; overflow: hidden; color: #d0cfca; text-overflow: e
 .settings-field > span { display: flex; flex-direction: column; gap: 4px; }
 .settings-field strong, .danger-zone strong { font-size: 12px; }
 .settings-field small, .danger-zone small { color: #8f908b; font-size: 10.5px; line-height: 1.45; }
-.settings-field textarea, .settings-field select { width: 100%; border: 1px solid #41433f; border-radius: 5px; color: var(--text); background: #151616; font: inherit; }
+.settings-field textarea, .settings-field select, .settings-field input { width: 100%; border: 1px solid #41433f; border-radius: 5px; color: var(--text); background: #151616; font: inherit; }
 .settings-field textarea { min-height: 66px; resize: vertical; padding: 9px 10px; font-size: 11px; line-height: 1.45; }
-.settings-field select { height: 34px; padding: 0 9px; font-size: 11px; }
+.settings-field select, .settings-field input { height: 34px; padding: 0 9px; font-size: 11px; }
 .settings-field.compact { grid-template-columns: minmax(0, 1fr) 190px; align-items: center; gap: 20px; }
 .storage-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; margin: 10px 0 2px; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--line); }
 .storage-summary span { display: flex; padding: 12px; flex-direction: column; gap: 3px; background: #20211f; }
@@ -228,6 +228,23 @@ dd { min-width: 0; margin: 0; overflow: hidden; color: #d0cfca; text-overflow: e
 .storage-summary small { color: #888a85; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
 .modal-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line-soft); padding: 11px 2px 13px; }
 .modal-actions span { color: #8f908b; font-size: 10.5px; }
+.model-settings { display: grid; gap: 13px; border-top: 1px solid var(--line-soft); padding-top: 14px; }
+.model-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 2px 2px; }
+.model-heading > span, .model-source-heading { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.model-heading strong, .model-source-heading strong { font-size: 12px; }
+.model-heading small, .model-source-heading small { color: #8f908b; font-size: 10.5px; line-height: 1.45; }
+.model-source-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.model-source { display: grid; min-width: 0; align-content: start; gap: 9px; border-top: 1px solid var(--line-soft); padding-top: 12px; }
+.model-source label { display: grid; min-width: 0; gap: 5px; }
+.model-source label span { color: #9a9b95; font-size: 10.5px; }
+.model-source input { width: 100%; min-width: 0; height: 34px; border: 1px solid #41433f; border-radius: 5px; padding: 0 9px; color: var(--text); background: #151616; font: inherit; font-size: 11px; }
+.model-source button { justify-self: end; }
+.model-list { display: grid; gap: 8px; padding: 2px 0 12px; }
+.model-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--line-soft); border-radius: 6px; padding: 10px; background: #171817; }
+.model-row > span { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.model-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; }
+.model-row small { color: #8f908b; font-size: 10px; }
+.model-row > div { display: flex; flex: 0 0 auto; gap: 7px; }
 .danger-zone { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-top: 12px; border: 1px solid #553636; border-radius: 6px; padding: 12px; background: #241919; }
 .danger-zone > span { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
 .danger-zone > div { display: flex; gap: 7px; flex: 0 0 auto; }
@@ -237,6 +254,9 @@ dd { min-width: 0; margin: 0; overflow: hidden; color: #d0cfca; text-overflow: e
 @media (max-width: 620px) {
   .settings-field.compact { grid-template-columns: 1fr; gap: 8px; }
   .danger-zone, .modal-actions { align-items: stretch; flex-direction: column; }
+  .model-source-grid { grid-template-columns: 1fr; }
+  .model-heading, .model-row { align-items: stretch; flex-direction: column; }
+  .model-source button, .model-row > div { justify-self: stretch; justify-content: flex-end; }
 }
 .state-pill { border: 1px solid #31583f; border-radius: 999px; padding: 4px 8px; color: var(--green); background: #17231b; font-size: 10px; }
 .state-pill.paused { border-color: #675a33; color: var(--accent); background: #29251a; }
