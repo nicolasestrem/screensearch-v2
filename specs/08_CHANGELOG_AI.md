@@ -297,3 +297,22 @@ Items 15 and 16 remain open until the branch compiles cleanly, the model-worker 
 ### Remaining boundary
 
 Items 15 and 16 **stay open**. Closing them additionally requires a live-Windows GGUF benchmark of a selected candidate model (the harness exists; candidate measurements are pending), the GAP-002/GAP-003 model/licensing decisions, and the memory-pressure unload path (GAP-008). The gated worker-supervision tests must also be run on Windows with a test GGUF to confirm the runtime end to end.
+
+## 2026-06-22 — PR #6 review follow-ups (model-management polish)
+
+### Changed
+
+- **Deleting a model now removes its directory too.** `delete_generation_model` removed the GGUF file but left the empty `{model_root}/{model_id}/` directory behind to accumulate. It now best-effort-removes the parent directory after the file delete (ignoring `NotFound`; a still-populated or busy directory is logged content-free and left in place rather than failing the delete).
+- **Hugging Face downloads reject HTML/error pages.** `download_and_hash` now checks the response `Content-Type` and bails with a clear message when the server returns a `text/*` page (e.g. a gated-model authentication wall) instead of writing a bogus file that would only fail later with an opaque "invalid GGUF magic" error. `error_for_status()` already rejected explicit 401/403 responses; this closes the 200-with-HTML case.
+
+### Not changed (reviewed and intentionally left)
+
+- **`context_tokens = 2048`** is correct as stored: the domain field is documented as "context window *configured for evaluation*", and the worker's llama.cpp context is a fixed conservative `n_ctx = 2048` with a `1792`-token prompt cap. The stored value matches the effective runtime context, so it is truthful rather than a fabricated capability. Reading the model's GGUF-declared `context_length` and raising the evaluation window is tracked as a follow-up (see patch plan).
+- **Import/download progress feedback** and **a Hugging Face `revision` pin / gated-model token auth** are deferred: both require additive IPC contract plus Tauri/UI plumbing (progress) or a wire/UI argument (revision/token) and are larger than this review-fix pass. Recorded in the patch plan; revision/auth ties to GAP-003. Provenance is already captured today via the stored BLAKE3 `content_hash`.
+
+### Verification evidence
+
+- `cargo fmt --check` — clean (exit 0).
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean (exit 0).
+- `cargo test --workspace` — 52 passed, 0 failed, 7 ignored (unchanged; the two fixes are in daemon binary helpers that touch the filesystem/network and are not unit-testable in CI).
+- `npm run lint` and `npm run build` (`apps/desktop`) — clean (exit 0); no desktop code changed.

@@ -1103,11 +1103,20 @@ async fn delete_generation_model(
     else {
         return Ok(false);
     };
-    let path = model_root.join(model.relative_path);
-    match tokio::fs::remove_file(path).await {
+    let path = model_root.join(&model.relative_path);
+    match tokio::fs::remove_file(&path).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
+    }
+    // Best-effort cleanup of the now-empty per-model directory (`{model_root}/{model_id}/`);
+    // a still-populated or busy directory is left in place rather than failing the delete.
+    if let Some(parent) = path.parent() {
+        match tokio::fs::remove_dir(parent).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(error = %error, "left model directory in place after delete"),
+        }
     }
     Ok(true)
 }
@@ -1204,6 +1213,19 @@ async fn copy_to_temporary_and_hash(
 
 async fn download_and_hash(url: &str, temporary: &Path) -> Result<(u64, String), anyhow::Error> {
     let mut response = reqwest::get(url).await?.error_for_status()?;
+    // Reject HTML/text error pages (for example a gated-model authentication wall) before
+    // writing a bogus file that would only fail later when llama.cpp rejects the GGUF magic.
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if content_type.starts_with("text/") {
+        anyhow::bail!(
+            "model download returned a \"{content_type}\" page instead of a model file; the model may require Hugging Face authentication or may not exist"
+        );
+    }
     let mut output = tokio::fs::File::create(temporary).await?;
     let mut hasher = blake3::Hasher::new();
     let mut byte_length = 0_u64;
