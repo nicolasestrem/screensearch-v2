@@ -75,24 +75,16 @@ resident model.
 
 ## GPU Offload Note
 
-GGUF generation now supports an opt-in Vulkan worker build:
+GGUF generation now prefers a prebuilt llama.cpp Windows Vulkan sidecar instead of requiring a local Vulkan SDK Cargo build. On first Windows generation, the worker reuses an installed sidecar under the ScreenSearch data directory, honors `SSV2C_LLAMA_RELEASE_URL` when set to a `ggml-org/llama.cpp` release URL, or selects the newest recent release with a `*-bin-win-vulkan-x64.zip` asset. Temporarily incomplete latest releases are skipped.
 
 ```powershell
-cargo build -p screensearch-model-worker --features gpu-vulkan
+$env:SSV2C_LLAMA_RELEASE_URL = "https://github.com/ggml-org/llama.cpp/releases/tag/<tag>" # optional
+cargo build -p screensearch-model-worker
 ```
 
-At runtime the worker asks llama.cpp whether GPU offload is supported. If supported, it requests full
-layer offload for the selected GGUF; if the binary, driver, or device cannot support offload, it uses
-the CPU path. Local verification of the Vulkan build is blocked on this machine because the Vulkan
-SDK is not installed:
+The sidecar `llama-cli.exe` is invoked with full GPU layer offload, a 4096-token context, the current physical-core thread count, deterministic greedy-equivalent sampling, and the same generation token cap as the embedded provider. Sidecar downloads use temporary files and staging directories, enforce a download byte cap before writing indefinitely, and reject zip entries if they escape the staging root. During generation, stdout is held only until the llama-cli transcript prompt boundary is recognized; answer text then streams incrementally while the trailing `Exiting...` marker is retained and stripped. Ambiguous transcript output is rejected before any answer text reaches the UI. If sidecar acquisition, execution, or stdout sanitization fails before emitting answer text, diagnostics stay content-free and generation falls back to the embedded CPU provider so evidence search still works.
 
-```text
-Please install Vulkan SDK and ensure that VULKAN_SDK env variable is set: NotPresent
-```
-
-The table above therefore remains a CPU baseline. Rerun the benchmark and gated worker suite with
-the Vulkan-enabled worker before comparing GPU latency or selecting a release default on GPU-capable
-hardware.
+The table above remains a CPU baseline. Rerun the benchmark and gated worker suite on GPU-capable hardware before comparing GPU latency or selecting a release default. The `gpu-vulkan` Cargo feature remains available for advanced local-build experiments, but it is no longer the normal GPU acceleration path and still requires the Vulkan SDK on the build machine.
 
 ## Engineering Recommendation
 

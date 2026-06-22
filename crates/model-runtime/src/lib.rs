@@ -1,5 +1,7 @@
 //! Local model providers and deterministic test doubles.
 
+pub mod llama_sidecar;
+
 use std::{
     num::NonZeroU32,
     path::PathBuf,

@@ -37,13 +37,14 @@ cargo run -p screensearch-daemon
 
 `cargo run -p screensearch-daemon` does not automatically build sibling workspace binaries. Build `screensearch-model-worker` first when running from source; packaged builds must place the worker executable beside the daemon.
 
-GGUF generation can use GPU acceleration when the worker is built with the opt-in Vulkan backend:
+GGUF generation uses the prebuilt llama.cpp Windows Vulkan sidecar as the preferred GPU path. The worker installs it under the ScreenSearch data directory on first use, reuses the installed sidecar afterward, and falls back to the embedded CPU provider if sidecar acquisition, execution, or stdout sanitization fails. Sidecar lifecycle logs report only content-free metadata such as timing, byte counts, and failure category; prompts, model paths, captures, and llama-cli transcripts are not logged or shown as answer text. Once the llama-cli transcript prompt boundary is recognized, answer text streams incrementally.
 
 ```powershell
-cargo build -p screensearch-model-worker --features gpu-vulkan
+$env:SSV2C_LLAMA_RELEASE_URL = "https://github.com/ggml-org/llama.cpp/releases/tag/<tag>" # optional pinned release
+cargo build -p screensearch-model-worker
 ```
 
-The worker checks llama.cpp GPU offload support at runtime and requests full layer offload when a compatible GPU backend is available; otherwise it falls back to CPU execution. Vulkan-enabled builds require the Vulkan SDK and runtime on the build machine.
+When no override is set, the worker queries recent `ggml-org/llama.cpp` releases and picks the newest release carrying a `*-bin-win-vulkan-x64.zip` asset, skipping temporarily incomplete releases. When `SSV2C_LLAMA_RELEASE_URL` is set, the installed sidecar is reused only if its recorded release tag matches the requested tag. The old `gpu-vulkan` Cargo feature still exists for advanced local llama.cpp builds, but it is no longer the expected GPU acceleration path and still requires the Vulkan SDK on the build machine.
 
 The current vertical slice automatically captures the focused monitor, runs Windows Media OCR, produces local quantized MiniLM embeddings, and returns screenshot-backed hybrid-search evidence. Deterministic providers are test-only; optional answer generation uses a selected local GGUF model imported from disk, downloaded explicitly from Hugging Face, or discovered from packaged resources.
 

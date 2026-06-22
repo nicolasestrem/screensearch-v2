@@ -193,6 +193,36 @@ export function App() {
     if (query.trim()) search.mutate({ value: query.trim(), generateAnswer: false });
   }
 
+  function showRecentEvidence() {
+    setDateFilter("any");
+    setApplicationFilter("all");
+    const newest = citations[0];
+    if (!newest) {
+      searchInput.current?.focus();
+      searchInput.current?.select();
+      return;
+    }
+    setSelectedId(newest.chunkId);
+    setDetailTab("metadata");
+    requestAnimationFrame(() => {
+      document.querySelector(".timeline-pane")?.scrollTo({ top: 0, behavior: "smooth" });
+      itemRefs.current.get(newest.chunkId)?.focus();
+    });
+  }
+
+  function showVisualEvidence() {
+    if (!selected) {
+      searchInput.current?.focus();
+      searchInput.current?.select();
+      return;
+    }
+    setSelectedId(selected.chunkId);
+    setDetailTab("source");
+    requestAnimationFrame(() => {
+      document.querySelector(".detail-pane")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    });
+  }
+
   function openModal(name: Exclude<ModalName, null>) {
     lastFocus.current = document.activeElement as HTMLElement | null;
     setModal(name);
@@ -254,8 +284,8 @@ export function App() {
       <div className="work-area">
         <nav className="rail" aria-label="Primary navigation">
           <IconButton label="Search" active onClick={() => searchInput.current?.focus()}><MagnifyingGlass /></IconButton>
-          <IconButton label="Recent evidence" onClick={() => document.querySelector(".timeline-pane")?.scrollTo({ top: 0, behavior: "smooth" })}><ClockCounterClockwise /></IconButton>
-          <IconButton label="Visual evidence" onClick={() => selected && setSelectedId(selected.chunkId)}><ImageSquare /></IconButton>
+          <IconButton label="Recent evidence" onClick={showRecentEvidence}><ClockCounterClockwise /></IconButton>
+          <IconButton label="Visual evidence" onClick={showVisualEvidence}><ImageSquare /></IconButton>
           <span className="rail-spacer" />
           <IconButton label="Privacy and exclusions" onClick={() => openModal("privacy")}><ShieldCheck /></IconButton>
         </nav>
