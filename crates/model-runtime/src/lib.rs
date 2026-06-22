@@ -218,6 +218,8 @@ pub const GENERATION_CONTEXT_TOKENS: u32 = 4_096;
 /// still reach an answer; the wall-clock deadline remains the real bound.
 const MAX_GENERATED_TOKENS: usize = 768;
 
+const FULL_GPU_LAYER_OFFLOAD: u32 = i32::MAX as u32;
+
 /// Picks the CPU thread budget for llama.cpp inference.
 ///
 /// Local generation is memory-bandwidth bound, so physical cores outperform SMT
@@ -225,6 +227,25 @@ const MAX_GENERATED_TOKENS: usize = 768;
 /// generation crawling (and appearing frozen) on multi-core machines.
 fn cpu_thread_budget() -> i32 {
     i32::try_from(num_cpus::get_physical().max(1)).unwrap_or(1)
+}
+
+/// Builds model-loading parameters for the available llama.cpp backend.
+///
+/// GPU offload is opportunistic: binaries built without a GPU backend, machines
+/// without a supported device, or missing runtime drivers stay on CPU. When a
+/// supported GPU backend is available, request full layer offload and let
+/// llama.cpp choose the exact feasible placement for the model and device.
+fn model_params_for_available_hardware(
+    gpu_offload_supported: bool,
+) -> (LlamaModelParams, &'static str) {
+    if gpu_offload_supported {
+        (
+            LlamaModelParams::default().with_n_gpu_layers(FULL_GPU_LAYER_OFFLOAD),
+            "gpu",
+        )
+    } else {
+        (LlamaModelParams::default().with_n_gpu_layers(0), "cpu")
+    }
 }
 
 /// Local GGUF generator backed by llama.cpp.
@@ -306,10 +327,16 @@ fn load_model(model_path: &std::path::Path) -> Result<LoadedLlamaModel, PortErro
     let load_started = Instant::now();
     let backend = LlamaBackend::init()
         .map_err(|error| PortError::Internal(format!("initialize llama.cpp: {error}")))?;
-    let model = LlamaModel::load_from_file(&backend, model_path, &LlamaModelParams::default())
+    let gpu_offload_supported = backend.supports_gpu_offload();
+    let (model_params, inference_backend) =
+        model_params_for_available_hardware(gpu_offload_supported);
+    let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
         .map_err(|error| PortError::Unavailable(format!("load local GGUF model: {error}")))?;
     info!(
         load_ms = u64::try_from(load_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        gpu_offload_supported,
+        n_gpu_layers = model_params.n_gpu_layers(),
+        inference_backend,
         "loaded local GGUF generation model"
     );
     Ok(LoadedLlamaModel { backend, model })
@@ -489,7 +516,10 @@ mod tests {
     use llama_cpp_2::token::LlamaToken;
     use screensearch_ports::EmbeddingEngine;
 
-    use super::{FakeEmbeddingEngine, dedupe_leading_bos, should_stop_generation};
+    use super::{
+        FULL_GPU_LAYER_OFFLOAD, FakeEmbeddingEngine, dedupe_leading_bos,
+        model_params_for_available_hardware, should_stop_generation,
+    };
 
     #[tokio::test]
     async fn fake_embeddings_are_normalized_and_fixed_width() {
@@ -515,6 +545,23 @@ mod tests {
             deadline,
             start + Duration::from_secs(121)
         ));
+    }
+
+    #[test]
+    fn model_params_offload_all_layers_when_gpu_is_available() {
+        let (params, backend) = model_params_for_available_hardware(true);
+
+        assert_eq!(FULL_GPU_LAYER_OFFLOAD, i32::MAX as u32);
+        assert_eq!(backend, "gpu");
+        assert_eq!(params.n_gpu_layers(), i32::MAX);
+    }
+
+    #[test]
+    fn model_params_leave_gpu_layers_at_zero_for_cpu_fallback() {
+        let (params, backend) = model_params_for_available_hardware(false);
+
+        assert_eq!(backend, "cpu");
+        assert_eq!(params.n_gpu_layers(), 0);
     }
 
     #[test]

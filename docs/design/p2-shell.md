@@ -163,32 +163,32 @@ npm run tauri dev
 
 Checklist (tick each; expected result in parentheses):
 
-- [ ] Tray icon appears; hovering shows a tooltip with live state and queue depth
+- [x] Tray icon appears; hovering shows a tooltip with live state and queue depth
       (`ScreenSearch V2 — Capturing · N queued`).
-- [ ] Click the in-window **Pause capture**; within ~3 s the tray tooltip/status shows `Paused`
+- [x] Click the in-window **Pause capture**; within ~3 s the tray tooltip/status shows `Paused`
       and the tray menu item reads **Resume capture**. Resume flips both back.
-- [ ] Tray **Pause capture** toggles the in-window capture-state pill to *Paused*; **Resume
+- [x] Tray **Pause capture** toggles the in-window capture-state pill to *Paused*; **Resume
       capture** flips it back. (Tray and window control the same daemon policy.)
-- [ ] Left-click the tray icon and the **Open ScreenSearch** menu item both un-hide and focus the
+- [x] Left-click the tray icon and the **Open ScreenSearch** menu item both un-hide and focus the
       window.
-- [ ] Tray **Quit ScreenSearch** exits the shell **only** — terminal 1 shows the daemon still
+- [x] Tray **Quit ScreenSearch** exits the shell **only** — terminal 1 shows the daemon still
       running (capture continues).
-- [ ] Click the window **X**: the window hides (no exit); re-open it from the tray.
-- [ ] With the window hidden or behind another app, press **Ctrl+Shift+Space**: the window comes
+- [x] Click the window **X**: the window hides (no exit); re-open it from the tray.
+- [x] With the window hidden or behind another app, press **Ctrl+Shift+Space**: the window comes
       to the front, focused, with the search field focused and its text selected.
-- [ ] Settings → **Summon shortcut**: record a new combo (e.g. Ctrl+Shift+J). The old combo no
+- [x] Settings → **Summon shortcut**: record a new combo (e.g. Ctrl+Shift+J). The old combo no
       longer summons; the new one does, immediately. Restart the shell → the new hotkey persists
       (`%APPDATA%\com.screensearch.v2\shell-settings.json`).
-- [ ] Record a combination the OS already owns (or an invalid one): Settings shows an error and
+- [x] Record a combination the OS already owns (or an invalid one): Settings shows an error and
       the app stays stable with the previous hotkey active.
-- [ ] Stop the daemon (Ctrl+C in terminal 1): the tray tooltip becomes
+- [x] Stop the daemon (Ctrl+C in terminal 1): the tray tooltip becomes
       `ScreenSearch V2 — Daemon offline`; the shell stays alive and the window still opens.
 
 Record the outcome below when complete:
 
 ```
-manual windows e2e result: <pending>
-tested by: <name>   date: <yyyy-mm-dd>   build: <git short sha>
+manual windows e2e result: passed
+tested by: user-attested   date: 2026-06-22   build: 1d88405
 ```
 
 ## Troubleshooting

@@ -1,6 +1,6 @@
 # P3 Model Selection Baseline
 
-Status: implementation scaffold added; measurements pending.
+Status: local text-only smoke measurements recorded; release model selection still open.
 
 ## Goal
 
@@ -49,18 +49,69 @@ Candidate HF entries to import through the app:
 - Long evidence context near budget
 - Required capture-ID citation formatting
 
-## Pending Measurements
+## 2026-06-22 Local Text-Only Smoke Pass
 
-Record for each model:
+This pass validates the default CPU llama.cpp build and supervised worker plumbing against two
+ignored repo-local Q4 candidates. It does not select a release default: GAP-002/GAP-003 still own
+release model approval and packaging policy, and GAP-008 still owns the memory-pressure unload
+signal. Hashes below are SHA-256 because `b3sum` was not installed in the test environment.
 
-- file name, hash, size, quantization, source
-- load time
-- first-token latency
-- full-answer latency
-- tokens per second
-- peak working set
-- unload result
-- pass/fail for every required prompt case
+| Model | Size | SHA-256 | Benchmark output |
+|---|---:|---|---|
+| `Ministral-3-3B-Reasoning-2512-Q4_K_M.gguf` | 2,147,021,472 bytes | `7e9516cc01a039bb3e2d41227cdf388849bc1c942c4624c84567b1684cd9c0fc` | `model_benchmark path=.\models\Ministral-3-3B-Reasoning-2512-Q4_K_M.gguf duration_ms=5641 token_pieces=49 status=ok` |
+| `NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf` | 2,837,072,864 bytes | `be5d9a656a51922f24f1f09a759cebb694e1f5d9728bf0ef9f8c972c5a0b5ef2` | `model_benchmark path=.\models\NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf duration_ms=7338 token_pieces=38 status=ok` |
+
+Worker validation passed for both candidates with:
+
+```powershell
+$env:SCREENSEARCH_RUN_WORKER_IT = "1"
+$env:SCREENSEARCH_TEST_GGUF = (Resolve-Path ".\models\<candidate>.gguf").Path
+cargo test -p screensearch-daemon --test worker_supervision -- --ignored --nocapture
+```
+
+Each run passed all five live cases: readiness plus lifeline exit, kill-then-restart recovery,
+generation after restart, cancellation keeping health responsive, and raw idle unload releasing the
+resident model.
+
+## GPU Offload Note
+
+GGUF generation now supports an opt-in Vulkan worker build:
+
+```powershell
+cargo build -p screensearch-model-worker --features gpu-vulkan
+```
+
+At runtime the worker asks llama.cpp whether GPU offload is supported. If supported, it requests full
+layer offload for the selected GGUF; if the binary, driver, or device cannot support offload, it uses
+the CPU path. Local verification of the Vulkan build is blocked on this machine because the Vulkan
+SDK is not installed:
+
+```text
+Please install Vulkan SDK and ensure that VULKAN_SDK env variable is set: NotPresent
+```
+
+The table above therefore remains a CPU baseline. Rerun the benchmark and gated worker suite with
+the Vulkan-enabled worker before comparing GPU latency or selecting a release default on GPU-capable
+hardware.
+
+## Engineering Recommendation
+
+Keep both candidates in the development pool. `Ministral-3-3B-Reasoning-2512-Q4_K_M.gguf` is the
+faster smoke benchmark in this run, while `NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf` remains a useful
+hybrid-architecture comparison point. Do not choose a release default yet: the benchmark harness only
+proves load/generate/unload plumbing and does not score the required groundedness, no-evidence,
+conflicting-evidence, prompt-injection, or citation-format cases. GPU-capable machines may also
+change relative latency once the Vulkan build is available.
+
+## Remaining Measurements
+
+Before item 15 can close, record for the candidate that product/legal approve:
+
+- load time, first-token latency, full-answer latency, tokens per second, peak working set, and
+  unload result from a release-like run, including GPU backend status where applicable;
+- pass/fail notes for every required prompt case listed above;
+- the chosen model acquisition mode and release provenance from GAP-002/GAP-003;
+- the Windows memory-pressure unload policy from GAP-008.
 
 ## Development Run Note
 

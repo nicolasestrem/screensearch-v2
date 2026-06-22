@@ -37,6 +37,14 @@ cargo run -p screensearch-daemon
 
 `cargo run -p screensearch-daemon` does not automatically build sibling workspace binaries. Build `screensearch-model-worker` first when running from source; packaged builds must place the worker executable beside the daemon.
 
+GGUF generation can use GPU acceleration when the worker is built with the opt-in Vulkan backend:
+
+```powershell
+cargo build -p screensearch-model-worker --features gpu-vulkan
+```
+
+The worker checks llama.cpp GPU offload support at runtime and requests full layer offload when a compatible GPU backend is available; otherwise it falls back to CPU execution. Vulkan-enabled builds require the Vulkan SDK and runtime on the build machine.
+
 The current vertical slice automatically captures the focused monitor, runs Windows Media OCR, produces local quantized MiniLM embeddings, and returns screenshot-backed hybrid-search evidence. Deterministic providers are test-only; optional answer generation uses a selected local GGUF model imported from disk, downloaded explicitly from Hugging Face, or discovered from packaged resources.
 
 The desktop uses the selected **Memory Timeline** interface: search and filters lead to chronologically grouped screenshot evidence, positioned OCR highlights, provenance, and an optional cited answer. Automatic capture can be paused and resumed through a durable daemon control, with retention, storage budget, and application exclusions configured through local privacy/settings controls.

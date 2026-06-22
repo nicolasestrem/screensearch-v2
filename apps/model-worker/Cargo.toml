@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+gpu-vulkan = ["screensearch-model-runtime/gpu-vulkan"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

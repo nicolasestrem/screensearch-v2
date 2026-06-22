@@ -2,6 +2,45 @@
 
 This log records meaningful AI-assisted repository changes and their reasons. It is not a substitute for Git history.
 
+## 2026-06-22 — PR #10 review follow-up
+
+### Changed
+
+- Replaced the GGUF GPU offload request sentinel with an explicit `i32::MAX as u32` constant so full layer offload no longer relies on `llama-cpp-2` clamping an overflowing `u32::MAX` input.
+- Added a unit assertion documenting the representable offload limit used by `LlamaModelParams::with_n_gpu_layers`.
+- Corrected stale Claude guidance so future changes update `CHANGELOG.md` and `specs/08_CHANGELOG_AI.md` when each is relevant.
+
+### Why
+
+PR #10 review identified that `u32::MAX` worked only because the current dependency clamps it internally. Passing the largest value the API can represent directly is clearer and avoids a future runtime panic if the dependency changes its conversion behavior.
+
+## 2026-06-22 — P2/P3 validation closeout
+
+### Changed
+
+- Closed patch-plan item 14 from user-attested manual Windows verification of the native tray, pause/resume, hide-to-tray, global summon hotkey, hotkey persistence, tray Quit, and daemon-offline behavior.
+- Ran local text-only GGUF smoke benchmarks against `Ministral-3-3B-Reasoning-2512-Q4_K_M.gguf` and `NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf`.
+- Ran the gated live model-worker supervision suite against both local candidates. Each run passed readiness/lifeline, kill-then-restart recovery, generation after restart, cancellation health responsiveness, and idle unload.
+- Recorded the measurements and release-selection boundaries in `docs/performance/P3_MODEL_SELECTION.md`.
+- Added opt-in Vulkan GPU offload for GGUF generation in the model worker. The runtime requests full llama.cpp layer offload only when `supports_gpu_offload()` reports support, and otherwise keeps the CPU fallback path.
+- Closed patch-plan item 16 because production OCR, embeddings, and generation now run behind the supervised worker boundary and the live worker path is validated.
+
+### Why
+
+Items 14 and 16 were implemented but still open for runtime evidence. This pass records that evidence and narrows item 15 to the remaining model-release decisions, qualitative answer scoring, and memory-pressure unload policy.
+
+### Verification evidence
+
+- `cargo build -p screensearch-model-worker` passed.
+- `screensearch-model-worker.exe --benchmark-model` passed for both local GGUF candidates.
+- `SCREENSEARCH_RUN_WORKER_IT=1 cargo test -p screensearch-daemon --test worker_supervision -- --ignored --nocapture` passed for both local GGUF candidates.
+- `cargo test -p screensearch-model-runtime` passed for the GPU-parameter selection helper and existing runtime tests.
+- `cargo build -p screensearch-model-worker --features gpu-vulkan` is blocked on this machine because the Vulkan SDK is not installed (`VULKAN_SDK` is `NotPresent`).
+
+### Remaining boundary
+
+Patch-plan item 15 remains open. GAP-002/GAP-003 still own release model approval and acquisition policy; GAP-008 still owns memory-pressure-triggered unload; qualitative grounded answer scoring and release GPU packaging/validation remain pending.
+
 ## 2026-06-22 — P4 guarded automation
 
 ### Changed
@@ -41,7 +80,7 @@ P2/P3 gaps and release-hardening item 18 remain open. Guarded automation is incl
 
 ### Why
 
-The model loaded fine; generation was just starved (two CPU threads) and unformatted (no chat template), so a reasoning model never surfaced an answer. These fixes are CPU-only and fully verifiable. GPU acceleration was explored but **descoped at the user's request** for this change.
+The model loaded fine; generation was just starved (two CPU threads) and unformatted (no chat template), so a reasoning model never surfaced an answer. These fixes are CPU-only and fully verifiable. GPU acceleration was explored but **descoped at the user's request** for this change; a later validation branch re-scoped GPU support as opt-in Vulkan worker acceleration with CPU fallback.
 
 ### Verification
 
