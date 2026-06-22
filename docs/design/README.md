@@ -38,6 +38,11 @@ The full P2 shell reference and manual Windows verification runbook is in
   and focuses the search field. The hotkey is a shell-local setting persisted by the Tauri shell
   (not in the daemon archive); it is editable in Settings.
 
+## Guarded automation (P4)
+
+The default-off manual approval flow, daemon safety gates, privacy contract, and Windows fixture
+runbook are specified in [`p4-guarded-automation.md`](p4-guarded-automation.md).
+
 ## Keyboard model (P2)
 
 - `Ctrl/Cmd+K` focuses and selects the search field from anywhere in the window.
