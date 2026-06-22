@@ -19,7 +19,7 @@ use screensearch_ipc::{
         worker_generation_event,
     },
 };
-use screensearch_model_runtime::{FastEmbedEngine, LlamaCppTextGenerator};
+use screensearch_model_runtime::{FastEmbedEngine, llama_sidecar::PreferredLlamaTextGenerator};
 use screensearch_ports::{EmbeddingEngine, OcrEngine, TextGenerator};
 use screensearch_windows::WindowsOcrEngine;
 use tokio::sync::Mutex;
@@ -27,6 +27,7 @@ use tracing::{info, warn};
 
 struct WorkerHandler {
     model_root: PathBuf,
+    sidecar_root: PathBuf,
     ocr: Arc<WindowsOcrEngine>,
     embeddings: Arc<FastEmbedEngine>,
     generation: Mutex<Option<CachedGenerator>>,
@@ -35,7 +36,7 @@ struct WorkerHandler {
 struct CachedGenerator {
     model_id: String,
     relative_path: String,
-    generator: LlamaCppTextGenerator,
+    generator: PreferredLlamaTextGenerator,
 }
 
 #[async_trait::async_trait]
@@ -143,8 +144,9 @@ impl RequestHandler for WorkerHandler {
                         *generation = Some(CachedGenerator {
                             model_id: command.model_id.clone(),
                             relative_path: command.model_relative_path.clone(),
-                            generator: LlamaCppTextGenerator::new(
+                            generator: PreferredLlamaTextGenerator::new(
                                 self.model_root.join(&command.model_relative_path),
+                                self.sidecar_root.clone(),
                             ),
                         });
                     }
@@ -252,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
     let WorkerConfig {
         asset_root,
         model_root,
+        sidecar_root,
         pipe_name,
         lifeline_pipe,
     } = worker_config()?;
@@ -266,6 +269,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let handler = Arc::new(WorkerHandler {
         model_root: model_root.clone(),
+        sidecar_root,
         ocr: Arc::new(WindowsOcrEngine::new(asset_root)),
         embeddings: Arc::new(FastEmbedEngine::new(model_root)),
         generation: Mutex::new(None),
@@ -278,7 +282,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn benchmark_model(model_path: PathBuf) -> anyhow::Result<()> {
-    let generator = LlamaCppTextGenerator::new(&model_path);
+    let sidecar_root = data_directory()?.join("sidecar").join("llama");
+    let generator = PreferredLlamaTextGenerator::new(&model_path, sidecar_root);
     let prompt = "Answer only from the supplied local captures. Cite capture identifiers in brackets.\n\n[00000000-0000-7000-8000-000000000001] The ScreenSearch benchmark phrase is cobalt window.\n\nQuestion: What benchmark phrase was visible?";
     let started = Instant::now();
     let mut stream = generator
@@ -312,6 +317,7 @@ fn benchmark_model_arg() -> Option<PathBuf> {
 struct WorkerConfig {
     asset_root: PathBuf,
     model_root: PathBuf,
+    sidecar_root: PathBuf,
     pipe_name: String,
     lifeline_pipe: Option<String>,
 }
@@ -335,6 +341,7 @@ fn worker_config() -> anyhow::Result<WorkerConfig> {
     Ok(WorkerConfig {
         asset_root: asset_root.unwrap_or_else(|| data_root.join("assets")),
         model_root: model_root.unwrap_or_else(|| data_root.join("models")),
+        sidecar_root: data_root.join("sidecar").join("llama"),
         pipe_name: pipe_name.unwrap_or_else(|| DEFAULT_WORKER_PIPE_NAME.to_owned()),
         lifeline_pipe,
     })
