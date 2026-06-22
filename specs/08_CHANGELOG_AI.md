@@ -7,8 +7,9 @@ This log records meaningful AI-assisted repository changes and their reasons. It
 ### Changed
 
 - Capped per-hit OCR excerpts before they enter answer prompts and added a regression test for long OCR chunks.
+- Included every returned citation in answer prompts so generated answers and the visible evidence list use the same evidence set.
 - Replaced the odd full-day helper call pattern with a dedicated local-midnight helper.
-- Kept browser pages eligible by applying source filters to OCR chunk text as well as app/title metadata, and documented the strict-extraction/loose-matching boundary.
+- Kept browser pages eligible by applying source filters to any OCR chunk in the same capture as well as app/title metadata, and documented the strict-extraction/loose-matching boundary.
 - Removed the unavailable display-name requirement from the advanced Hugging Face download button.
 - Made desktop `<think>` stripping hide content from the first unclosed streaming tag onward.
 - Recorded known gaps for source vocabulary expansion, client timezone propagation through search IPC, and further prompt hardening for application/window-title metadata.

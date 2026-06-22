@@ -858,7 +858,7 @@ fn assemble_prompt(
         );
     }
     prompt.push_str("\nEvidence:\n");
-    for hit in hits.iter().take(12) {
+    for hit in hits {
         let local_timestamp = hit.captured_at.with_timezone(now.offset());
         let _ = writeln!(&mut prompt, "[{}]", hit.capture_id);
         let _ = writeln!(
@@ -1115,5 +1115,43 @@ mod tests {
 
         assert!(prompt.contains("... [truncated]"));
         assert!(!prompt.contains(&"x".repeat(PROMPT_OCR_EXCERPT_CHARS + 1)));
+    }
+
+    #[test]
+    fn prompt_includes_every_returned_citation() {
+        let now = chrono::FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2026, 6, 22, 12, 0, 0)
+            .unwrap();
+        let plan = plan_search("what was visible?", now).unwrap();
+        let hits = (0..20)
+            .map(|index| SearchHit {
+                chunk_id: ChunkId::new(),
+                capture_id: CaptureId::new(),
+                text: format!("Evidence item {index}"),
+                score: 1.0,
+                captured_at: chrono::Utc::now(),
+                application: "test.exe".to_owned(),
+                window_title: "Test".to_owned(),
+                width: 1,
+                height: 1,
+                asset: screensearch_domain::AssetRef {
+                    content_hash: "hash".to_owned(),
+                    relative_path: "aa/hash.png".to_owned(),
+                    media_type: "image/png".to_owned(),
+                    byte_length: 1,
+                },
+                bounds: Vec::new(),
+                match_kind: screensearch_domain::SearchMatchKind::Lexical,
+                ocr_model_id: "test-ocr".to_owned(),
+                embedding_model_id: "test-embedding".to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let prompt = assemble_prompt("what was visible?", &hits, &plan, now);
+
+        for hit in &hits {
+            assert!(prompt.contains(&format!("[{}]", hit.capture_id)));
+        }
+        assert!(prompt.contains("OCR excerpt: Evidence item 19"));
     }
 }

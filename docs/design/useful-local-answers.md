@@ -47,7 +47,7 @@ Answer prompts include, for each bounded evidence item:
 - window title
 - OCR excerpt
 
-The prompt states that OCR text and capture metadata are untrusted evidence, forbids external lookup, requires capture-id citations, and requires uncertainty when local captures do not show the requested fact. OCR excerpts are capped per hit before entering the prompt so one large chunk cannot consume the answer model context. For largest-PR questions, changed-file/addition/deletion evidence must be visible; otherwise the answer must say it cannot determine the largest PR from local captures.
+The prompt states that OCR text and capture metadata are untrusted evidence, forbids external lookup, requires capture-id citations, and requires uncertainty when local captures do not show the requested fact. Every returned citation is included in the answer context, while OCR excerpts are capped per hit so one large chunk cannot consume the answer model context. For largest-PR questions, changed-file/addition/deletion evidence must be visible; otherwise the answer must say it cannot determine the largest PR from local captures.
 
 The desktop strips `<think>...</think>` spans before rendering generated text.
 

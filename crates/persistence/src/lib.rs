@@ -1604,13 +1604,18 @@ fn append_capture_filters(sql: &mut String, values: &mut Vec<Value>, filters: &S
         }
         let pattern = like_pattern(&source);
         // The planner extracts known source words strictly, then persistence applies them as
-        // escaped substrings across metadata and OCR text. This keeps desktop apps such as
-        // telegram-desktop.exe filterable without dropping browser pages whose app/title omit the
-        // site name but whose captured text still shows GitHub, Amazon, and similar sources.
+        // escaped substrings across metadata and any OCR chunk in the same capture. This keeps
+        // desktop apps such as telegram-desktop.exe filterable without dropping useful browser
+        // chunks whose app/title/current text omit the site name but another OCR block shows it.
         sql.push_str(
             " AND (lower(c.application) LIKE ? ESCAPE '\\'
                    OR lower(c.window_title) LIKE ? ESCAPE '\\'
-                   OR lower(sc.text) LIKE ? ESCAPE '\\')",
+                   OR EXISTS (
+                       SELECT 1
+                       FROM search_chunk source_sc
+                       WHERE source_sc.capture_id = c.id
+                         AND lower(source_sc.text) LIKE ? ESCAPE '\\'
+                   ))",
         );
         values.push(Value::Text(pattern.clone()));
         values.push(Value::Text(pattern.clone()));
@@ -2233,6 +2238,15 @@ mod tests {
         window_title: &'a str,
     }
 
+    struct MultiChunkSearchCaptureFixture<'a> {
+        index: u32,
+        chunks: Vec<(&'a str, Vec<f32>)>,
+        model_id: &'a str,
+        captured_at: chrono::DateTime<Utc>,
+        application: &'a str,
+        window_title: &'a str,
+    }
+
     async fn index_capture_with_metadata(
         repository: &LibSqlArchive,
         fixture: SearchCaptureFixture<'_>,
@@ -2273,6 +2287,64 @@ mod tests {
                     embedding: fixture.embedding,
                 }],
                 ocr_model_id: "filtered-search-ocr".to_owned(),
+            })
+            .await
+            .unwrap();
+        capture_id
+    }
+
+    async fn index_capture_with_chunks(
+        repository: &LibSqlArchive,
+        fixture: MultiChunkSearchCaptureFixture<'_>,
+    ) -> CaptureId {
+        let mut capture = capture(fixture.index, 0, 1);
+        capture.captured_at = fixture.captured_at;
+        capture.application = fixture.application.to_owned();
+        capture.window_title = fixture.window_title.to_owned();
+        let capture_id = capture.id;
+        repository.enqueue_capture(capture).await.unwrap();
+        let job = repository
+            .claim_job("multi-chunk-search-worker")
+            .await
+            .unwrap()
+            .unwrap();
+        let blocks = fixture
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(index, (text, _))| OcrBlock {
+                reading_order: u32::try_from(index).unwrap(),
+                bounds: BoundingBox {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 0.1,
+                },
+                text: (*text).to_owned(),
+                confidence: Some(1.0),
+                language: Some("en".to_owned()),
+            })
+            .collect::<Vec<_>>();
+        let chunks = fixture
+            .chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, (text, embedding))| IndexedChunk {
+                id: ChunkId::new(),
+                capture_id,
+                text: text.to_owned(),
+                source_reading_order: u32::try_from(index).unwrap(),
+                model_id: fixture.model_id.to_owned(),
+                embedding,
+            })
+            .collect::<Vec<_>>();
+        repository
+            .complete_analysis(AnalysisResult {
+                job_id: job.id,
+                capture_id,
+                blocks,
+                chunks,
+                ocr_model_id: "multi-chunk-search-ocr".to_owned(),
             })
             .await
             .unwrap();
@@ -2533,6 +2605,52 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].capture_id, expected_id);
         assert!(hits.iter().all(|hit| hit.capture_id != excluded_id));
+    }
+
+    #[tokio::test]
+    async fn source_filters_qualify_all_chunks_in_matching_capture() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        let embeddings = FakeEmbeddingEngine;
+        let model_id = embeddings.model_id();
+        let query = "largest pr";
+        let query_vector = embeddings.embed(query).await.unwrap();
+        let captured_at = Utc.with_ymd_and_hms(2026, 6, 22, 9, 45, 0).unwrap();
+        let expected_id = index_capture_with_chunks(
+            &repository,
+            MultiChunkSearchCaptureFixture {
+                index: 27,
+                chunks: vec![
+                    (
+                        "GitHub navigation header",
+                        embeddings.embed("source header").await.unwrap(),
+                    ),
+                    ("Largest PR Files changed +120 -8", query_vector.clone()),
+                ],
+                model_id,
+                captured_at,
+                application: "Microsoft Edge",
+                window_title: "nicolasestrem/screensearch-v2 pull request 12",
+            },
+        )
+        .await;
+
+        let hits = repository
+            .hybrid_search(
+                query,
+                &query_vector,
+                model_id,
+                &SearchFilters {
+                    source_terms: vec!["github".to_owned()],
+                    ..SearchFilters::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(hits[0].capture_id, expected_id);
+        assert!(hits[0].text.contains("Largest PR"));
     }
 
     #[tokio::test]

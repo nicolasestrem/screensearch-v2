@@ -17,7 +17,7 @@
 
 ### Changed
 
-- Addressed PR #12 review follow-ups by capping per-hit OCR prompt excerpts, clarifying local-day planning, matching source filters against OCR text for browser pages, allowing HF downloads without a display-name field, and making `<think>` stripping robust for unclosed streaming spans.
+- Addressed PR #12 review follow-ups by capping per-hit OCR prompt excerpts, prompting every returned citation, clarifying local-day planning, matching source filters at capture level for browser pages, allowing HF downloads without a display-name field, and making `<think>` stripping robust for unclosed streaming spans.
 - Applied search time/source filters in backend hybrid retrieval before ranking, loosened FTS to phrase/exact boosts plus OR fallback, and enriched answer prompts with local timestamp/source metadata and citation/uncertainty requirements.
 - Redesigned Settings around answer readiness, timezone basis, active/installed answer models, blank guided local GGUF import, advanced HF download fields, explicit storage policy state, and conservative reset.
 - Hid generated model `<think>` spans before rendering answers in the desktop UI.
