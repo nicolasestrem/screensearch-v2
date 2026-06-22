@@ -218,24 +218,6 @@ pub trait AutomationPlatform: Send + Sync {
     ) -> Result<(), PortError>;
 }
 
-/// A validated, explicitly approved automation action.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ApprovedAutomationAction {
-    /// Identifier of the approval record.
-    pub approval_id: String,
-    /// Expected foreground window title.
-    pub expected_window: String,
-    /// Deterministic action description.
-    pub action: String,
-}
-
-/// Executes a guarded OS automation action.
-#[async_trait]
-pub trait AutomationExecutor: Send + Sync {
-    /// Executes only after approval, foreground, and abort checks pass.
-    async fn execute(&self, action: &ApprovedAutomationAction) -> Result<(), PortError>;
-}
-
 /// Errors crossing an adapter boundary.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum PortError {
@@ -251,6 +233,9 @@ pub enum PortError {
     /// A policy gate rejected the operation.
     #[error("operation denied: {0}")]
     Denied(String),
+    /// Guarded automation failed with a stable content-free category.
+    #[error("automation denied: {0}")]
+    Automation(screensearch_domain::AutomationFailureCode),
     /// An unexpected adapter failure occurred.
     #[error("adapter failure: {0}")]
     Internal(String),

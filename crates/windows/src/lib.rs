@@ -1,20 +1,25 @@
 //! Windows-facing capture, OCR, and automation adapters.
 
+mod automation;
+
+pub use automation::WindowsAutomationPlatform;
+
+#[cfg(test)]
+use automation::{
+    encode_key_chord_inputs, encode_text_inputs, keyboard_event, target_identity_matches,
+    validate_send_input_count,
+};
+
 use std::{
     io::Cursor,
     path::{Component, Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use async_trait::async_trait;
 use image::{DynamicImage, ImageFormat, imageops::FilterType};
 use screensearch_domain::{BoundingBox, CapturedFrame, OcrBlock};
-use screensearch_ports::{
-    ApprovedAutomationAction, AutomationExecutor, CaptureSource, OcrEngine, PortError,
-};
+use screensearch_ports::{CaptureSource, OcrEngine, PortError};
 use windows::{
     Graphics::Imaging::BitmapDecoder,
     Media::Ocr::OcrEngine as WinOcrEngine,
@@ -264,128 +269,71 @@ fn ocr_error(error: windows::core::Error) -> PortError {
     PortError::Internal(format!("Windows OCR: {error}"))
 }
 
-/// Reads the foreground window without coupling policy tests to Win32 globals.
-pub trait ForegroundWindowReader: Send + Sync {
-    /// Returns the current foreground window label.
-    fn current_window(&self) -> Result<String, PortError>;
-}
-
-/// Fixed foreground-window adapter for deterministic tests and bootstrap wiring.
-pub struct FixedForegroundWindow(pub String);
-
-impl ForegroundWindowReader for FixedForegroundWindow {
-    fn current_window(&self) -> Result<String, PortError> {
-        Ok(self.0.clone())
-    }
-}
-
-/// Enforces approval, foreground-window, and emergency-abort policy before native input.
-pub struct GuardedWindowsAutomation {
-    foreground: Arc<dyn ForegroundWindowReader>,
-    emergency_abort: Arc<AtomicBool>,
-}
-
-impl GuardedWindowsAutomation {
-    /// Creates a guarded executor around a foreground-window adapter.
-    pub fn new(
-        foreground: Arc<dyn ForegroundWindowReader>,
-        emergency_abort: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            foreground,
-            emergency_abort,
-        }
-    }
-
-    /// Activates the process-wide emergency stop.
-    pub fn abort(&self) {
-        self.emergency_abort.store(true, Ordering::SeqCst);
-    }
-
-    /// Clears the stop after an explicit user reset.
-    pub fn reset_abort(&self) {
-        self.emergency_abort.store(false, Ordering::SeqCst);
-    }
-}
-
-#[async_trait]
-impl AutomationExecutor for GuardedWindowsAutomation {
-    async fn execute(&self, action: &ApprovedAutomationAction) -> Result<(), PortError> {
-        if action.approval_id.trim().is_empty() {
-            return Err(PortError::Denied("missing approval record".to_owned()));
-        }
-        if self.emergency_abort.load(Ordering::SeqCst) {
-            return Err(PortError::Denied("emergency abort is active".to_owned()));
-        }
-        let foreground = self.foreground.current_window()?;
-        if foreground != action.expected_window {
-            return Err(PortError::Denied(format!(
-                "foreground window changed from '{}' to '{foreground}'",
-                action.expected_window
-            )));
-        }
-        if action.action.trim().is_empty() {
-            return Err(PortError::InvalidData(
-                "automation action is empty".to_owned(),
-            ));
-        }
-
-        // A production adapter will translate the validated action to UI Automation or
-        // SendInput here. The bootstrap intentionally proves policy without emitting input.
-        Ok(())
-    }
-}
-
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicBool};
+    use screensearch_domain::{
+        AutomationFailureCode, AutomationKey, AutomationTarget, KeyModifier,
+    };
+    use screensearch_ports::PortError;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, KEYEVENTF_UNICODE};
 
-    use screensearch_ports::{ApprovedAutomationAction, AutomationExecutor, PortError};
+    use super::{
+        encode_key_chord_inputs, encode_text_inputs, keyboard_event, target_identity_matches,
+        validate_send_input_count,
+    };
 
-    use super::{FixedForegroundWindow, GuardedWindowsAutomation};
+    #[test]
+    fn target_identity_requires_exact_hwnd_pid_and_executable() {
+        let expected = AutomationTarget {
+            process_id: 42,
+            window_handle: 9001,
+            executable_name: "Fixture.exe".to_owned(),
+            display_title: "Before".to_owned(),
+        };
+        let mut actual = expected.clone();
+        actual.display_title = "After".to_owned();
+        actual.executable_name = "fixture.EXE".to_owned();
+        assert!(target_identity_matches(&actual, &expected));
 
-    fn action() -> ApprovedAutomationAction {
-        ApprovedAutomationAction {
-            approval_id: "approval-1".to_owned(),
-            expected_window: "Calculator".to_owned(),
-            action: "press Enter".to_owned(),
+        actual.window_handle = 7;
+        assert!(!target_identity_matches(&actual, &expected));
+    }
+
+    #[test]
+    fn utf16_text_encoding_emits_key_down_and_up_for_every_code_unit() {
+        let inputs = encode_text_inputs("A😀");
+        assert_eq!(inputs.len(), 6);
+        for pair in inputs.chunks_exact(2) {
+            let down = keyboard_event(&pair[0]);
+            let up = keyboard_event(&pair[1]);
+            assert!(down.dwFlags.contains(KEYEVENTF_UNICODE));
+            assert!(!down.dwFlags.contains(KEYEVENTF_KEYUP));
+            assert!(up.dwFlags.contains(KEYEVENTF_UNICODE));
+            assert!(up.dwFlags.contains(KEYEVENTF_KEYUP));
+            assert_eq!(down.wScan, up.wScan);
         }
     }
 
-    #[tokio::test]
-    async fn approved_action_requires_the_expected_foreground_window() {
-        let executor = GuardedWindowsAutomation::new(
-            Arc::new(FixedForegroundWindow("Notepad".to_owned())),
-            Arc::new(AtomicBool::new(false)),
+    #[test]
+    fn key_chord_releases_all_modifiers_in_reverse_order() {
+        let inputs = encode_key_chord_inputs(
+            &[KeyModifier::Control, KeyModifier::Shift],
+            AutomationKey::S,
         );
-
-        assert!(matches!(
-            executor.execute(&action()).await,
-            Err(PortError::Denied(_))
-        ));
+        assert_eq!(inputs.len(), 6);
+        let shift_up = keyboard_event(&inputs[4]);
+        let control_up = keyboard_event(&inputs[5]);
+        assert!(shift_up.dwFlags.contains(KEYEVENTF_KEYUP));
+        assert!(control_up.dwFlags.contains(KEYEVENTF_KEYUP));
     }
 
-    #[tokio::test]
-    async fn emergency_abort_blocks_an_otherwise_valid_action() {
-        let executor = GuardedWindowsAutomation::new(
-            Arc::new(FixedForegroundWindow("Calculator".to_owned())),
-            Arc::new(AtomicBool::new(false)),
+    #[test]
+    fn partial_send_input_is_a_stable_input_blocked_failure() {
+        assert_eq!(
+            validate_send_input_count(6, 5),
+            Err(PortError::Automation(AutomationFailureCode::InputBlocked))
         );
-        executor.abort();
-
-        assert!(matches!(
-            executor.execute(&action()).await,
-            Err(PortError::Denied(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn valid_approved_action_passes_all_policy_gates() {
-        let executor = GuardedWindowsAutomation::new(
-            Arc::new(FixedForegroundWindow("Calculator".to_owned())),
-            Arc::new(AtomicBool::new(false)),
-        );
-
-        assert!(executor.execute(&action()).await.is_ok());
+        assert_eq!(validate_send_input_count(6, 6), Ok(()));
     }
 }
