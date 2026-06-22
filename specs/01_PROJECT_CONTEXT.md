@@ -6,13 +6,13 @@ This document answers one question: **what is true today?** It does not select f
 
 ## Repository status
 
-ScreenSearch V2 is an independent Git repository. It is a Rust 2024 workspace with a Tauri 2 React/TypeScript desktop shell. P0 and P1 are implemented: the truthful evidence loop, semantic retrieval, capture growth controls, retention/storage policy, and the synthetic scale target all pass their required checks as of the date above. The `codex/p4-guarded-automation` branch also implements patch-plan item 17: guarded Windows automation behind explicit default-off opt-in.
+ScreenSearch V2 is an independent Git repository. It is a Rust 2024 workspace with a Tauri 2 React/TypeScript desktop shell. P0, P1, P2 shell runtime, supervised model-worker execution, and guarded automation are implemented through patch-plan item 17 except for item 15 model-selection release decisions and item 18 release hardening.
 
 ## Current process boundaries
 
 - `screensearch-daemon` owns the database, asset store, capture ingestion, job processing, search orchestration, and local named-pipe server.
 - `screensearch-desktop` is a Tauri process. It proxies typed commands from React to the daemon.
-- `screensearch-model-worker` exists as a process boundary declaration but does not yet host production model inference.
+- `screensearch-model-worker` hosts production OCR, embedding, and generation inference behind the daemon, which supervises it with bounded restarts and a parent lifeline.
 - Protobuf request/response envelopes are length-delimited over a Windows named pipe.
 
 ## Current workspace
@@ -24,9 +24,9 @@ ScreenSearch V2 is an independent Git repository. It is a Rust 2024 workspace wi
 - `crates/ipc`: protobuf contracts and named-pipe transport.
 - `crates/windows`: production focused-monitor capture, Windows Media OCR, test doubles, and automation policy guards.
 - `crates/model-runtime`: production MiniLM embeddings and llama.cpp generation plus deterministic test doubles.
-- `apps/daemon`: adapter composition and IPC request handling.
+- `apps/daemon`: adapter composition, IPC request handling, and model-worker supervision.
 - `apps/desktop`: Tauri commands and the React diagnostics screen.
-- `apps/model-worker`: placeholder worker executable.
+- `apps/model-worker`: supervised OCR, embedding, and generation worker executable.
 
 ## Current data model
 
@@ -75,12 +75,14 @@ Capture metadata and an analysis job are committed transactionally. Analysis com
 - Settings and privacy controls for exclusions, retention, storage budget, storage metrics, and confirmed deletion of captured history.
 - A reproducible ten-million-capture metadata benchmark and a live populated-archive hybrid-search latency check, recorded in `docs/performance/P1_SCALE_BASELINE.md`.
 - A real llama.cpp GGUF adapter that is dormant until an explicitly installed model is selected; evidence-only search does not require it.
+- A user-attested native Windows tray/hotkey runtime check for the P2 shell.
+- A supervised model-worker production path with live gated validation against two local GGUF candidates; benchmark results are recorded in `docs/performance/P3_MODEL_SELECTION.md`.
+- Opt-in Vulkan GPU offload for GGUF generation in the model worker, with runtime detection and CPU fallback when llama.cpp reports no supported GPU backend.
 
 ## What is fake or disabled
 
 - Deterministic fake capture, OCR, embeddings, and generation remain available only for tests.
-- No GGUF generation model is selected or installed by default; the diagnostics UI requests evidence-only search.
-- The model-worker process does not perform inference.
+- No GGUF generation model is selected or installed by default; the UI can request evidence-only search and model management remains explicit.
 - Guarded automation is disabled by default and never runs from generated plans. It emits native input only after manual enablement, target capture, exact review, one-shot approval, and same-plan execution while all safety gates still pass.
 
 ## Current user experience
@@ -100,9 +102,9 @@ The React screen implements the product-owner-selected Memory Timeline direction
 
 1. The initial perceptual threshold is deterministic but still needs tuning against long-running real workloads; the P1 baseline deliberately favors preserving evidence.
 2. The daemon is not supervised or launched by the desktop shell.
-3. No global hotkey or tray lifecycle exists yet; Ctrl+K currently focuses search only inside the window.
-4. The model worker boundary is not yet exercised; OCR and embeddings currently execute in the daemon process.
-5. The GGUF provider has no approved default model, manifest, acquisition flow, or packaged weights.
+3. No approved default GGUF generation model, manifest, release acquisition policy, packaged weights, or release GPU packaging policy exist yet.
+4. Qualitative generation scoring for groundedness, no-evidence refusal, conflict handling, prompt-injection resistance, and citation formatting is still pending.
+5. Memory-pressure-triggered generation-model unload remains open; idle-timeout unload is implemented.
 6. Guarded automation is included behind explicit default-off opt-in; it still needs release sign-off for user-facing scope and support policy.
 7. Idle/active capture CPU, long-duration storage growth, and OCR/embedding queue latency still need release-hardware soak measurements; the P1 metadata-scale and live-search baselines are complete.
 8. A full factory-reset scope covering archive database and model files is not implemented; confirmed deletion currently covers captured history and its derived evidence/assets.
