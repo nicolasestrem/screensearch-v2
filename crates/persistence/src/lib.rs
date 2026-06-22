@@ -8,13 +8,13 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{Duration, SecondsFormat, Utc};
-use libsql::{Builder, params};
+use libsql::{Builder, Value, params, params_from_iter};
 use screensearch_domain::{
     AnalysisJob, AnalysisResult, ArchiveSettings, AssetCleanupTask, AssetRef,
     AutomationFailureCode, AutomationRun, AutomationRunId, AutomationRunStatus, AutomationSettings,
     BoundingBox, CaptureDisposition, CaptureId, ChunkId, DeleteCaptures, DeletionSummary,
-    GenerationModel, JobId, ModelSourceKind, NewCapture, QueueMetrics, SearchHit, SearchMatchKind,
-    StorageMetrics,
+    GenerationModel, JobId, ModelSourceKind, NewCapture, QueueMetrics, SearchFilters, SearchHit,
+    SearchMatchKind, StorageMetrics,
 };
 use screensearch_ports::{
     ArchiveRepository, AssetStore, AutomationClaimOutcome, AutomationRepository, PortError,
@@ -984,6 +984,7 @@ impl ArchiveRepository for LibSqlArchive {
         query: &str,
         embedding: &[f32],
         model_id: &str,
+        filters: &SearchFilters,
         limit: usize,
     ) -> Result<Vec<SearchHit>, PortError> {
         if embedding.len() != 384 {
@@ -994,11 +995,20 @@ impl ArchiveRepository for LibSqlArchive {
         let candidate_limit = limit.clamp(1, 50) * 4;
         let connection = self.connection();
         let mut scores: HashMap<String, RankedHit> = HashMap::new();
-        add_lexical_results(&connection, query, model_id, candidate_limit, &mut scores).await?;
+        add_lexical_results(
+            &connection,
+            query,
+            model_id,
+            filters,
+            candidate_limit,
+            &mut scores,
+        )
+        .await?;
         add_semantic_results(
             &connection,
             embedding,
             model_id,
+            filters,
             candidate_limit,
             &mut scores,
         )
@@ -1014,8 +1024,17 @@ impl ArchiveRepository for LibSqlArchive {
                     (false, true) => SearchMatchKind::Semantic,
                     (false, false) => unreachable!("a ranked hit has at least one source"),
                 };
-                if ranked.hit.text.to_lowercase().contains(&normalized_query) {
-                    ranked.hit.score += 0.05;
+                if !normalized_query.is_empty() {
+                    let hit_text = ranked.hit.text.to_lowercase();
+                    if hit_text.contains(&normalized_query) {
+                        ranked.hit.score += 0.05;
+                    } else {
+                        for term in normalized_query.split_whitespace() {
+                            if hit_text.contains(term) {
+                                ranked.hit.score += 0.01;
+                            }
+                        }
+                    }
                 }
                 ranked.hit
             })
@@ -1458,6 +1477,7 @@ async fn add_lexical_results(
     connection: &libsql::Connection,
     query: &str,
     model_id: &str,
+    filters: &SearchFilters,
     candidate_limit: usize,
     scores: &mut HashMap<String, RankedHit>,
 ) -> Result<(), PortError> {
@@ -1465,28 +1485,32 @@ async fn add_lexical_results(
     if query.is_empty() {
         return Ok(());
     }
+    let mut sql = String::from(
+        "SELECT sc.id, sc.capture_id, sc.text,
+                c.captured_at, c.application, c.window_title, c.width, c.height,
+                a.content_hash, a.relative_path, a.media_type, a.byte_length,
+                ob.x, ob.y, ob.width, ob.height, ob.model_id
+         FROM search_chunk_fts f
+         JOIN search_chunk sc ON sc.rowid = f.rowid
+         JOIN chunk_embedding_384 ce ON ce.chunk_id = sc.id AND ce.model_id = ?
+         JOIN capture c ON c.id = sc.capture_id
+         JOIN asset a ON a.content_hash = c.asset_hash
+         JOIN ocr_block ob ON ob.capture_id = sc.capture_id
+             AND ob.reading_order = sc.source_reading_order
+         WHERE search_chunk_fts MATCH ?",
+    );
+    let mut values = vec![Value::Text(model_id.to_owned()), Value::Text(query)];
+    append_capture_filters(&mut sql, &mut values, filters);
+    sql.push_str(
+        " ORDER BY bm25(search_chunk_fts)
+         LIMIT ?",
+    );
+    values.push(Value::Integer(
+        i64::try_from(candidate_limit).unwrap_or(200),
+    ));
+
     let mut rows = connection
-        .query(
-            "SELECT sc.id, sc.capture_id, sc.text,
-                    c.captured_at, c.application, c.window_title, c.width, c.height,
-                    a.content_hash, a.relative_path, a.media_type, a.byte_length,
-                    ob.x, ob.y, ob.width, ob.height, ob.model_id
-             FROM search_chunk_fts f
-             JOIN search_chunk sc ON sc.rowid = f.rowid
-             JOIN chunk_embedding_384 ce ON ce.chunk_id = sc.id AND ce.model_id = ?
-             JOIN capture c ON c.id = sc.capture_id
-             JOIN asset a ON a.content_hash = c.asset_hash
-             JOIN ocr_block ob ON ob.capture_id = sc.capture_id
-                 AND ob.reading_order = sc.source_reading_order
-             WHERE search_chunk_fts MATCH ?
-             ORDER BY bm25(search_chunk_fts)
-             LIMIT ?",
-            params![
-                model_id,
-                query,
-                i64::try_from(candidate_limit).unwrap_or(200)
-            ],
-        )
+        .query(&sql, params_from_iter(values))
         .await
         .map_err(database_error)?;
     let mut rank = 1_usize;
@@ -1502,30 +1526,37 @@ async fn add_semantic_results(
     connection: &libsql::Connection,
     embedding: &[f32],
     model_id: &str,
+    filters: &SearchFilters,
     candidate_limit: usize,
     scores: &mut HashMap<String, RankedHit>,
 ) -> Result<(), PortError> {
     let embedding_count = embedding_count(connection, model_id).await?;
     let vector = vector_text(embedding);
     let limit = i64::try_from(candidate_limit).unwrap_or(200);
-    let mut rows = if embedding_count <= BRUTE_FORCE_VECTOR_THRESHOLD {
+    let mut rows = if embedding_count <= BRUTE_FORCE_VECTOR_THRESHOLD || filters.has_constraints() {
+        let mut sql = String::from(
+            "SELECT sc.id, sc.capture_id, sc.text,
+                    c.captured_at, c.application, c.window_title, c.width, c.height,
+                    a.content_hash, a.relative_path, a.media_type, a.byte_length,
+                    ob.x, ob.y, ob.width, ob.height, ob.model_id
+             FROM chunk_embedding_384 ce
+             JOIN search_chunk sc ON sc.id = ce.chunk_id
+             JOIN capture c ON c.id = sc.capture_id
+             JOIN asset a ON a.content_hash = c.asset_hash
+             JOIN ocr_block ob ON ob.capture_id = sc.capture_id
+                 AND ob.reading_order = sc.source_reading_order
+             WHERE ce.model_id = ?",
+        );
+        let mut values = vec![Value::Text(model_id.to_owned())];
+        append_capture_filters(&mut sql, &mut values, filters);
+        sql.push_str(
+            " ORDER BY vector_distance_cos(ce.embedding, vector(?)) ASC
+             LIMIT ?",
+        );
+        values.push(Value::Text(vector.clone()));
+        values.push(Value::Integer(limit));
         connection
-            .query(
-                "SELECT sc.id, sc.capture_id, sc.text,
-                        c.captured_at, c.application, c.window_title, c.width, c.height,
-                        a.content_hash, a.relative_path, a.media_type, a.byte_length,
-                        ob.x, ob.y, ob.width, ob.height, ob.model_id
-                 FROM chunk_embedding_384 ce
-                 JOIN search_chunk sc ON sc.id = ce.chunk_id
-                 JOIN capture c ON c.id = sc.capture_id
-                 JOIN asset a ON a.content_hash = c.asset_hash
-                 JOIN ocr_block ob ON ob.capture_id = sc.capture_id
-                     AND ob.reading_order = sc.source_reading_order
-                 WHERE ce.model_id = ?
-                 ORDER BY vector_distance_cos(ce.embedding, vector(?)) ASC
-                 LIMIT ?",
-                params![model_id, vector, limit],
-            )
+            .query(&sql, params_from_iter(values))
             .await
             .map_err(database_error)?
     } else {
@@ -1555,6 +1586,45 @@ async fn add_semantic_results(
         rank += 1;
     }
     Ok(())
+}
+
+fn append_capture_filters(sql: &mut String, values: &mut Vec<Value>, filters: &SearchFilters) {
+    if let Some(after) = filters.captured_after.as_ref() {
+        sql.push_str(" AND c.captured_at >= ?");
+        values.push(Value::Text(timestamp(after.to_owned())));
+    }
+    if let Some(before) = filters.captured_before.as_ref() {
+        sql.push_str(" AND c.captured_at < ?");
+        values.push(Value::Text(timestamp(before.to_owned())));
+    }
+    for source in &filters.source_terms {
+        let source = source.trim().to_lowercase();
+        if source.is_empty() {
+            continue;
+        }
+        let pattern = like_pattern(&source);
+        sql.push_str(
+            " AND (lower(c.application) LIKE ? ESCAPE '\\'
+                   OR lower(c.window_title) LIKE ? ESCAPE '\\')",
+        );
+        values.push(Value::Text(pattern.clone()));
+        values.push(Value::Text(pattern));
+    }
+}
+
+fn like_pattern(value: &str) -> String {
+    let mut pattern = String::from("%");
+    for character in value.chars() {
+        match character {
+            '%' | '_' | '\\' => {
+                pattern.push('\\');
+                pattern.push(character);
+            }
+            _ => pattern.push(character),
+        }
+    }
+    pattern.push('%');
+    pattern
 }
 
 fn merge_rank(
@@ -1691,11 +1761,38 @@ async fn embedding_count(
 }
 
 fn fts_query(query: &str) -> String {
-    query
-        .split_whitespace()
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" AND ")
+    let terms = fts_terms(query);
+    if terms.is_empty() {
+        return String::new();
+    }
+    let mut clauses = Vec::new();
+    if terms.len() > 1 {
+        clauses.push(format!("\"{}\"", terms.join(" ")));
+    }
+    clauses.extend(
+        terms
+            .into_iter()
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\""))),
+    );
+    clauses.join(" OR ")
+}
+
+fn fts_terms(query: &str) -> Vec<String> {
+    let mut normalized = String::with_capacity(query.len());
+    for character in query.chars() {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character.to_ascii_lowercase());
+        } else {
+            normalized.push(' ');
+        }
+    }
+    let mut terms = Vec::new();
+    for term in normalized.split_whitespace() {
+        if !terms.iter().any(|existing| existing == term) {
+            terms.push(term.to_owned());
+        }
+    }
+    terms
 }
 
 fn timestamp(value: chrono::DateTime<Utc>) -> String {
@@ -1998,12 +2095,13 @@ fn io_error(error: std::io::Error) -> PortError {
 mod tests {
     use std::sync::Arc;
 
-    use chrono::{Duration, Utc};
+    use chrono::{Duration, TimeZone, Utc};
     use libsql::params;
     use screensearch_domain::{
         AnalysisResult, ArchiveSettings, AssetRef, AutomationFailureCode, AutomationRun,
         AutomationRunId, AutomationRunStatus, AutomationSettings, BoundingBox, CaptureDisposition,
         CaptureId, CapturedFrame, ChunkId, IndexedChunk, NewCapture, OcrBlock, SearchEvent,
+        SearchFilters, SearchMatchKind,
     };
     use screensearch_model_runtime::{FakeEmbeddingEngine, FakeOcrEngine, FakeTextGenerator};
     use screensearch_ports::{
@@ -2113,6 +2211,62 @@ mod tests {
                     embedding,
                 }],
                 ocr_model_id: "ranking-ocr".to_owned(),
+            })
+            .await
+            .unwrap();
+        capture_id
+    }
+
+    struct SearchCaptureFixture<'a> {
+        index: u32,
+        text: &'a str,
+        model_id: &'a str,
+        embedding: Vec<f32>,
+        captured_at: chrono::DateTime<Utc>,
+        application: &'a str,
+        window_title: &'a str,
+    }
+
+    async fn index_capture_with_metadata(
+        repository: &LibSqlArchive,
+        fixture: SearchCaptureFixture<'_>,
+    ) -> CaptureId {
+        let mut capture = capture(fixture.index, 0, 1);
+        capture.captured_at = fixture.captured_at;
+        capture.application = fixture.application.to_owned();
+        capture.window_title = fixture.window_title.to_owned();
+        let capture_id = capture.id;
+        repository.enqueue_capture(capture).await.unwrap();
+        let job = repository
+            .claim_job("filtered-search-worker")
+            .await
+            .unwrap()
+            .unwrap();
+        repository
+            .complete_analysis(AnalysisResult {
+                job_id: job.id,
+                capture_id,
+                blocks: vec![OcrBlock {
+                    reading_order: 0,
+                    bounds: BoundingBox {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1.0,
+                        height: 0.1,
+                    },
+                    text: fixture.text.to_owned(),
+                    confidence: Some(1.0),
+                    language: Some("en".to_owned()),
+                }],
+                chunks: vec![IndexedChunk {
+                    id: ChunkId::new(),
+                    capture_id,
+                    text: fixture.text.to_owned(),
+                    source_reading_order: 0,
+                    model_id: fixture.model_id.to_owned(),
+                    embedding: fixture.embedding,
+                }],
+                ocr_model_id: "filtered-search-ocr".to_owned(),
             })
             .await
             .unwrap();
@@ -2234,13 +2388,143 @@ mod tests {
         .await;
 
         let hits = repository
-            .hybrid_search(query, &query_vector, model_id, 10)
+            .hybrid_search(
+                query,
+                &query_vector,
+                model_id,
+                &SearchFilters::default(),
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(hits[0].capture_id, exact_id);
         assert!(hits.iter().any(|hit| hit.capture_id == semantic_id));
         assert!(hits.iter().all(|hit| hit.capture_id != legacy_id));
         assert!(hits.iter().all(|hit| hit.embedding_model_id == model_id));
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_applies_time_and_source_filters_before_ranking() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        let embeddings = FakeEmbeddingEngine;
+        let model_id = embeddings.model_id();
+        let query_vector = embeddings.embed("telegram").await.unwrap();
+        let unrelated_vector = embeddings.embed("unrelated screen words").await.unwrap();
+        let in_window = Utc.with_ymd_and_hms(2026, 6, 22, 10, 15, 0).unwrap();
+        let outside_window = Utc.with_ymd_and_hms(2026, 6, 22, 13, 30, 0).unwrap();
+        let expected_id = index_capture_with_metadata(
+            &repository,
+            SearchCaptureFixture {
+                index: 20,
+                text: "Noon conversation about local search",
+                model_id,
+                embedding: query_vector.clone(),
+                captured_at: in_window,
+                application: "Telegram Desktop",
+                window_title: "Nico",
+            },
+        )
+        .await;
+        let outside_time_id = index_capture_with_metadata(
+            &repository,
+            SearchCaptureFixture {
+                index: 21,
+                text: "Telegram conversation outside the requested window",
+                model_id,
+                embedding: query_vector.clone(),
+                captured_at: outside_window,
+                application: "Telegram Desktop",
+                window_title: "Nico",
+            },
+        )
+        .await;
+        let wrong_source_id = index_capture_with_metadata(
+            &repository,
+            SearchCaptureFixture {
+                index: 22,
+                text: "Noon conversation about local search",
+                model_id,
+                embedding: unrelated_vector,
+                captured_at: in_window,
+                application: "Visual Studio Code",
+                window_title: "Notes",
+            },
+        )
+        .await;
+
+        let hits = repository
+            .hybrid_search(
+                "",
+                &query_vector,
+                model_id,
+                &SearchFilters {
+                    captured_after: Some(Utc.with_ymd_and_hms(2026, 6, 22, 9, 0, 0).unwrap()),
+                    captured_before: Some(Utc.with_ymd_and_hms(2026, 6, 22, 11, 0, 0).unwrap()),
+                    source_terms: vec!["telegram".to_owned()],
+                },
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].capture_id, expected_id);
+        assert!(hits.iter().all(|hit| hit.capture_id != outside_time_id));
+        assert!(hits.iter().all(|hit| hit.capture_id != wrong_source_id));
+        assert_eq!(hits[0].application, "Telegram Desktop");
+    }
+
+    #[tokio::test]
+    async fn lexical_search_uses_or_fallback_for_partial_terms() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        let embeddings = FakeEmbeddingEngine;
+        let model_id = embeddings.model_id();
+        let query = "quarterly roadmap nonexistentterm";
+        let query_vector = embeddings
+            .embed("semantically favored unrelated")
+            .await
+            .unwrap();
+        let partial_id = index_capture(
+            &repository,
+            23,
+            "The quarterly roadmap was visible in the browser",
+            model_id,
+            embeddings
+                .embed("distant partial lexical text")
+                .await
+                .unwrap(),
+        )
+        .await;
+        index_capture(
+            &repository,
+            24,
+            "Semantically favored unrelated",
+            model_id,
+            query_vector.clone(),
+        )
+        .await;
+
+        let hits = repository
+            .hybrid_search(
+                query,
+                &query_vector,
+                model_id,
+                &SearchFilters::default(),
+                10,
+            )
+            .await
+            .unwrap();
+
+        let partial = hits
+            .iter()
+            .find(|hit| hit.capture_id == partial_id)
+            .expect("partial lexical match is returned despite the extra noisy term");
+        assert!(matches!(
+            partial.match_kind,
+            SearchMatchKind::Lexical | SearchMatchKind::Hybrid
+        ));
     }
 
     #[tokio::test]

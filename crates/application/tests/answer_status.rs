@@ -8,7 +8,7 @@ use screensearch_application::SearchService;
 use screensearch_domain::{
     AnalysisJob, AnalysisResult, ArchiveSettings, AssetCleanupTask, AssetRef, CaptureDisposition,
     CaptureId, DeleteCaptures, DeletionSummary, GenerationModel, NewCapture, QueueMetrics,
-    SearchEvent, SearchHit, SearchMatchKind, StorageMetrics,
+    SearchEvent, SearchFilters, SearchHit, SearchMatchKind, StorageMetrics,
 };
 use screensearch_ports::{
     ArchiveRepository, EmbeddingEngine, PortError, TextGenerator, TokenStream,
@@ -26,6 +26,7 @@ impl ArchiveRepository for FakeRepository {
         _query: &str,
         _embedding: &[f32],
         _model_id: &str,
+        _filters: &SearchFilters,
         _limit: usize,
     ) -> Result<Vec<SearchHit>, PortError> {
         Ok(self.hits.clone())
@@ -210,7 +211,7 @@ async fn terminal_status(service: &SearchService, generate_answer: bool) -> (usi
     while let Some(event) = stream.next().await {
         match event.expect("event is ok") {
             SearchEvent::Citation(_) => citations += 1,
-            SearchEvent::Token(_) => {}
+            SearchEvent::Plan(_) | SearchEvent::Token(_) => {}
             SearchEvent::Completed {
                 citation_count,
                 answer_status,

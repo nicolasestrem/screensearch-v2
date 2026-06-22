@@ -18,7 +18,8 @@ Visual source: [`memory-timeline-reference.png`](memory-timeline-reference.png)
 - Live ultra-wide captures use `object-fit: contain` so evidence is never cropped; this can letterbox the inspector.
 - Result totals are the current query's real match count, not a fabricated archive-wide total.
 - When no GGUF model is installed, the answer panel offers generation and states the requirement instead of fabricating an answer.
-- Retention and application exclusions appear only in the privacy dialog with explicit not-configured language.
+- Settings show answer readiness, timezone basis, installed answer models, and explicit storage retention/budget state. Model setup starts blank and guided rather than prefilled with speculative defaults.
+- Search displays the deterministic local-time query plan emitted by the daemon before citations.
 
 The blocking visual review is recorded in [`design-qa.md`](../../design-qa.md).
 
@@ -44,6 +45,14 @@ The default-off manual approval flow, daemon safety gates, privacy contract, and
 fixture runbook are specified in [`p4-guarded-automation.md`](p4-guarded-automation.md). The
 production path is included only behind explicit opt-in; preview mode and generated plans remain
 non-emitting.
+
+## Useful local answers
+
+The query-planning, filtered-retrieval, prompt metadata, guided Settings, and content-free smoke
+runbook for questions such as Telegram around noon, largest GitHub PR today, Codex settings early
+afternoon, and Amazon book this afternoon are specified in
+[`useful-local-answers.md`](useful-local-answers.md). Answers must come only from captured
+screenshots/OCR and must report uncertainty when local evidence is insufficient.
 
 ## Keyboard model (P2)
 

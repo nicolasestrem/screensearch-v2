@@ -216,6 +216,14 @@ impl AutomationCommandError {
 )]
 #[allow(clippy::large_enum_variant)]
 enum SearchUiEvent {
+    Plan {
+        original_query: String,
+        retrieval_query: String,
+        timezone_label: String,
+        captured_after: String,
+        captured_before: String,
+        source_terms: Vec<String>,
+    },
     Citation {
         capture_id: String,
         chunk_id: String,
@@ -1003,7 +1011,7 @@ async fn search(
         request_id: uuid::Uuid::now_v7().to_string(),
         body: Some(request_envelope::Body::Search(SearchRequest {
             query,
-            limit: 16,
+            limit: 20,
             generate_answer,
         })),
     };
@@ -1011,6 +1019,16 @@ async fn search(
         .request_each(request, |response| {
             match response.body {
                 Some(response_envelope::Body::Search(event)) => match event.event {
+                    Some(search_event::Event::Plan(plan)) => on_event
+                        .send(SearchUiEvent::Plan {
+                            original_query: plan.original_query,
+                            retrieval_query: plan.retrieval_query,
+                            timezone_label: plan.timezone_label,
+                            captured_after: plan.captured_after,
+                            captured_before: plan.captured_before,
+                            source_terms: plan.source_terms,
+                        })
+                        .map_err(channel_error)?,
                     Some(search_event::Event::Citation(citation)) => on_event
                         .send(SearchUiEvent::Citation {
                             capture_id: citation.capture_id,
@@ -1426,6 +1444,32 @@ mod tests {
         assert_eq!(value["citationCount"], 3);
         assert_eq!(value["answerStatus"], "answered");
         assert!(value.get("citation_count").is_none());
+    }
+
+    #[test]
+    fn plan_event_serializes_with_camel_case_fields() {
+        let value = serde_json::to_value(SearchUiEvent::Plan {
+            original_query: "Which book did I check on Amazon this afternoon?".to_owned(),
+            retrieval_query: "book".to_owned(),
+            timezone_label: "W. Europe Standard Time".to_owned(),
+            captured_after: "2026-06-22T10:00:00Z".to_owned(),
+            captured_before: "2026-06-22T16:00:00Z".to_owned(),
+            source_terms: vec!["amazon".to_owned()],
+        })
+        .expect("serialize plan event");
+        assert_eq!(value["kind"], "plan");
+        assert_eq!(
+            value["originalQuery"],
+            "Which book did I check on Amazon this afternoon?"
+        );
+        assert_eq!(value["retrievalQuery"], "book");
+        assert_eq!(value["timezoneLabel"], "W. Europe Standard Time");
+        assert_eq!(value["capturedAfter"], "2026-06-22T10:00:00Z");
+        assert_eq!(value["capturedBefore"], "2026-06-22T16:00:00Z");
+        assert_eq!(value["sourceTerms"][0], "amazon");
+        assert!(value.get("original_query").is_none());
+        assert!(value.get("retrieval_query").is_none());
+        assert!(value.get("timezone_label").is_none());
     }
 
     #[test]

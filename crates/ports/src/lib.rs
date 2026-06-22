@@ -14,7 +14,7 @@ use screensearch_domain::{
     AnalysisJob, AnalysisResult, ArchiveSettings, AssetCleanupTask, AssetRef, AutomationAction,
     AutomationFailureCode, AutomationRun, AutomationRunId, AutomationRunStatus, AutomationSettings,
     AutomationTarget, CaptureDisposition, CaptureId, CapturedFrame, DeleteCaptures,
-    DeletionSummary, GenerationModel, NewCapture, OcrBlock, QueueMetrics, SearchHit,
+    DeletionSummary, GenerationModel, NewCapture, OcrBlock, QueueMetrics, SearchFilters, SearchHit,
     StorageMetrics,
 };
 use thiserror::Error;
@@ -96,6 +96,7 @@ pub trait ArchiveRepository: Send + Sync {
         query: &str,
         embedding: &[f32],
         model_id: &str,
+        filters: &SearchFilters,
         limit: usize,
     ) -> Result<Vec<SearchHit>, PortError>;
 

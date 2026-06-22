@@ -86,6 +86,12 @@ The sidecar `llama-cli.exe` is invoked with full GPU layer offload, a 4096-token
 
 The table above remains a CPU baseline. Rerun the benchmark and gated worker suite on GPU-capable hardware before comparing GPU latency or selecting a release default. The `gpu-vulkan` Cargo feature remains available for advanced local-build experiments, but it is no longer the normal GPU acceleration path and still requires the Vulkan SDK on the build machine.
 
+## 2026-06-22 Useful-Answer Planning Pass
+
+Search now supplies the generation model with better bounded evidence context: a deterministic local-time query plan, source/time filters applied before ranking, local timestamp/source metadata per citation, and explicit instructions to cite capture IDs or state insufficient evidence. The desktop strips model `<think>` spans before display and Settings shows answer-readiness/model state.
+
+This improves the harness available for qualitative scoring, but it does not choose or approve a release model. Item 15 remains open until the required prompt cases are scored against an approved acquisition path and memory-pressure unload is implemented.
+
 ## Engineering Recommendation
 
 Keep both candidates in the development pool. `Ministral-3-3B-Reasoning-2512-Q4_K_M.gguf` is the

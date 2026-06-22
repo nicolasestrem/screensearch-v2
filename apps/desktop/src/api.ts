@@ -109,6 +109,15 @@ export interface AutomationApproval {
 
 export type SearchEvent =
   | {
+      kind: "plan";
+      originalQuery: string;
+      retrievalQuery: string;
+      timezoneLabel: string;
+      capturedAfter: string;
+      capturedBefore: string;
+      sourceTerms: string[];
+    }
+  | {
       kind: "citation";
       captureId: string;
       chunkId: string;
@@ -255,6 +264,15 @@ export const api = {
     receive: (event: SearchEvent) => void,
   ) => {
     if (!isTauri) {
+      receive({
+        kind: "plan",
+        originalQuery: query,
+        retrievalQuery: query.toLowerCase().replace(/[^\da-z]+/g, " ").trim(),
+        timezoneLabel: Intl.DateTimeFormat().resolvedOptions().timeZone || "Local time",
+        capturedAfter: "",
+        capturedBefore: "",
+        sourceTerms: [],
+      });
       previewCitations.forEach(receive);
       if (generateAnswer) {
         receive({ kind: "token", text: "The selected evidence shows the V2 architecture and its locally verified capture, OCR, and search pipeline." });

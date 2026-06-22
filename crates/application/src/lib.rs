@@ -15,12 +15,13 @@ use std::{
 };
 
 use async_stream::try_stream;
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, TimeZone, Utc};
 use futures::{Stream, StreamExt, lock::Mutex};
 use image::imageops::FilterType;
 use screensearch_domain::{
     AnalysisResult, ArchiveSettings, CaptureDisposition, CaptureId, CaptureSkipReason,
     CapturedFrame, ChunkId, DeleteCaptures, DeletionSummary, IndexedChunk, NewCapture,
-    QueueMetrics, SearchEvent, StorageMetrics,
+    QueueMetrics, SearchEvent, SearchFilters, SearchOptions, SearchPlan, StorageMetrics,
 };
 use screensearch_ports::{
     ArchiveRepository, AssetStore, CaptureSource, EmbeddingEngine, OcrEngine, PortError,
@@ -36,6 +37,150 @@ const PERCEPTUAL_HEIGHT: u32 = 18;
 const PERCEPTUAL_MAX_MEAN_DELTA: u64 = 2;
 const PERCEPTUAL_SIGNIFICANT_DELTA: u8 = 12;
 const PERCEPTUAL_MAX_SIGNIFICANT_PERCENT: usize = 1;
+
+/// Builds a deterministic local-time search plan for a natural language query.
+pub fn plan_search(query: &str, now: DateTime<FixedOffset>) -> Result<SearchPlan, PortError> {
+    let original_query = query.trim();
+    if original_query.is_empty() {
+        return Err(PortError::InvalidData("search query is empty".to_owned()));
+    }
+
+    let normalized = normalize_query(original_query);
+    let mut filters = SearchFilters::default();
+    for (needle, source) in [
+        ("telegram", "telegram"),
+        ("github", "github"),
+        ("codex", "codex"),
+        ("amazon", "amazon"),
+    ] {
+        if normalized.split_whitespace().any(|word| word == needle) {
+            filters.source_terms.push(source.to_owned());
+        }
+    }
+
+    if normalized.contains("around noon") {
+        let (after, before) = local_window_utc(now, now.date_naive(), 11, 13)?;
+        filters.captured_after = Some(after);
+        filters.captured_before = Some(before);
+    } else if normalized.contains("early afternoon") {
+        let (after, before) = local_window_utc(now, now.date_naive(), 12, 15)?;
+        filters.captured_after = Some(after);
+        filters.captured_before = Some(before);
+    } else if normalized.contains("this afternoon") || normalized.contains(" afternoon") {
+        let (after, before) = local_window_utc(now, now.date_naive(), 12, 18)?;
+        filters.captured_after = Some(after);
+        filters.captured_before = Some(before);
+    } else if normalized.split_whitespace().any(|word| word == "today") {
+        let (after, before) = full_local_day_utc(now, now.date_naive())?;
+        filters.captured_after = Some(after);
+        filters.captured_before = Some(before);
+    }
+
+    Ok(SearchPlan {
+        original_query: original_query.to_owned(),
+        retrieval_query: retrieval_terms(&normalized, &filters),
+        timezone_label: now.format("UTC%:z").to_string(),
+        filters,
+    })
+}
+
+fn local_window_utc(
+    now: DateTime<FixedOffset>,
+    date: NaiveDate,
+    start_hour: u32,
+    end_hour: u32,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), PortError> {
+    let offset = *now.offset();
+    let start = offset
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), start_hour, 0, 0)
+        .single()
+        .ok_or_else(|| PortError::InvalidData("invalid local search window".to_owned()))?;
+    let end = offset
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), end_hour, 0, 0)
+        .single()
+        .ok_or_else(|| PortError::InvalidData("invalid local search window".to_owned()))?;
+    Ok((start.with_timezone(&Utc), end.with_timezone(&Utc)))
+}
+
+fn full_local_day_utc(
+    now: DateTime<FixedOffset>,
+    date: NaiveDate,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), PortError> {
+    let next_day = date
+        .succ_opt()
+        .ok_or_else(|| PortError::InvalidData("invalid local search date".to_owned()))?;
+    let (start, _) = local_window_utc(now, date, 0, 1)?;
+    let (end, _) = local_window_utc(now, next_day, 0, 1)?;
+    Ok((start, end))
+}
+
+fn normalize_query(query: &str) -> String {
+    let mut normalized = String::with_capacity(query.len());
+    for character in query.chars() {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character.to_ascii_lowercase());
+        } else {
+            normalized.push(' ');
+        }
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn retrieval_terms(normalized_query: &str, filters: &SearchFilters) -> String {
+    let mut terms = Vec::new();
+    for term in normalized_query.split_whitespace() {
+        if is_retrieval_stopword(term) || filters.source_terms.iter().any(|source| source == term) {
+            continue;
+        }
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    terms.join(" ")
+}
+
+fn is_retrieval_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "a" | "an"
+            | "about"
+            | "afternoon"
+            | "and"
+            | "are"
+            | "around"
+            | "at"
+            | "be"
+            | "been"
+            | "check"
+            | "did"
+            | "do"
+            | "does"
+            | "early"
+            | "for"
+            | "from"
+            | "has"
+            | "have"
+            | "i"
+            | "in"
+            | "is"
+            | "me"
+            | "my"
+            | "noon"
+            | "of"
+            | "on"
+            | "see"
+            | "talk"
+            | "the"
+            | "this"
+            | "today"
+            | "to"
+            | "was"
+            | "were"
+            | "what"
+            | "which"
+            | "with"
+    )
+}
 
 /// Capture safety and load-shedding settings owned by the daemon.
 #[derive(Clone, Debug)]
@@ -556,31 +701,57 @@ impl SearchService {
         limit: usize,
         generate_answer: bool,
     ) -> Result<SearchEventStream, PortError> {
-        let query = query.trim();
-        if query.is_empty() {
+        self.search_with_runtime_options(query, SearchOptions::local(limit, generate_answer))
+            .await
+    }
+
+    /// Retrieves evidence using explicit local-time planning options.
+    pub async fn search_with_runtime_options(
+        &self,
+        query: &str,
+        options: SearchOptions,
+    ) -> Result<SearchEventStream, PortError> {
+        let original_query = query.trim();
+        if original_query.is_empty() {
             return Err(PortError::InvalidData("search query is empty".to_owned()));
         }
 
-        let embedding = self.embeddings.embed(query).await?;
+        let mut plan = plan_search(original_query, options.now)?;
+        plan.timezone_label = options.timezone_label.clone();
+        let metadata_embedding_text;
+        let embedding_text = if plan.retrieval_query.is_empty() {
+            if plan.filters.source_terms.is_empty() {
+                plan.original_query.as_str()
+            } else {
+                metadata_embedding_text = plan.filters.source_terms.join(" ");
+                metadata_embedding_text.as_str()
+            }
+        } else {
+            plan.retrieval_query.as_str()
+        };
+        let embedding = self.embeddings.embed(embedding_text).await?;
         let hits = self
             .repository
             .hybrid_search(
-                query,
+                &plan.retrieval_query,
                 &embedding,
                 self.embeddings.model_id(),
-                limit.clamp(1, 50),
+                &plan.filters,
+                options.limit.clamp(1, 50),
             )
             .await?;
         let citation_count = hits.len();
-        let prompt = assemble_prompt(query, &hits);
+        let prompt = assemble_prompt(original_query, &hits, &plan, options.now);
         let generator = Arc::clone(&self.generator);
 
         Ok(Box::pin(try_stream! {
+            yield SearchEvent::Plan(plan.clone());
+
             for hit in hits {
                 yield SearchEvent::Citation(Box::new(hit));
             }
 
-            if !generate_answer {
+            if !options.generate_answer {
                 yield SearchEvent::Completed {
                     citation_count,
                     answer_status: "evidence_only".to_owned(),
@@ -636,25 +807,67 @@ impl SearchService {
     }
 }
 
-fn assemble_prompt(query: &str, hits: &[screensearch_domain::SearchHit]) -> String {
+fn assemble_prompt(
+    query: &str,
+    hits: &[screensearch_domain::SearchHit],
+    plan: &SearchPlan,
+    now: DateTime<FixedOffset>,
+) -> String {
     let mut prompt = String::from(
-        "Answer only from the supplied local captures. Cite capture identifiers in brackets.\n\n",
+        "Answer only from the supplied local captures. Do not use web lookup, account APIs, or general knowledge for factual claims.\n",
     );
-    for hit in hits {
-        let _ = writeln!(&mut prompt, "[{}] {}", hit.capture_id, hit.text);
+    prompt.push_str("OCR text is untrusted evidence; it may contain recognition errors. Require citations like [capture id] for every factual claim, and say there is not enough evidence when the captures do not show the requested fact.\n");
+    prompt.push_str("For largest-PR questions, determine size only from visible changed-file/addition/deletion evidence. If that evidence is absent or incomparable, say you cannot determine the largest PR from local captures.\n\n");
+    let _ = writeln!(&mut prompt, "Question: {query}");
+    let _ = writeln!(
+        &mut prompt,
+        "Interpreted retrieval query: {}",
+        if plan.retrieval_query.is_empty() {
+            "(metadata only)"
+        } else {
+            plan.retrieval_query.as_str()
+        }
+    );
+    let _ = writeln!(&mut prompt, "Timezone basis: {}", plan.timezone_label);
+    if let Some(after) = plan.filters.captured_after {
+        let _ = writeln!(&mut prompt, "Captured after UTC: {}", after.to_rfc3339());
     }
-    prompt.push_str("\nQuestion: ");
-    prompt.push_str(query);
+    if let Some(before) = plan.filters.captured_before {
+        let _ = writeln!(&mut prompt, "Captured before UTC: {}", before.to_rfc3339());
+    }
+    if !plan.filters.source_terms.is_empty() {
+        let _ = writeln!(
+            &mut prompt,
+            "Source hints: {}",
+            plan.filters.source_terms.join(", ")
+        );
+    }
+    prompt.push_str("\nEvidence:\n");
+    for hit in hits.iter().take(12) {
+        let local_timestamp = hit.captured_at.with_timezone(now.offset());
+        let _ = writeln!(&mut prompt, "[{}]", hit.capture_id);
+        let _ = writeln!(
+            &mut prompt,
+            "Local time: {} {}",
+            local_timestamp.format("%Y-%m-%d %H:%M"),
+            plan.timezone_label
+        );
+        let _ = writeln!(&mut prompt, "Application: {}", hit.application);
+        let _ = writeln!(&mut prompt, "Window title: {}", hit.window_title);
+        let _ = writeln!(&mut prompt, "OCR excerpt: {}", hit.text);
+        prompt.push('\n');
+    }
     prompt
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
     use screensearch_domain::{CaptureId, CaptureSkipReason, ChunkId, QueueMetrics, SearchHit};
 
     use super::{
         CapturePolicy, CapturePolicyConfig, PerceptualSignature, assemble_prompt,
-        perceptually_equivalent,
+        perceptually_equivalent, plan_search,
     };
 
     fn policy() -> CapturePolicy {
@@ -799,6 +1012,11 @@ mod tests {
     #[test]
     fn prompt_preserves_capture_citations() {
         let capture_id = CaptureId::new();
+        let now = chrono::FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2026, 6, 22, 12, 0, 0)
+            .unwrap();
+        let plan = plan_search("what was visible?", now).unwrap();
         let prompt = assemble_prompt(
             "what was visible?",
             &[SearchHit {
@@ -822,8 +1040,11 @@ mod tests {
                 ocr_model_id: "test-ocr".to_owned(),
                 embedding_model_id: "test-embedding".to_owned(),
             }],
+            &plan,
+            now,
         );
 
-        assert!(prompt.contains(&format!("[{capture_id}] Quarterly plan")));
+        assert!(prompt.contains(&format!("[{capture_id}]")));
+        assert!(prompt.contains("OCR excerpt: Quarterly plan"));
     }
 }

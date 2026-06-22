@@ -2,6 +2,27 @@
 
 This log records meaningful AI-assisted repository changes and their reasons. It is not a substitute for Git history.
 
+## 2026-06-22 — Useful local answers and guided settings
+
+### Changed
+
+- Added deterministic local-time query planning for the supplied Telegram, GitHub PR, Codex settings, and Amazon book prompts. The planner extracts source hints, bounded Windows-local time windows, and a reduced retrieval query.
+- Added domain `SearchFilters`, `SearchPlan`, and `SearchOptions`, plus an additive search-plan event over protobuf/Tauri/TypeScript so the UI can show the interpreted plan.
+- Changed hybrid search so source/time metadata filters apply inside lexical and semantic candidate SQL before rank fusion. Filtered semantic search uses the exact vector path rather than global top-k.
+- Replaced strict all-term FTS with phrase/exact boosting plus OR fallback, preserving capture-level dedupe and embedding model-revision isolation.
+- Enriched answer prompts with capture id, local timestamp/timezone, application, window title, and OCR excerpt, and explicitly instructs the model that OCR is untrusted evidence requiring citations or uncertainty.
+- Hid generated `<think>` spans before desktop display.
+- Redesigned Settings around answer readiness, timezone basis, active/installed answer model state, blank guided local GGUF import, advanced explicit HF download, explicit retention/budget state, and a conservative storage reset.
+- Added a content-free ignored local archive smoke for the four acceptance prompts.
+
+### Why
+
+The app previously searched raw text with post-hoc UI filtering and sparse answer context, so questions like "Telegram around noon" or "largest PR today" could return irrelevant or uncited results. This pass makes the local evidence constraints deterministic, inspectable, and enforced before ranking while keeping external services out of answer generation.
+
+### Remaining boundary
+
+Patch-plan item 15 stays open for qualitative answer scoring, release model approval/acquisition, and memory-pressure unload. Item 18 stays open for locked-session privacy, security, packaging/signing, and release soak.
+
 ## 2026-06-22 — PR #10 review follow-up
 
 ### Changed

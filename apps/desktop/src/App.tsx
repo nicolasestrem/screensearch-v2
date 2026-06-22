@@ -38,6 +38,7 @@ import {
 } from "./api";
 
 type Citation = Extract<SearchEvent, { kind: "citation" }>;
+type SearchPlanEvent = Extract<SearchEvent, { kind: "plan" }>;
 type DetailTab = "text" | "metadata" | "source";
 type ModalName = "privacy" | "settings" | "automation" | null;
 type SettingsDraft = {
@@ -95,6 +96,11 @@ export function App() {
   );
   const answer = useMemo(
     () => events.filter((event) => event.kind === "token").map((event) => event.text).join(""),
+    [events],
+  );
+  const visibleAnswer = useMemo(() => stripThinkSpans(answer), [answer]);
+  const searchPlan = useMemo(
+    () => [...events].reverse().find((event): event is SearchPlanEvent => event.kind === "plan"),
     [events],
   );
   const answerCompletion = useMemo(
@@ -305,6 +311,11 @@ export function App() {
             <button className="filter-button" type="button" onClick={() => openModal("privacy")}>
               <ShieldCheck /> Privacy & exclusions <CaretDown />
             </button>
+            {searchPlan && (
+              <span className="plan-summary" title={planTooltip(searchPlan)}>
+                <ClockCounterClockwise /> {planSummary(searchPlan)}
+              </span>
+            )}
             <span className="result-count">
               {search.isPending ? "Searching local index…" : `${filteredCitations.length} evidence matches`}
             </span>
@@ -346,7 +357,7 @@ export function App() {
                 <EvidenceDetail
                   citation={selected}
                   tab={detailTab}
-                  answer={answer}
+                  answer={visibleAnswer}
                   answerStatus={answerCompletion?.answerStatus ?? "evidence_only"}
                   answerMessage={answerCompletion?.answerMessage ?? ""}
                   searching={search.isPending}
@@ -781,18 +792,21 @@ function errorText(error: unknown) {
 function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<ModalName, null | "automation">; paused: boolean; onClose: () => void; onCapture: () => void }) {
   const queryClient = useQueryClient();
   const dialogRef = useRef<HTMLElement>(null);
+  const health = useQuery({ queryKey: ["health"], queryFn: api.health });
   const settings = useQuery({ queryKey: ["archive-settings"], queryFn: api.archiveSettings });
   const shell = useQuery({ queryKey: ["shell-settings"], queryFn: api.getShellSettings });
   const models = useQuery({ queryKey: ["generation-models"], queryFn: api.generationModels });
   const [draft, setDraft] = useState<SettingsDraft>();
   const [modelDraft, setModelDraft] = useState({
-    sourcePath: "models\\NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf",
-    repository: "unsloth/Qwen3.5-4B-GGUF",
-    filename: "Qwen3.5-4B-Q4_K_M.gguf",
-    displayName: "Qwen3.5 4B Q4_K_M",
+    sourcePath: "",
+    repository: "",
+    filename: "",
+    displayName: "",
   });
   const [confirmDelete, setConfirmDelete] = useState(false);
   const current = draft ?? settingsDraft(settings.data);
+  const activeModel = models.data?.find((model) => model.active);
+  const localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "Local time";
 
   useEffect(() => {
     const root = dialogRef.current;
@@ -840,6 +854,19 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
       void queryClient.invalidateQueries({ queryKey: ["health"] });
     },
   });
+  const resetStoragePolicy = useMutation({
+    mutationFn: () => api.updateArchiveSettings({
+      retentionDays: null,
+      diskBudgetBytes: null,
+      excludedApplications: splitPatterns(current.excludedApplications),
+      excludedTitles: splitPatterns(current.excludedTitles),
+    }),
+    onSuccess: (result) => {
+      queryClient.setQueryData<ArchiveSettings>(["archive-settings"], result.settings);
+      setDraft(settingsDraft(result.settings));
+      void queryClient.invalidateQueries({ queryKey: ["health"] });
+    },
+  });
   const saveHotkey = useMutation({
     mutationFn: (hotkey: string) => api.setShellSettings(hotkey),
     onSuccess: (result) => {
@@ -866,7 +893,7 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
     mutationFn: api.unloadGenerationModel,
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["generation-models"] }),
   });
-  const modalError = settings.error || save.error || deleteAll.error || saveHotkey.error
+  const modalError = settings.error || save.error || resetStoragePolicy.error || deleteAll.error || saveHotkey.error
     || models.error || importModel.error || downloadModel.error || selectModel.error || deleteModel.error || unloadModel.error;
 
   return (
@@ -898,9 +925,19 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
         ) : (
           <div className="modal-content">
             <div className="setting-row"><span><strong>Automatic capture</strong><small>{paused ? "Capture is paused." : "The focused monitor is captured every two seconds."}</small></span><span className={`state-pill ${paused ? "paused" : ""}`}>{paused ? "Paused" : "Active"}</span></div>
+            <div className="readiness-grid" aria-label="Answer readiness">
+              <span><strong>{health.data?.captureCount.toLocaleString() ?? "—"}</strong><small>captures</small></span>
+              <span><strong>{health.data?.ocrBlockCount.toLocaleString() ?? "—"}</strong><small>OCR chunks</small></span>
+              <span><strong>{health.data?.searchChunkCount.toLocaleString() ?? "—"}</strong><small>embeddings</small></span>
+              <span><strong>{activeModel?.displayName ?? "None"}</strong><small>answer model</small></span>
+              <span><strong>{health.data ? `${health.data.queueDepth} / ${health.data.deadLetterCount}` : "—"}</strong><small>queue / dead</small></span>
+              <span><strong>{localTimeZone}</strong><small>timezone basis</small></span>
+            </div>
             <div className="storage-summary">
-              <span><strong>{settings.data?.captureCount.toLocaleString() ?? "—"}</strong><small>captures</small></span>
+              <span><strong>{settings.data?.captureCount.toLocaleString() ?? "—"}</strong><small>captures stored</small></span>
               <span><strong>{settings.data ? formatBytes(settings.data.assetBytes) : "—"}</strong><small>screen assets</small></span>
+              <span><strong>{current.retentionDays ? `${current.retentionDays} days` : "Keep all"}</strong><small>retention</small></span>
+              <span><strong>{current.diskBudgetBytes ? formatBytes(current.diskBudgetBytes) : "No limit"}</strong><small>asset budget</small></span>
             </div>
             <label className="settings-field compact">
               <span><strong>Age retention</strong><small>Only completed or waiting captures are eligible; active analysis is protected.</small></span>
@@ -924,7 +961,12 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
             </label>
             <div className="modal-actions">
               <span>{save.isSuccess ? "Retention policy saved" : "Changes are applied immediately and checked every minute."}</span>
-              <button type="button" onClick={() => save.mutate()} disabled={settings.isPending || save.isPending}>{save.isPending ? "Applying…" : "Save storage policy"}</button>
+              <div className="modal-action-buttons">
+                <button type="button" className="secondary" onClick={() => resetStoragePolicy.mutate()} disabled={settings.isPending || resetStoragePolicy.isPending}>
+                  {resetStoragePolicy.isPending ? "Resetting…" : "Reset conservative"}
+                </button>
+                <button type="button" onClick={() => save.mutate()} disabled={settings.isPending || save.isPending}>{save.isPending ? "Applying…" : "Save storage policy"}</button>
+              </div>
             </div>
             <div className="setting-row"><span><strong>Capture current frame</strong><small>Queue an immediate frame without changing the automatic cadence.</small></span><button type="button" onClick={onCapture}><Camera /> Capture now</button></div>
             <div className="setting-row"><span><strong>Search shortcut</strong><small>Focus search from anywhere in this window.</small></span><kbd>Ctrl K</kbd></div>
@@ -1018,47 +1060,48 @@ function ModelSettings({
 }) {
   const active = models.find((model) => model.active);
   return (
-    <section className="model-settings" aria-label="Generation models">
+    <section className="model-settings guided" aria-label="Generation models">
       <div className="model-heading">
         <span>
-          <strong>Answer model</strong>
-          <small>{active ? `${active.displayName} · ${active.quantization || "GGUF"}` : "No generation model selected."}</small>
+          <strong>Answer Model</strong>
+          <small>{active ? `${active.displayName} · ${active.quantization || "GGUF"}` : "No local GGUF selected."}</small>
         </span>
-        <button type="button" onClick={onUnload} disabled={busy || !active}>{unloadPending ? "Unloading..." : "Unload"}</button>
+        <button type="button" onClick={onUnload} disabled={busy || !active}>{unloadPending ? "Unloading…" : "Unload"}</button>
       </div>
       <div className="model-source-grid">
-        <div className="model-source">
+        <div className="model-source primary">
           <span className="model-source-heading">
-            <strong>Local GGUF</strong>
-            <small>Import ignored repo samples or any local GGUF file.</small>
+            <strong>Import local GGUF</strong>
+            <small>Select a local file and make it the active answer model.</small>
           </span>
           <label>
             <span>Path</span>
-            <input value={draft.sourcePath} onChange={(event) => onDraft({ ...draft, sourcePath: event.target.value })} />
+            <input value={draft.sourcePath} onChange={(event) => onDraft({ ...draft, sourcePath: event.target.value })} placeholder="C:\\Models\\answer-model.gguf" />
           </label>
           <label>
             <span>Display name</span>
-            <input value={draft.displayName} onChange={(event) => onDraft({ ...draft, displayName: event.target.value })} />
+            <input value={draft.displayName} onChange={(event) => onDraft({ ...draft, displayName: event.target.value })} placeholder="Local answer model" />
           </label>
-          <button type="button" onClick={onImport} disabled={busy || !draft.sourcePath.trim()}><Archive /> {importPending ? "Importing..." : "Import local"}</button>
+          <button type="button" onClick={onImport} disabled={busy || !draft.sourcePath.trim() || !draft.displayName.trim()}><Archive /> {importPending ? "Importing…" : "Import local"}</button>
         </div>
-        <div className="model-source">
+        <details className="model-source advanced-model">
+          <summary>Advanced HF download</summary>
           <span className="model-source-heading">
-            <strong>Hugging Face</strong>
-            <small>Download one explicit file into local app data.</small>
+            <strong>Explicit repository file</strong>
+            <small>Download one named GGUF into local app data.</small>
           </span>
           <label>
             <span>Repository</span>
-            <input value={draft.repository} onChange={(event) => onDraft({ ...draft, repository: event.target.value })} />
+            <input value={draft.repository} onChange={(event) => onDraft({ ...draft, repository: event.target.value })} placeholder="owner/repository" />
           </label>
           <label>
             <span>Filename</span>
-            <input value={draft.filename} onChange={(event) => onDraft({ ...draft, filename: event.target.value })} />
+            <input value={draft.filename} onChange={(event) => onDraft({ ...draft, filename: event.target.value })} placeholder="model.Q4_K_M.gguf" />
           </label>
-          <button type="button" onClick={onDownload} disabled={busy || !draft.repository.trim() || !draft.filename.trim()}><Sparkle /> {downloadPending ? "Downloading..." : "Download HF"}</button>
-        </div>
+          <button type="button" onClick={onDownload} disabled={busy || !draft.repository.trim() || !draft.filename.trim() || !draft.displayName.trim()}><Sparkle /> {downloadPending ? "Downloading…" : "Download HF"}</button>
+        </details>
       </div>
-      {models.length > 0 && (
+      {models.length > 0 ? (
         <div className="model-list">
           {models.map((model) => (
             <div key={model.id} className="model-row">
@@ -1073,6 +1116,8 @@ function ModelSettings({
             </div>
           ))}
         </div>
+      ) : (
+        <div className="model-list-empty">No installed answer models.</div>
       )}
     </section>
   );
@@ -1092,6 +1137,41 @@ function answerSubtitle(answer: string, status: string, message: string) {
   if (status === "generation_failed") return message || "Local generation failed.";
   if (status === "cancelled") return "Generation was cancelled.";
   return "Requires an active local GGUF model";
+}
+
+function stripThinkSpans(value: string) {
+  return value
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<think>[\s\S]*$/i, "")
+    .trim();
+}
+
+function planSummary(plan: SearchPlanEvent) {
+  const parts = [
+    plan.sourceTerms.length ? plan.sourceTerms.join(", ") : "local evidence",
+    plan.retrievalQuery || "metadata-only",
+    planWindowLabel(plan),
+    plan.timezoneLabel,
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
+function planTooltip(plan: SearchPlanEvent) {
+  return [
+    `Original: ${plan.originalQuery}`,
+    `Retrieval: ${plan.retrievalQuery || "(metadata only)"}`,
+    plan.sourceTerms.length ? `Sources: ${plan.sourceTerms.join(", ")}` : "",
+    plan.capturedAfter ? `After: ${plan.capturedAfter}` : "",
+    plan.capturedBefore ? `Before: ${plan.capturedBefore}` : "",
+    `Timezone: ${plan.timezoneLabel}`,
+  ].filter(Boolean).join("\n");
+}
+
+function planWindowLabel(plan: SearchPlanEvent) {
+  if (!plan.capturedAfter && !plan.capturedBefore) return "";
+  const after = plan.capturedAfter ? formatDateTime(plan.capturedAfter) : "start";
+  const before = plan.capturedBefore ? formatDateTime(plan.capturedBefore) : "now";
+  return `${after} to ${before}`;
 }
 
 function normalizeHotkeyKey(key: string) {
