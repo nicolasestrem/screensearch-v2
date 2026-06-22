@@ -1,6 +1,12 @@
 //! Dependency-inversion ports implemented by capture, storage, model, and automation adapters.
 
-use std::pin::Pin;
+use std::{
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -201,6 +207,29 @@ pub trait AutomationRepository: Send + Sync {
     ) -> Result<u64, PortError>;
 }
 
+/// Shared cancellation signal for one in-flight native automation action.
+#[derive(Clone, Debug, Default)]
+pub struct AutomationAbortSignal {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl AutomationAbortSignal {
+    /// Creates a clear cancellation signal.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marks the action cancelled. Native adapters must fail closed before emitting input.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns true once the action has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
 /// Native platform observations and one typed action emission.
 #[async_trait]
 pub trait AutomationPlatform: Send + Sync {
@@ -215,6 +244,7 @@ pub trait AutomationPlatform: Send + Sync {
         &self,
         target: &AutomationTarget,
         action: &AutomationAction,
+        abort_signal: AutomationAbortSignal,
     ) -> Result<(), PortError>;
 }
 

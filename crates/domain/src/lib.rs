@@ -111,6 +111,18 @@ pub struct AutomationTarget {
 }
 
 impl AutomationTarget {
+    /// Returns true when two targets have the same HWND/PID/executable identity.
+    ///
+    /// The display title is intentionally excluded because it is user-visible review context and
+    /// can legitimately change while the same process/window remains selected.
+    pub fn matches_identity(&self, other: &Self) -> bool {
+        self.process_id == other.process_id
+            && self.window_handle == other.window_handle
+            && self
+                .executable_name
+                .eq_ignore_ascii_case(&other.executable_name)
+    }
+
     /// Validates a complete, bounded target identity.
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.process_id == 0 || self.window_handle == 0 {
@@ -1185,6 +1197,18 @@ mod tests {
             target: automation_target(),
             actions,
         }
+    }
+
+    #[test]
+    fn automation_target_identity_ignores_title_but_requires_hwnd_pid_and_executable() {
+        let target = automation_target();
+        let mut same_identity = target.clone();
+        same_identity.display_title = "Renamed window".to_owned();
+        same_identity.executable_name = "NOTEPAD.EXE".to_owned();
+        assert!(target.matches_identity(&same_identity));
+
+        same_identity.window_handle = 7;
+        assert!(!target.matches_identity(&same_identity));
     }
 
     #[test]

@@ -1,18 +1,22 @@
 #![allow(unsafe_code)]
 
-use std::{ffi::c_void, mem::size_of, path::Path};
+use std::{
+    ffi::c_void,
+    mem::{ManuallyDrop, size_of},
+    path::Path,
+};
 
 use async_trait::async_trait;
 use screensearch_domain::{
     AutomationAction, AutomationFailureCode, AutomationKey, AutomationTarget, KeyModifier,
 };
-use screensearch_ports::{AutomationPlatform, PortError};
+use screensearch_ports::{AutomationAbortSignal, AutomationPlatform, PortError};
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE, HWND},
         System::{
             Com::{
-                CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
                 CoUninitialize,
             },
             RemoteDesktop::{
@@ -23,12 +27,13 @@ use windows::{
                 OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
                 QueryFullProcessImageNameW,
             },
+            Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BSTR, VariantClear},
         },
         UI::{
             Accessibility::{
                 CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
-                IUIAutomationValuePattern, TreeScope_Descendants, UIA_InvokePatternId,
-                UIA_ValuePatternId,
+                IUIAutomationValuePattern, TreeScope_Descendants, UIA_AutomationIdPropertyId,
+                UIA_InvokePatternId, UIA_ValuePatternId,
             },
             Input::KeyboardAndMouse::{
                 INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
@@ -64,10 +69,11 @@ impl AutomationPlatform for WindowsAutomationPlatform {
         &self,
         target: &AutomationTarget,
         action: &AutomationAction,
+        abort_signal: AutomationAbortSignal,
     ) -> Result<(), PortError> {
         let target = target.clone();
         let action = action.clone();
-        tokio::task::spawn_blocking(move || execute_native_action(&target, &action))
+        tokio::task::spawn_blocking(move || execute_native_action(&target, &action, &abort_signal))
             .await
             .map_err(|error| PortError::Internal(format!("automation task failed: {error}")))?
     }
@@ -166,21 +172,30 @@ fn read_session_unlocked() -> Result<bool, PortError> {
 fn execute_native_action(
     target: &AutomationTarget,
     action: &AutomationAction,
+    abort_signal: &AutomationAbortSignal,
 ) -> Result<(), PortError> {
+    ensure_not_cancelled(abort_signal)?;
     let foreground = read_foreground_target()?;
-    if !target_identity_matches(&foreground, target) {
+    ensure_not_cancelled(abort_signal)?;
+    if !foreground.matches_identity(target) {
         return Err(PortError::Automation(AutomationFailureCode::TargetChanged));
     }
     match action {
-        AutomationAction::UiaInvoke { automation_id } => execute_uia(target, automation_id, None),
+        AutomationAction::UiaInvoke { automation_id } => {
+            execute_uia(target, automation_id, None, abort_signal)
+        }
         AutomationAction::UiaSetValue {
             automation_id,
             value,
-        } => execute_uia(target, automation_id, Some(value)),
-        AutomationAction::KeyChord { modifiers, key } => {
-            send_keyboard_inputs(&encode_key_chord_inputs(modifiers, *key), modifiers)
+        } => execute_uia(target, automation_id, Some(value), abort_signal),
+        AutomationAction::KeyChord { modifiers, key } => send_keyboard_inputs(
+            &encode_key_chord_inputs(modifiers, *key),
+            modifiers,
+            abort_signal,
+        ),
+        AutomationAction::TypeText { text } => {
+            send_keyboard_inputs(&encode_text_inputs(text), &[], abort_signal)
         }
-        AutomationAction::TypeText { text } => send_keyboard_inputs(&encode_text_inputs(text), &[]),
     }
 }
 
@@ -188,6 +203,7 @@ fn execute_uia(
     target: &AutomationTarget,
     automation_id: &str,
     value: Option<&String>,
+    abort_signal: &AutomationAbortSignal,
 ) -> Result<(), PortError> {
     let _com = ComApartment::initialize()?;
     // SAFETY: COM is initialized on this blocking thread. The target HWND was revalidated
@@ -202,28 +218,35 @@ fn execute_uia(
         let hwnd_value = usize::try_from(target.window_handle)
             .map_err(|_| PortError::Automation(AutomationFailureCode::TargetChanged))?;
         let hwnd = HWND(hwnd_value as *mut c_void);
+        ensure_not_cancelled(abort_signal)?;
         let root = automation.ElementFromHandle(hwnd).map_err(uia_internal)?;
-        let condition = automation.CreateTrueCondition().map_err(uia_internal)?;
+        ensure_not_cancelled(abort_signal)?;
+        let automation_id_variant = BstrVariant::new(automation_id);
+        let condition = automation
+            .CreatePropertyCondition(
+                UIA_AutomationIdPropertyId,
+                automation_id_variant.as_variant(),
+            )
+            .map_err(uia_internal)?;
         let elements = root
             .FindAll(TreeScope_Descendants, &condition)
             .map_err(uia_internal)?;
+        ensure_not_cancelled(abort_signal)?;
         let count = elements.Length().map_err(uia_internal)?;
         let mut match_element: Option<IUIAutomationElement> = None;
         for index in 0..count {
             let element = elements.GetElement(index).map_err(uia_internal)?;
-            let current_id = element.CurrentAutomationId().map_err(uia_internal)?;
-            if current_id == automation_id {
-                if match_element.is_some() {
-                    return Err(PortError::Automation(
-                        AutomationFailureCode::ControlAmbiguous,
-                    ));
-                }
-                match_element = Some(element);
+            if match_element.is_some() {
+                return Err(PortError::Automation(
+                    AutomationFailureCode::ControlAmbiguous,
+                ));
             }
+            match_element = Some(element);
         }
         let element =
             match_element.ok_or(PortError::Automation(AutomationFailureCode::ControlMissing))?;
         if let Some(value) = value {
+            ensure_not_cancelled(abort_signal)?;
             let pattern: IUIAutomationValuePattern = element
                 .GetCurrentPatternAs(UIA_ValuePatternId)
                 .map_err(|_| PortError::Automation(AutomationFailureCode::ControlUnsupported))?;
@@ -236,13 +259,16 @@ fn execute_uia(
                     AutomationFailureCode::ControlUnsupported,
                 ));
             }
+            ensure_not_cancelled(abort_signal)?;
             pattern
                 .SetValue(&BSTR::from(value.as_str()))
                 .map_err(|_| PortError::Automation(AutomationFailureCode::InputBlocked))
         } else {
+            ensure_not_cancelled(abort_signal)?;
             let pattern: IUIAutomationInvokePattern = element
                 .GetCurrentPatternAs(UIA_InvokePatternId)
                 .map_err(|_| PortError::Automation(AutomationFailureCode::ControlUnsupported))?;
+            ensure_not_cancelled(abort_signal)?;
             pattern
                 .Invoke()
                 .map_err(|_| PortError::Automation(AutomationFailureCode::InputBlocked))
@@ -254,11 +280,16 @@ fn uia_internal(_: windows::core::Error) -> PortError {
     PortError::Automation(AutomationFailureCode::ControlUnsupported)
 }
 
-fn send_keyboard_inputs(inputs: &[INPUT], modifiers: &[KeyModifier]) -> Result<(), PortError> {
+fn send_keyboard_inputs(
+    inputs: &[INPUT],
+    modifiers: &[KeyModifier],
+    abort_signal: &AutomationAbortSignal,
+) -> Result<(), PortError> {
     // SAFETY: INPUT values are fully initialized keyboard records. SendInput receives the exact
     // element size required by Win32. On partial injection, modifier key-up records are sent
     // best-effort before returning the stable input_blocked failure.
     unsafe {
+        ensure_not_cancelled(abort_signal)?;
         let inserted = SendInput(
             inputs,
             i32::try_from(size_of::<INPUT>())
@@ -286,15 +317,12 @@ pub(super) fn validate_send_input_count(expected: usize, actual: u32) -> Result<
     }
 }
 
+#[cfg(test)]
 pub(super) fn target_identity_matches(
     actual: &AutomationTarget,
     expected: &AutomationTarget,
 ) -> bool {
-    actual.process_id == expected.process_id
-        && actual.window_handle == expected.window_handle
-        && actual
-            .executable_name
-            .eq_ignore_ascii_case(&expected.executable_name)
+    actual.matches_identity(expected)
 }
 
 pub(super) fn encode_text_inputs(text: &str) -> Vec<INPUT> {
@@ -455,11 +483,57 @@ impl ComApartment {
     fn initialize() -> Result<Self, PortError> {
         // SAFETY: Initializes COM for the current blocking thread; Drop balances successful calls.
         unsafe {
-            CoInitializeEx(None, COINIT_MULTITHREADED)
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED)
                 .ok()
                 .map_err(|_| PortError::Automation(AutomationFailureCode::ControlUnsupported))?;
         }
         Ok(Self)
+    }
+}
+
+fn ensure_not_cancelled(abort_signal: &AutomationAbortSignal) -> Result<(), PortError> {
+    if abort_signal.is_cancelled() {
+        Err(PortError::Automation(AutomationFailureCode::AbortActive))
+    } else {
+        Ok(())
+    }
+}
+
+struct BstrVariant {
+    variant: VARIANT,
+}
+
+impl BstrVariant {
+    fn new(value: &str) -> Self {
+        Self {
+            variant: VARIANT {
+                Anonymous: VARIANT_0 {
+                    Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                        vt: VT_BSTR,
+                        wReserved1: 0,
+                        wReserved2: 0,
+                        wReserved3: 0,
+                        Anonymous: VARIANT_0_0_0 {
+                            bstrVal: ManuallyDrop::new(BSTR::from(value)),
+                        },
+                    }),
+                },
+            },
+        }
+    }
+
+    fn as_variant(&self) -> &VARIANT {
+        &self.variant
+    }
+}
+
+impl Drop for BstrVariant {
+    fn drop(&mut self) {
+        // SAFETY: `variant` is initialized as VT_BSTR by `BstrVariant::new`; VariantClear releases
+        // the owned BSTR exactly once before the wrapper is dropped.
+        unsafe {
+            let _ = VariantClear(&raw mut self.variant);
+        }
     }
 }
 

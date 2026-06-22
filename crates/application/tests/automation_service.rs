@@ -18,7 +18,8 @@ use screensearch_domain::{
     AutomationRunId, AutomationRunStatus, AutomationSettings, AutomationTarget,
 };
 use screensearch_ports::{
-    AutomationClaimOutcome, AutomationPlatform, AutomationRepository, PortError,
+    AutomationAbortSignal, AutomationClaimOutcome, AutomationPlatform, AutomationRepository,
+    PortError,
 };
 
 #[derive(Default)]
@@ -134,6 +135,53 @@ impl FakePlatform {
     }
 }
 
+struct BlockingPlatform {
+    target: AutomationTarget,
+    action_delay: StdDuration,
+    emitted: Arc<AtomicUsize>,
+}
+
+impl BlockingPlatform {
+    fn new(target: AutomationTarget, action_delay: StdDuration) -> Self {
+        Self {
+            target,
+            action_delay,
+            emitted: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl AutomationPlatform for BlockingPlatform {
+    async fn foreground_target(&self) -> Result<AutomationTarget, PortError> {
+        Ok(self.target.clone())
+    }
+
+    async fn session_is_unlocked(&self) -> Result<bool, PortError> {
+        Ok(true)
+    }
+
+    async fn execute_action(
+        &self,
+        _target: &AutomationTarget,
+        _action: &AutomationAction,
+        abort_signal: AutomationAbortSignal,
+    ) -> Result<(), PortError> {
+        let emitted = Arc::clone(&self.emitted);
+        let delay = self.action_delay;
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(delay);
+            if abort_signal.is_cancelled() {
+                return Err(PortError::Automation(AutomationFailureCode::AbortActive));
+            }
+            emitted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .map_err(|error| PortError::Internal(format!("blocking fake failed: {error}")))?
+    }
+}
+
 #[async_trait]
 impl AutomationPlatform for FakePlatform {
     async fn foreground_target(&self) -> Result<AutomationTarget, PortError> {
@@ -148,8 +196,12 @@ impl AutomationPlatform for FakePlatform {
         &self,
         _target: &AutomationTarget,
         _action: &AutomationAction,
+        abort_signal: AutomationAbortSignal,
     ) -> Result<(), PortError> {
         tokio::time::sleep(self.action_delay).await;
+        if abort_signal.is_cancelled() {
+            return Err(PortError::Automation(AutomationFailureCode::AbortActive));
+        }
         self.emitted.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -299,4 +351,64 @@ async fn concurrent_and_timed_out_execution_fail_closed() {
         second_result,
         Err(PortError::Automation(AutomationFailureCode::RateLimited))
     );
+}
+
+#[tokio::test]
+async fn abort_cancels_in_flight_platform_action() {
+    let platform = Arc::new(FakePlatform::delayed(
+        target(),
+        StdDuration::from_millis(100),
+    ));
+    let repository = Arc::new(MemoryAutomationRepository::default());
+    let service = AutomationService::with_config(
+        repository,
+        platform.clone(),
+        AutomationServiceConfig {
+            execution_timeout: StdDuration::from_secs(1),
+            ..fast_config()
+        },
+    );
+    let now = Utc::now();
+    service.safety_heartbeat(true, now).await;
+    service.set_enabled(true, now).await.unwrap();
+    let approval = service.approve(plan(), now).await.unwrap();
+
+    let execution = service.execute(approval.id, plan());
+    tokio::time::sleep(StdDuration::from_millis(10)).await;
+    service.abort();
+
+    assert_eq!(
+        execution.await,
+        Err(PortError::Automation(AutomationFailureCode::AbortActive))
+    );
+    assert_eq!(platform.emitted.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn timeout_cancels_late_blocking_platform_emission() {
+    let platform = Arc::new(BlockingPlatform::new(
+        target(),
+        StdDuration::from_millis(100),
+    ));
+    let emitted = Arc::clone(&platform.emitted);
+    let repository = Arc::new(MemoryAutomationRepository::default());
+    let service = AutomationService::with_config(
+        repository,
+        platform,
+        AutomationServiceConfig {
+            execution_timeout: StdDuration::from_millis(10),
+            ..fast_config()
+        },
+    );
+    let now = Utc::now();
+    service.safety_heartbeat(true, now).await;
+    service.set_enabled(true, now).await.unwrap();
+    let approval = service.approve(plan(), now).await.unwrap();
+
+    assert_eq!(
+        service.execute(approval.id, plan()).await,
+        Err(PortError::Automation(AutomationFailureCode::Timeout))
+    );
+    tokio::time::sleep(StdDuration::from_millis(150)).await;
+    assert_eq!(emitted.load(Ordering::SeqCst), 0);
 }

@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration as StdDuration,
@@ -13,7 +13,8 @@ use screensearch_domain::{
     AutomationSettings, AutomationTarget,
 };
 use screensearch_ports::{
-    AutomationClaimOutcome, AutomationPlatform, AutomationRepository, PortError,
+    AutomationAbortSignal, AutomationClaimOutcome, AutomationPlatform, AutomationRepository,
+    PortError,
 };
 
 /// Guarded automation timing policy.
@@ -61,6 +62,7 @@ pub struct AutomationService {
     config: AutomationServiceConfig,
     heartbeat: Mutex<Option<DateTime<Utc>>>,
     abort_latched: AtomicBool,
+    active_abort_signal: StdMutex<Option<AutomationAbortSignal>>,
     executing: AtomicBool,
 }
 
@@ -85,6 +87,7 @@ impl AutomationService {
             config,
             heartbeat: Mutex::new(None),
             abort_latched: AtomicBool::new(false),
+            active_abort_signal: StdMutex::new(None),
             executing: AtomicBool::new(false),
         }
     }
@@ -195,13 +198,20 @@ impl AutomationService {
             }
         }
 
-        let result =
-            match tokio::time::timeout(self.config.execution_timeout, self.execute_actions(&plan))
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(automation_failure(AutomationFailureCode::Timeout)),
-            };
+        let abort_signal = AutomationAbortSignal::new();
+        self.set_active_abort_signal(Some(abort_signal.clone()));
+        let result = if let Ok(result) = tokio::time::timeout(
+            self.config.execution_timeout,
+            self.execute_actions(&plan, abort_signal.clone()),
+        )
+        .await
+        {
+            result
+        } else {
+            abort_signal.cancel();
+            Err(automation_failure(AutomationFailureCode::Timeout))
+        };
+        self.set_active_abort_signal(None);
         let (status, failure_code) = match &result {
             Ok(()) => (AutomationRunStatus::Succeeded, None),
             Err(PortError::Automation(AutomationFailureCode::AbortActive)) => (
@@ -223,6 +233,11 @@ impl AutomationService {
     /// Latches emergency abort. The latch remains active until explicit reset.
     pub fn abort(&self) {
         self.abort_latched.store(true, Ordering::SeqCst);
+        if let Ok(active) = self.active_abort_signal.lock()
+            && let Some(signal) = active.as_ref()
+        {
+            signal.cancel();
+        }
     }
 
     /// Explicitly clears the emergency-abort latch.
@@ -230,14 +245,18 @@ impl AutomationService {
         self.abort_latched.store(false, Ordering::SeqCst);
     }
 
-    async fn execute_actions(&self, plan: &AutomationPlanV1) -> Result<(), PortError> {
+    async fn execute_actions(
+        &self,
+        plan: &AutomationPlanV1,
+        abort_signal: AutomationAbortSignal,
+    ) -> Result<(), PortError> {
         for (index, action) in plan.actions.iter().enumerate() {
             if index > 0 {
                 tokio::time::sleep(self.config.action_pacing).await;
             }
             self.check_target(Utc::now(), &plan.target).await?;
             self.platform
-                .execute_action(&plan.target, action)
+                .execute_action(&plan.target, action, abort_signal.clone())
                 .await
                 .map_err(|error| match error {
                     PortError::Automation(_) => error,
@@ -261,7 +280,7 @@ impl AutomationService {
             .foreground_target()
             .await
             .map_err(|_| automation_failure(AutomationFailureCode::TargetChanged))?;
-        if !same_target_identity(&foreground, expected) {
+        if !foreground.matches_identity(expected) {
             return Err(automation_failure(AutomationFailureCode::TargetChanged));
         }
         Ok(())
@@ -293,18 +312,16 @@ impl AutomationService {
             .to_std()
             .is_ok_and(|age| age <= self.config.heartbeat_stale_after)
     }
+
+    fn set_active_abort_signal(&self, signal: Option<AutomationAbortSignal>) {
+        if let Ok(mut active) = self.active_abort_signal.lock() {
+            *active = signal;
+        }
+    }
 }
 
 fn automation_failure(code: AutomationFailureCode) -> PortError {
     PortError::Automation(code)
-}
-
-fn same_target_identity(left: &AutomationTarget, right: &AutomationTarget) -> bool {
-    left.process_id == right.process_id
-        && left.window_handle == right.window_handle
-        && left
-            .executable_name
-            .eq_ignore_ascii_case(&right.executable_name)
 }
 
 struct ExecutionGuard<'a> {

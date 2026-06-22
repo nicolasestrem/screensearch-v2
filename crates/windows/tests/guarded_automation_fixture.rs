@@ -17,7 +17,7 @@ use std::{
 use screensearch_domain::{
     AutomationAction, AutomationFailureCode, AutomationKey, AutomationTarget, KeyModifier,
 };
-use screensearch_ports::{AutomationPlatform, PortError};
+use screensearch_ports::{AutomationAbortSignal, AutomationPlatform, PortError};
 use screensearch_windows::WindowsAutomationPlatform;
 use windows::{
     Win32::{
@@ -71,6 +71,7 @@ async fn guarded_windows_automation_fixture_exercises_native_paths() {
                 automation_id: EDIT_ID.to_string(),
                 value: "set by uia".to_owned(),
             },
+            AutomationAbortSignal::new(),
         )
         .await
         .unwrap();
@@ -85,6 +86,7 @@ async fn guarded_windows_automation_fixture_exercises_native_paths() {
             &AutomationAction::UiaInvoke {
                 automation_id: BUTTON_ID.to_string(),
             },
+            AutomationAbortSignal::new(),
         )
         .await
         .unwrap();
@@ -101,6 +103,7 @@ async fn guarded_windows_automation_fixture_exercises_native_paths() {
             &AutomationAction::TypeText {
                 text: "typed ✓".to_owned(),
             },
+            AutomationAbortSignal::new(),
         )
         .await
         .unwrap();
@@ -116,6 +119,7 @@ async fn guarded_windows_automation_fixture_exercises_native_paths() {
                 modifiers: vec![KeyModifier::Control],
                 key: AutomationKey::A,
             },
+            AutomationAbortSignal::new(),
         )
         .await
         .unwrap();
@@ -125,6 +129,7 @@ async fn guarded_windows_automation_fixture_exercises_native_paths() {
             &AutomationAction::TypeText {
                 text: "replacement".to_owned(),
             },
+            AutomationAbortSignal::new(),
         )
         .await
         .unwrap();
@@ -142,6 +147,7 @@ async fn guarded_windows_automation_fixture_exercises_native_paths() {
             &AutomationAction::TypeText {
                 text: "must not type".to_owned(),
             },
+            AutomationAbortSignal::new(),
         )
         .await;
     assert_eq!(
