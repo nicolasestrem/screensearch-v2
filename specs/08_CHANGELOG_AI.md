@@ -2,6 +2,41 @@
 
 This log records meaningful AI-assisted repository changes and their reasons. It is not a substitute for Git history.
 
+## 2026-06-22 — Local generation throughput + chat-template fix
+
+### Changed
+
+- Diagnosed the "report generation does nothing" report from a live daemon log: a `Ministral-3-3B-Reasoning` GGUF loaded fully, then generation ran **CPU-only on a hardcoded two threads**, so a 3B reasoning model crawled and the answer pane appeared frozen.
+- Replaced the hardcoded `n_threads(2)` / `n_threads_batch(2)` in `generate_gguf` with a physical-core budget (`cpu_thread_budget`, via `num_cpus`).
+- Moved the 120 s generation deadline so it is armed **after** the model is resident and the prompt is decoded — a slow cold load can no longer silently consume the budget and return an empty "answered".
+- Applied the model's own chat template (`apply_chat_format` → `LlamaModel::chat_template`/`apply_chat_template`) before tokenizing, so instruct and reasoning models receive the role markers + trailing assistant tag they expect instead of a raw text blob. Falls back to the raw prompt for base models with no template.
+- Raised the evaluation context to `GENERATION_CONTEXT_TOKENS = 4096` and the per-request token cap to 768 so a reasoning model can finish its `<think>` span and still reach an answer (the wall-clock deadline stays the real bound). The daemon now stamps each model's `context_tokens` from that shared constant, keeping the stored metadata truthful.
+- Added content-free generation diagnostics (`load_ms`, `prompt_tokens`, `prompt_decode_ms`, `generated_tokens`, `generate_ms`, `stop_reason`, `threads`) and broadened the worker's tracing filter so `screensearch_model_runtime` logs surface. No prompt/answer/query text is logged.
+
+### Why
+
+The model loaded fine; generation was just starved (two CPU threads) and unformatted (no chat template), so a reasoning model never surfaced an answer. These fixes are CPU-only and fully verifiable. GPU acceleration was explored but **descoped at the user's request** for this change.
+
+### Verification
+
+- `cargo fmt --check` (exit 0), `cargo clippy --workspace --all-targets -- -D warnings` (exit 0), `cargo test --workspace` (52 passed, 7 ignored).
+
+### Not changed
+
+- The worker boundary contract, IPC, and persistence schema are unchanged. Items 15/16 remain open.
+
+### PR #8 review follow-ups
+
+- **Prompt-token budget** now derives from the constants (`GENERATION_CONTEXT_TOKENS - MAX_GENERATED_TOKENS = 3328`) instead of the stale hardcoded `1792` that assumed the old 2048-token context — a longer evidence prompt is no longer rejected for no reason.
+- **Initial decode batch** is sized to the full context (`GENERATION_CONTEXT_TOKENS`) instead of a hardcoded `2048`; with the larger prompt budget a 2049–3328-token prompt would otherwise overflow a 2048-slot batch on the first decode.
+- **Leading double-BOS guard** (`dedupe_leading_bos`): tokenizing the chat-formatted prompt with `AddBos::Always` keeps the tokenizer's single BOS for the built-in Mistral / Llama-2 / ChatML templates (which, in llama.cpp's C++ implementations, emit no literal BOS), while collapsing a `[BOS, BOS, …]` prefix if an exotic template (e.g. AlphaMonarch) emits a literal BOS that `parse_special` folds into a second one. The reviewer's suggested `AddBos::Never`-on-success was *not* taken: it would strip the only BOS from Mistral/Llama-2 prompts, which rely on the tokenizer to add it.
+- **Chat-template fallback logging**: `apply_chat_format` now `warn!`s (content-free) when `LlamaChatMessage::new` or `apply_chat_template` fails before falling back to the raw prompt, so a silent templating failure is diagnosable. A missing template (base model) stays silent — that path is expected.
+- Added `dedupe_leading_bos` unit tests (leading double collapses; single BOS, no-BOS, recurring-BOS, empty, and lone-token inputs are untouched).
+
+### Updated verification
+
+- `cargo fmt --check` (exit 0), `cargo clippy --workspace --all-targets -- -D warnings` (exit 0), `cargo test --workspace` (53 passed, 7 ignored), `npm run lint` (exit 0), `npm run build` (exit 0).
+
 ## 2026-06-21 — Specification engineering baseline
 
 ### Changed

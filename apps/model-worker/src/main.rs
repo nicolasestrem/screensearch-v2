@@ -238,8 +238,9 @@ fn validate_model_relative_path(relative_path: &str) -> Result<(), IpcError> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "screensearch_model_worker=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "screensearch_model_worker=info,screensearch_model_runtime=info".into()
+            }),
         )
         .try_init()
         .map_err(|error| anyhow::anyhow!("initialize model-worker tracing: {error}"))?;

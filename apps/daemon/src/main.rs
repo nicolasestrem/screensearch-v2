@@ -1149,7 +1149,7 @@ fn generation_model_from_file(
         byte_length,
         architecture: infer_architecture(filename),
         quantization,
-        context_tokens: Some(2_048),
+        context_tokens: Some(screensearch_model_runtime::GENERATION_CONTEXT_TOKENS),
         supports_vision: filename.to_lowercase().contains("vl") || filename.contains("mmproj"),
         active,
     }
