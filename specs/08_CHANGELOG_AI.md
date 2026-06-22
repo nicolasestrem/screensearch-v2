@@ -25,6 +25,18 @@ The model loaded fine; generation was just starved (two CPU threads) and unforma
 
 - The worker boundary contract, IPC, and persistence schema are unchanged. Items 15/16 remain open.
 
+### PR #8 review follow-ups
+
+- **Prompt-token budget** now derives from the constants (`GENERATION_CONTEXT_TOKENS - MAX_GENERATED_TOKENS = 3328`) instead of the stale hardcoded `1792` that assumed the old 2048-token context — a longer evidence prompt is no longer rejected for no reason.
+- **Initial decode batch** is sized to the full context (`GENERATION_CONTEXT_TOKENS`) instead of a hardcoded `2048`; with the larger prompt budget a 2049–3328-token prompt would otherwise overflow a 2048-slot batch on the first decode.
+- **Leading double-BOS guard** (`dedupe_leading_bos`): tokenizing the chat-formatted prompt with `AddBos::Always` keeps the tokenizer's single BOS for the built-in Mistral / Llama-2 / ChatML templates (which, in llama.cpp's C++ implementations, emit no literal BOS), while collapsing a `[BOS, BOS, …]` prefix if an exotic template (e.g. AlphaMonarch) emits a literal BOS that `parse_special` folds into a second one. The reviewer's suggested `AddBos::Never`-on-success was *not* taken: it would strip the only BOS from Mistral/Llama-2 prompts, which rely on the tokenizer to add it.
+- **Chat-template fallback logging**: `apply_chat_format` now `warn!`s (content-free) when `LlamaChatMessage::new` or `apply_chat_template` fails before falling back to the raw prompt, so a silent templating failure is diagnosable. A missing template (base model) stays silent — that path is expected.
+- Added `dedupe_leading_bos` unit tests (leading double collapses; single BOS, no-BOS, recurring-BOS, empty, and lone-token inputs are untouched).
+
+### Updated verification
+
+- `cargo fmt --check` (exit 0), `cargo clippy --workspace --all-targets -- -D warnings` (exit 0), `cargo test --workspace` (53 passed, 7 ignored), `npm run lint` (exit 0), `npm run build` (exit 0).
+
 ## 2026-06-21 — Specification engineering baseline
 
 ### Changed

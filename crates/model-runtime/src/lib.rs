@@ -20,11 +20,12 @@ use llama_cpp_2::{
     llama_batch::LlamaBatch,
     model::{AddBos, LlamaChatMessage, LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
+    token::LlamaToken,
 };
 use screensearch_domain::{AssetRef, BoundingBox, OcrBlock};
 use screensearch_ports::{EmbeddingEngine, OcrEngine, PortError, TextGenerator, TokenStream};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Bootstrap OCR provider used until the ONNX worker adapter is enabled.
 #[derive(Default)]
@@ -323,14 +324,36 @@ fn load_model(model_path: &std::path::Path) -> Result<LoadedLlamaModel, PortErro
 /// templating error, so generation never fails for want of a template.
 fn apply_chat_format(model: &LlamaModel, prompt: &str) -> String {
     let Ok(template) = model.chat_template(None) else {
+        // Base models ship no template; continuing with the raw prompt is expected.
         return prompt.to_owned();
     };
-    let Ok(message) = LlamaChatMessage::new("user".to_owned(), prompt.to_owned()) else {
-        return prompt.to_owned();
+    let message = match LlamaChatMessage::new("user".to_owned(), prompt.to_owned()) {
+        Ok(message) => message,
+        Err(error) => {
+            warn!(%error, "could not build chat message; using raw prompt");
+            return prompt.to_owned();
+        }
     };
     model
         .apply_chat_template(&template, &[message], true)
-        .unwrap_or_else(|_| prompt.to_owned())
+        .unwrap_or_else(|error| {
+            warn!(%error, "could not apply chat template; using raw prompt");
+            prompt.to_owned()
+        })
+}
+
+/// Collapses a single leading duplicate BOS token.
+///
+/// `str_to_token` with `AddBos::Always` lets the tokenizer prepend the model's BOS, while a
+/// handful of chat templates (e.g. the AlphaMonarch family) additionally emit a literal BOS
+/// marker that `parse_special` tokenization folds into a second BOS id. llama.cpp's built-in
+/// Mistral / Llama-2 / ChatML templates do not emit one, so this is a no-op for them; it only
+/// guards an exotic template from ever feeding the model a `[BOS, BOS, …]` prefix it was never
+/// trained on.
+fn dedupe_leading_bos(tokens: &mut Vec<LlamaToken>, bos: LlamaToken) {
+    if tokens.len() >= 2 && tokens[0] == bos && tokens[1] == bos {
+        tokens.remove(0);
+    }
 }
 
 fn generate_gguf(
@@ -358,11 +381,13 @@ fn generate_gguf(
         .new_context(&cached.backend, context_parameters)
         .map_err(|error| PortError::Internal(format!("create llama.cpp context: {error}")))?;
     let formatted_prompt = apply_chat_format(&cached.model, prompt);
-    let tokens = cached
+    let mut tokens = cached
         .model
         .str_to_token(&formatted_prompt, AddBos::Always)
         .map_err(|error| PortError::InvalidData(format!("tokenize generation prompt: {error}")))?;
-    let maximum_prompt_tokens = 1_792_usize;
+    dedupe_leading_bos(&mut tokens, cached.model.token_bos());
+    let context_capacity = usize::try_from(GENERATION_CONTEXT_TOKENS).unwrap_or(usize::MAX);
+    let maximum_prompt_tokens = context_capacity.saturating_sub(MAX_GENERATED_TOKENS);
     if tokens.is_empty() || tokens.len() > maximum_prompt_tokens {
         return Err(PortError::InvalidData(format!(
             "generation prompt contains {} tokens; maximum is {maximum_prompt_tokens}",
@@ -371,7 +396,7 @@ fn generate_gguf(
     }
     let prompt_token_count = tokens.len();
 
-    let mut batch = LlamaBatch::new(2_048, 1);
+    let mut batch = LlamaBatch::new(context_capacity, 1);
     let last = tokens.len() - 1;
     for (position, token) in tokens.into_iter().enumerate() {
         batch
@@ -461,9 +486,10 @@ impl OnnxRuntimeProvider {
 mod tests {
     use std::time::{Duration, Instant};
 
+    use llama_cpp_2::token::LlamaToken;
     use screensearch_ports::EmbeddingEngine;
 
-    use super::{FakeEmbeddingEngine, should_stop_generation};
+    use super::{FakeEmbeddingEngine, dedupe_leading_bos, should_stop_generation};
 
     #[tokio::test]
     async fn fake_embeddings_are_normalized_and_fixed_width() {
@@ -489,5 +515,39 @@ mod tests {
             deadline,
             start + Duration::from_secs(121)
         ));
+    }
+
+    #[test]
+    fn dedupe_collapses_only_a_leading_double_bos() {
+        let bos = LlamaToken(1);
+        let content = LlamaToken(42);
+
+        // Exotic template that emitted a literal BOS plus the tokenizer's BOS.
+        let mut doubled = vec![bos, bos, content];
+        dedupe_leading_bos(&mut doubled, bos);
+        assert_eq!(doubled, vec![bos, content]);
+
+        // Mistral / Llama-2 / ChatML: tokenizer added exactly one BOS — untouched.
+        let mut single = vec![bos, content];
+        dedupe_leading_bos(&mut single, bos);
+        assert_eq!(single, vec![bos, content]);
+
+        // No leading BOS at all (e.g. a model with add_bos_token = false) — untouched.
+        let mut none = vec![content, content];
+        dedupe_leading_bos(&mut none, bos);
+        assert_eq!(none, vec![content, content]);
+
+        // A BOS that recurs later in the sequence is not a leading pair — untouched.
+        let mut later = vec![bos, content, bos];
+        dedupe_leading_bos(&mut later, bos);
+        assert_eq!(later, vec![bos, content, bos]);
+
+        // Degenerate inputs never panic.
+        let mut empty: Vec<LlamaToken> = Vec::new();
+        dedupe_leading_bos(&mut empty, bos);
+        assert!(empty.is_empty());
+        let mut lone = vec![bos];
+        dedupe_leading_bos(&mut lone, bos);
+        assert_eq!(lone, vec![bos]);
     }
 }
