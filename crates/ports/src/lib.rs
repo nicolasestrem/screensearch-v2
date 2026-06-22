@@ -5,9 +5,11 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use futures::Stream;
 use screensearch_domain::{
-    AnalysisJob, AnalysisResult, ArchiveSettings, AssetCleanupTask, AssetRef, CaptureDisposition,
-    CaptureId, CapturedFrame, DeleteCaptures, DeletionSummary, GenerationModel, NewCapture,
-    OcrBlock, QueueMetrics, SearchHit, StorageMetrics,
+    AnalysisJob, AnalysisResult, ArchiveSettings, AssetCleanupTask, AssetRef, AutomationAction,
+    AutomationFailureCode, AutomationRun, AutomationRunId, AutomationRunStatus, AutomationSettings,
+    AutomationTarget, CaptureDisposition, CaptureId, CapturedFrame, DeleteCaptures,
+    DeletionSummary, GenerationModel, NewCapture, OcrBlock, QueueMetrics, SearchHit,
+    StorageMetrics,
 };
 use thiserror::Error;
 
@@ -141,6 +143,79 @@ pub trait EmbeddingEngine: Send + Sync {
 pub trait TextGenerator: Send + Sync {
     /// Streams an answer for an already policy-safe prompt.
     async fn generate(&self, prompt: String) -> Result<TokenStream, PortError>;
+}
+
+/// Result of atomically claiming a one-shot automation approval.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AutomationClaimOutcome {
+    /// Exact, live approval was transitioned to running.
+    Claimed(AutomationRun),
+    /// Approval does not exist or was already consumed.
+    Missing,
+    /// Approval elapsed and was transitioned to expired.
+    Expired,
+    /// Approval exists but its canonical digest differs.
+    PlanMismatch,
+}
+
+/// Durable default-off settings and content-free automation run ledger.
+#[async_trait]
+pub trait AutomationRepository: Send + Sync {
+    /// Loads daemon-owned automation enablement.
+    async fn automation_settings(&self) -> Result<AutomationSettings, PortError>;
+
+    /// Replaces daemon-owned automation enablement.
+    async fn update_automation_settings(
+        &self,
+        settings: AutomationSettings,
+    ) -> Result<(), PortError>;
+
+    /// Persists one exact digest approval.
+    async fn create_automation_approval(&self, run: AutomationRun) -> Result<(), PortError>;
+
+    /// Atomically validates and consumes one approval.
+    async fn claim_automation_run(
+        &self,
+        id: AutomationRunId,
+        plan_digest: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<AutomationClaimOutcome, PortError>;
+
+    /// Writes a terminal status and optional content-free failure code.
+    async fn finish_automation_run(
+        &self,
+        id: AutomationRunId,
+        status: AutomationRunStatus,
+        failure_code: Option<AutomationFailureCode>,
+        finished_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), PortError>;
+
+    /// Returns one content-free ledger record.
+    async fn automation_run(&self, id: AutomationRunId)
+    -> Result<Option<AutomationRun>, PortError>;
+
+    /// Converts orphaned running rows to aborted during daemon startup.
+    async fn recover_automation_runs(
+        &self,
+        recovered_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, PortError>;
+}
+
+/// Native platform observations and one typed action emission.
+#[async_trait]
+pub trait AutomationPlatform: Send + Sync {
+    /// Captures the exact current foreground HWND/PID/executable identity.
+    async fn foreground_target(&self) -> Result<AutomationTarget, PortError>;
+
+    /// Returns true only when Windows positively reports the interactive session unlocked.
+    async fn session_is_unlocked(&self) -> Result<bool, PortError>;
+
+    /// Executes exactly one already validated action against the approved target.
+    async fn execute_action(
+        &self,
+        target: &AutomationTarget,
+        action: &AutomationAction,
+    ) -> Result<(), PortError>;
 }
 
 /// A validated, explicitly approved automation action.

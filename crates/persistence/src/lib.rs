@@ -10,11 +10,15 @@ use async_trait::async_trait;
 use chrono::{Duration, SecondsFormat, Utc};
 use libsql::{Builder, params};
 use screensearch_domain::{
-    AnalysisJob, AnalysisResult, ArchiveSettings, AssetCleanupTask, AssetRef, BoundingBox,
-    CaptureDisposition, CaptureId, ChunkId, DeleteCaptures, DeletionSummary, GenerationModel,
-    JobId, ModelSourceKind, NewCapture, QueueMetrics, SearchHit, SearchMatchKind, StorageMetrics,
+    AnalysisJob, AnalysisResult, ArchiveSettings, AssetCleanupTask, AssetRef,
+    AutomationFailureCode, AutomationRun, AutomationRunId, AutomationRunStatus, AutomationSettings,
+    BoundingBox, CaptureDisposition, CaptureId, ChunkId, DeleteCaptures, DeletionSummary,
+    GenerationModel, JobId, ModelSourceKind, NewCapture, QueueMetrics, SearchHit, SearchMatchKind,
+    StorageMetrics,
 };
-use screensearch_ports::{ArchiveRepository, AssetStore, PortError};
+use screensearch_ports::{
+    ArchiveRepository, AssetStore, AutomationClaimOutcome, AutomationRepository, PortError,
+};
 use tokio::fs;
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -26,6 +30,7 @@ const MIGRATION_0003: &str = include_str!("../migrations/0003_search_evidence.sq
 const MIGRATION_0004: &str = include_str!("../migrations/0004_real_embedding_model.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_archive_policy.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_generation_model_catalog.sql");
+const MIGRATION_0007: &str = include_str!("../migrations/0007_guarded_automation.sql");
 const MAX_JOB_ATTEMPTS: u32 = 5;
 const BRUTE_FORCE_VECTOR_THRESHOLD: u64 = 50_000;
 
@@ -315,6 +320,20 @@ impl ArchiveRepository for LibSqlArchive {
         if rows.next().await.map_err(database_error)?.is_none() {
             self.connection()
                 .execute_batch(MIGRATION_0006)
+                .await
+                .map_err(database_error)?;
+        }
+        let mut rows = self
+            .connection()
+            .query(
+                "SELECT 1 FROM schema_migration WHERE version = 7 LIMIT 1",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        if rows.next().await.map_err(database_error)?.is_none() {
+            self.connection()
+                .execute_batch(MIGRATION_0007)
                 .await
                 .map_err(database_error)?;
         }
@@ -1209,6 +1228,226 @@ impl ArchiveRepository for LibSqlArchive {
     }
 }
 
+#[async_trait]
+impl AutomationRepository for LibSqlArchive {
+    async fn automation_settings(&self) -> Result<AutomationSettings, PortError> {
+        let mut rows = self
+            .connection()
+            .query(
+                "SELECT enabled FROM automation_settings_v1 WHERE singleton = 1",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        let row =
+            rows.next().await.map_err(database_error)?.ok_or_else(|| {
+                PortError::Internal("automation settings row is missing".to_owned())
+            })?;
+        Ok(AutomationSettings {
+            enabled: row.get::<i64>(0).map_err(database_error)? != 0,
+        })
+    }
+
+    async fn update_automation_settings(
+        &self,
+        settings: AutomationSettings,
+    ) -> Result<(), PortError> {
+        let _write_guard = self.write_gate.lock().await;
+        self.connection()
+            .execute(
+                "UPDATE automation_settings_v1
+                 SET enabled = ?, updated_at = ?
+                 WHERE singleton = 1",
+                params![i64::from(settings.enabled), timestamp(Utc::now())],
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn create_automation_approval(&self, run: AutomationRun) -> Result<(), PortError> {
+        validate_automation_run_for_insert(&run)?;
+        let _write_guard = self.write_gate.lock().await;
+        self.connection()
+            .execute(
+                "INSERT INTO automation_run_v2(
+                    id, plan_digest, action_count, status, approved_at, expires_at,
+                    started_at, finished_at, failure_code
+                 ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)",
+                params![
+                    run.id.to_string(),
+                    run.plan_digest,
+                    i64::from(run.action_count),
+                    run.status.as_str(),
+                    timestamp(run.approved_at),
+                    timestamp(run.expires_at),
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn claim_automation_run(
+        &self,
+        id: AutomationRunId,
+        plan_digest: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<AutomationClaimOutcome, PortError> {
+        if plan_digest.len() != 64 {
+            return Err(PortError::InvalidData(
+                "automation plan digest must contain 64 characters".to_owned(),
+            ));
+        }
+        let _write_guard = self.write_gate.lock().await;
+        let connection = self.connection();
+        let transaction = connection.transaction().await.map_err(database_error)?;
+        let mut rows = transaction
+            .query(
+                "SELECT
+                    id, plan_digest, action_count, status, approved_at, expires_at,
+                    started_at, finished_at, failure_code
+                 FROM automation_run_v2
+                 WHERE id = ?
+                 LIMIT 1",
+                params![id.to_string()],
+            )
+            .await
+            .map_err(database_error)?;
+        let Some(row) = rows.next().await.map_err(database_error)? else {
+            drop(rows);
+            transaction.rollback().await.map_err(database_error)?;
+            return Ok(AutomationClaimOutcome::Missing);
+        };
+        let mut run = map_automation_run(&row)?;
+        drop(rows);
+        if run.status != AutomationRunStatus::Approved {
+            transaction.rollback().await.map_err(database_error)?;
+            return Ok(AutomationClaimOutcome::Missing);
+        }
+        if run.plan_digest != plan_digest {
+            transaction.rollback().await.map_err(database_error)?;
+            return Ok(AutomationClaimOutcome::PlanMismatch);
+        }
+        if run.expires_at <= now {
+            transaction
+                .execute(
+                    "UPDATE automation_run_v2
+                     SET status = 'expired', finished_at = ?, failure_code = 'approval_expired'
+                     WHERE id = ? AND status = 'approved'",
+                    params![timestamp(now), id.to_string()],
+                )
+                .await
+                .map_err(database_error)?;
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(AutomationClaimOutcome::Expired);
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE automation_run_v2
+                 SET status = 'running', started_at = ?
+                 WHERE id = ? AND status = 'approved'",
+                params![timestamp(now), id.to_string()],
+            )
+            .await
+            .map_err(database_error)?;
+        if changed != 1 {
+            transaction.rollback().await.map_err(database_error)?;
+            return Ok(AutomationClaimOutcome::Missing);
+        }
+        transaction.commit().await.map_err(database_error)?;
+        run.status = AutomationRunStatus::Running;
+        run.started_at = Some(now);
+        Ok(AutomationClaimOutcome::Claimed(run))
+    }
+
+    async fn finish_automation_run(
+        &self,
+        id: AutomationRunId,
+        status: AutomationRunStatus,
+        failure_code: Option<AutomationFailureCode>,
+        finished_at: chrono::DateTime<Utc>,
+    ) -> Result<(), PortError> {
+        if !matches!(
+            status,
+            AutomationRunStatus::Succeeded
+                | AutomationRunStatus::Failed
+                | AutomationRunStatus::Aborted
+        ) {
+            return Err(PortError::InvalidData(
+                "automation run finish requires a terminal execution status".to_owned(),
+            ));
+        }
+        if status == AutomationRunStatus::Succeeded && failure_code.is_some() {
+            return Err(PortError::InvalidData(
+                "successful automation run cannot have a failure code".to_owned(),
+            ));
+        }
+        let _write_guard = self.write_gate.lock().await;
+        let changed = self
+            .connection()
+            .execute(
+                "UPDATE automation_run_v2
+                 SET status = ?, finished_at = ?, failure_code = ?
+                 WHERE id = ? AND status = 'running'",
+                params![
+                    status.as_str(),
+                    timestamp(finished_at),
+                    failure_code.map(AutomationFailureCode::as_str),
+                    id.to_string(),
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        if changed != 1 {
+            return Err(PortError::Denied(
+                "automation run is not currently running".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn automation_run(
+        &self,
+        id: AutomationRunId,
+    ) -> Result<Option<AutomationRun>, PortError> {
+        let mut rows = self
+            .connection()
+            .query(
+                "SELECT
+                    id, plan_digest, action_count, status, approved_at, expires_at,
+                    started_at, finished_at, failure_code
+                 FROM automation_run_v2
+                 WHERE id = ?
+                 LIMIT 1",
+                params![id.to_string()],
+            )
+            .await
+            .map_err(database_error)?;
+        rows.next()
+            .await
+            .map_err(database_error)?
+            .map(|row| map_automation_run(&row))
+            .transpose()
+    }
+
+    async fn recover_automation_runs(
+        &self,
+        recovered_at: chrono::DateTime<Utc>,
+    ) -> Result<u64, PortError> {
+        let _write_guard = self.write_gate.lock().await;
+        self.connection()
+            .execute(
+                "UPDATE automation_run_v2
+                 SET status = 'aborted', finished_at = ?, failure_code = NULL
+                 WHERE status = 'running'",
+                params![timestamp(recovered_at)],
+            )
+            .await
+            .map_err(database_error)
+    }
+}
+
 struct RankedHit {
     hit: SearchHit,
     lexical: bool,
@@ -1463,6 +1702,68 @@ fn timestamp(value: chrono::DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+fn parse_timestamp(value: &str, label: &str) -> Result<chrono::DateTime<Utc>, PortError> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|error| PortError::InvalidData(format!("invalid {label}: {error}")))
+}
+
+fn validate_automation_run_for_insert(run: &AutomationRun) -> Result<(), PortError> {
+    if run.status != AutomationRunStatus::Approved
+        || run.started_at.is_some()
+        || run.finished_at.is_some()
+        || run.failure_code.is_some()
+        || run.action_count == 0
+        || run.action_count > 10
+        || run.plan_digest.len() != 64
+        || run.expires_at <= run.approved_at
+    {
+        return Err(PortError::InvalidData(
+            "invalid automation approval record".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn map_automation_run(row: &libsql::Row) -> Result<AutomationRun, PortError> {
+    let id = row.get::<String>(0).map_err(database_error)?;
+    let action_count = row.get::<i64>(2).map_err(database_error)?;
+    Ok(AutomationRun {
+        id: AutomationRunId(Uuid::parse_str(&id).map_err(|error| {
+            PortError::InvalidData(format!("invalid automation run id: {error}"))
+        })?),
+        plan_digest: row.get(1).map_err(database_error)?,
+        action_count: u32::try_from(action_count)
+            .map_err(|_| PortError::InvalidData("invalid automation action count".to_owned()))?,
+        status: AutomationRunStatus::parse(&row.get::<String>(3).map_err(database_error)?)
+            .map_err(|error| PortError::InvalidData(error.to_string()))?,
+        approved_at: parse_timestamp(
+            &row.get::<String>(4).map_err(database_error)?,
+            "automation approval timestamp",
+        )?,
+        expires_at: parse_timestamp(
+            &row.get::<String>(5).map_err(database_error)?,
+            "automation expiry timestamp",
+        )?,
+        started_at: row
+            .get::<Option<String>>(6)
+            .map_err(database_error)?
+            .map(|value| parse_timestamp(&value, "automation start timestamp"))
+            .transpose()?,
+        finished_at: row
+            .get::<Option<String>>(7)
+            .map_err(database_error)?
+            .map(|value| parse_timestamp(&value, "automation finish timestamp"))
+            .transpose()?,
+        failure_code: row
+            .get::<Option<String>>(8)
+            .map_err(database_error)?
+            .map(|value| AutomationFailureCode::parse(&value))
+            .transpose()
+            .map_err(|error| PortError::InvalidData(error.to_string()))?,
+    })
+}
+
 fn parse_capture_id(value: &str) -> Result<CaptureId, PortError> {
     Uuid::parse_str(value)
         .map(CaptureId)
@@ -1700,12 +2001,14 @@ mod tests {
     use chrono::{Duration, Utc};
     use libsql::params;
     use screensearch_domain::{
-        AnalysisResult, ArchiveSettings, AssetRef, BoundingBox, CaptureDisposition, CaptureId,
-        CapturedFrame, ChunkId, IndexedChunk, NewCapture, OcrBlock, SearchEvent,
+        AnalysisResult, ArchiveSettings, AssetRef, AutomationFailureCode, AutomationRun,
+        AutomationRunId, AutomationRunStatus, AutomationSettings, BoundingBox, CaptureDisposition,
+        CaptureId, CapturedFrame, ChunkId, IndexedChunk, NewCapture, OcrBlock, SearchEvent,
     };
     use screensearch_model_runtime::{FakeEmbeddingEngine, FakeOcrEngine, FakeTextGenerator};
     use screensearch_ports::{
-        ArchiveRepository, AssetStore, CaptureSource, EmbeddingEngine, PortError,
+        ArchiveRepository, AssetStore, AutomationClaimOutcome, AutomationRepository, CaptureSource,
+        EmbeddingEngine, PortError,
     };
     use tempfile::TempDir;
 
@@ -2162,5 +2465,173 @@ mod tests {
         let metrics = repository.queue_metrics().await.unwrap();
         assert_eq!(metrics.pending, 1);
         assert_eq!(metrics.dead_letter_count, 0);
+    }
+
+    #[tokio::test]
+    async fn automation_settings_are_durable_and_default_off() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+
+        assert_eq!(
+            repository.automation_settings().await.unwrap(),
+            AutomationSettings { enabled: false }
+        );
+        repository
+            .update_automation_settings(AutomationSettings { enabled: true })
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.automation_settings().await.unwrap(),
+            AutomationSettings { enabled: true }
+        );
+    }
+
+    fn approval(now: chrono::DateTime<Utc>) -> AutomationRun {
+        AutomationRun {
+            id: AutomationRunId::new(),
+            plan_digest: "a".repeat(64),
+            action_count: 2,
+            status: AutomationRunStatus::Approved,
+            approved_at: now,
+            expires_at: now + Duration::seconds(60),
+            started_at: None,
+            finished_at: None,
+            failure_code: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn automation_approval_claim_is_atomic_one_shot_and_digest_bound() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        let now = Utc::now();
+        let run = approval(now);
+        repository
+            .create_automation_approval(run.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repository
+                .claim_automation_run(run.id, &"b".repeat(64), now)
+                .await
+                .unwrap(),
+            AutomationClaimOutcome::PlanMismatch
+        );
+        assert!(matches!(
+            repository
+                .claim_automation_run(run.id, &run.plan_digest, now)
+                .await
+                .unwrap(),
+            AutomationClaimOutcome::Claimed(AutomationRun {
+                status: AutomationRunStatus::Running,
+                ..
+            })
+        ));
+        assert_eq!(
+            repository
+                .claim_automation_run(run.id, &run.plan_digest, now)
+                .await
+                .unwrap(),
+            AutomationClaimOutcome::Missing
+        );
+    }
+
+    #[tokio::test]
+    async fn automation_expiry_and_restart_recovery_are_durable() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        let now = Utc::now();
+        let expired = approval(now - Duration::minutes(2));
+        repository
+            .create_automation_approval(expired.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .claim_automation_run(expired.id, &expired.plan_digest, now)
+                .await
+                .unwrap(),
+            AutomationClaimOutcome::Expired
+        );
+
+        let running = approval(now);
+        repository
+            .create_automation_approval(running.clone())
+            .await
+            .unwrap();
+        repository
+            .claim_automation_run(running.id, &running.plan_digest, now)
+            .await
+            .unwrap();
+        assert_eq!(repository.recover_automation_runs(now).await.unwrap(), 1);
+        let recovered = repository
+            .automation_run(running.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, AutomationRunStatus::Aborted);
+        assert_eq!(recovered.failure_code, None);
+
+        let failed = approval(now);
+        repository
+            .create_automation_approval(failed.clone())
+            .await
+            .unwrap();
+        repository
+            .claim_automation_run(failed.id, &failed.plan_digest, now)
+            .await
+            .unwrap();
+        repository
+            .finish_automation_run(
+                failed.id,
+                AutomationRunStatus::Failed,
+                Some(AutomationFailureCode::ApprovalExpired),
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .automation_run(failed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .failure_code,
+            Some(AutomationFailureCode::ApprovalExpired)
+        );
+    }
+
+    #[tokio::test]
+    async fn automation_ledger_schema_cannot_store_plan_content() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        let mut rows = repository
+            .connection()
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'automation_run_v2'",
+                (),
+            )
+            .await
+            .unwrap();
+        let sql = rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap()
+            .to_lowercase();
+
+        for forbidden in [
+            "plan_json",
+            "window_title",
+            "display_title",
+            "automation_id",
+            "typed_text",
+            "executable_name",
+        ] {
+            assert!(!sql.contains(forbidden), "{forbidden} leaked into schema");
+        }
     }
 }
