@@ -18,12 +18,13 @@ use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{AddBos, LlamaModel, params::LlamaModelParams},
+    model::{AddBos, LlamaChatMessage, LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
 };
 use screensearch_domain::{AssetRef, BoundingBox, OcrBlock};
 use screensearch_ports::{EmbeddingEngine, OcrEngine, PortError, TextGenerator, TokenStream};
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::info;
 
 /// Bootstrap OCR provider used until the ONNX worker adapter is enabled.
 #[derive(Default)]
@@ -194,11 +195,36 @@ impl TextGenerator for FakeTextGenerator {
     }
 }
 
-/// Backstop wall-clock budget for a single generation request.
+/// Backstop wall-clock budget for a single generation request, measured from the
+/// first generated token rather than from model load.
 ///
 /// A code constant rather than a tunable: the spec adds no generation-deadline
-/// environment variable, so this stays an internal safety limit.
+/// environment variable, so this stays an internal safety limit. Arming it after
+/// the (potentially slow, one-time) cold load means a long load can never silently
+/// consume the budget and leave the answer empty.
 const GENERATION_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Context window the generator evaluates with.
+///
+/// Large enough to hold a bounded retrieval prompt plus a reasoning model's
+/// think-then-answer span. Exposed so the daemon stamps the same value into each
+/// model's `context_tokens` metadata (keeping that claim truthful).
+pub const GENERATION_CONTEXT_TOKENS: u32 = 4_096;
+
+/// Hard cap on tokens emitted for a single generation request.
+///
+/// Headroom over the old 256 so a reasoning model can finish its `<think>` span and
+/// still reach an answer; the wall-clock deadline remains the real bound.
+const MAX_GENERATED_TOKENS: usize = 768;
+
+/// Picks the CPU thread budget for llama.cpp inference.
+///
+/// Local generation is memory-bandwidth bound, so physical cores outperform SMT
+/// logical threads. This replaces the previous hardcoded two-thread cap, which left
+/// generation crawling (and appearing frozen) on multi-core machines.
+fn cpu_thread_budget() -> i32 {
+    i32::try_from(num_cpus::get_physical().max(1)).unwrap_or(1)
+}
 
 /// Local GGUF generator backed by llama.cpp.
 #[derive(Clone)]
@@ -253,7 +279,6 @@ impl TextGenerator for LlamaCppTextGenerator {
         let model_path = self.model_path.clone();
         let model = self.model.clone();
         let loaded = self.loaded.clone();
-        let deadline = Instant::now() + GENERATION_DEADLINE;
         let (send, receive) = tokio::sync::mpsc::channel(32);
         tokio::task::spawn_blocking(move || {
             let result = generate_gguf(
@@ -266,7 +291,6 @@ impl TextGenerator for LlamaCppTextGenerator {
                 },
                 &model,
                 &loaded,
-                deadline,
             );
             if let Err(error) = result {
                 let _ = send.blocking_send(Err(error));
@@ -276,37 +300,67 @@ impl TextGenerator for LlamaCppTextGenerator {
     }
 }
 
+/// Loads a GGUF model and its backend. Logs only content-free timing metadata.
+fn load_model(model_path: &std::path::Path) -> Result<LoadedLlamaModel, PortError> {
+    let load_started = Instant::now();
+    let backend = LlamaBackend::init()
+        .map_err(|error| PortError::Internal(format!("initialize llama.cpp: {error}")))?;
+    let model = LlamaModel::load_from_file(&backend, model_path, &LlamaModelParams::default())
+        .map_err(|error| PortError::Unavailable(format!("load local GGUF model: {error}")))?;
+    info!(
+        load_ms = u64::try_from(load_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "loaded local GGUF generation model"
+    );
+    Ok(LoadedLlamaModel { backend, model })
+}
+
+/// Wraps the assembled prompt in the model's own chat template so instruct and
+/// reasoning models receive the role markers and trailing assistant tag they expect
+/// (without it, a chat model treats the prompt as raw text to continue and a reasoning
+/// model can spend its whole budget mid-thought without ever answering).
+///
+/// Falls back to the raw prompt for base models that ship no template, and on any
+/// templating error, so generation never fails for want of a template.
+fn apply_chat_format(model: &LlamaModel, prompt: &str) -> String {
+    let Ok(template) = model.chat_template(None) else {
+        return prompt.to_owned();
+    };
+    let Ok(message) = LlamaChatMessage::new("user".to_owned(), prompt.to_owned()) else {
+        return prompt.to_owned();
+    };
+    model
+        .apply_chat_template(&template, &[message], true)
+        .unwrap_or_else(|_| prompt.to_owned())
+}
+
 fn generate_gguf(
     model_path: &std::path::Path,
     prompt: &str,
     mut emit: impl FnMut(String) -> Result<(), PortError>,
     model_cache: &Mutex<Option<LoadedLlamaModel>>,
     loaded: &AtomicBool,
-    deadline: Instant,
 ) -> Result<(), PortError> {
     let mut cached = model_cache
         .lock()
         .map_err(|_| PortError::Internal("generation lock was poisoned".to_owned()))?;
     if cached.is_none() {
-        let backend = LlamaBackend::init()
-            .map_err(|error| PortError::Internal(format!("initialize llama.cpp: {error}")))?;
-        let model = LlamaModel::load_from_file(&backend, model_path, &LlamaModelParams::default())
-            .map_err(|error| PortError::Unavailable(format!("load local GGUF model: {error}")))?;
-        *cached = Some(LoadedLlamaModel { backend, model });
+        *cached = Some(load_model(model_path)?);
     }
     loaded.store(true, Ordering::Release);
     let cached = cached.as_mut().expect("llama model initialized");
+    let threads = cpu_thread_budget();
     let context_parameters = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(2_048))
-        .with_n_threads(2)
-        .with_n_threads_batch(2);
+        .with_n_ctx(NonZeroU32::new(GENERATION_CONTEXT_TOKENS))
+        .with_n_threads(threads)
+        .with_n_threads_batch(threads);
     let mut context = cached
         .model
         .new_context(&cached.backend, context_parameters)
         .map_err(|error| PortError::Internal(format!("create llama.cpp context: {error}")))?;
+    let formatted_prompt = apply_chat_format(&cached.model, prompt);
     let tokens = cached
         .model
-        .str_to_token(prompt, AddBos::Always)
+        .str_to_token(&formatted_prompt, AddBos::Always)
         .map_err(|error| PortError::InvalidData(format!("tokenize generation prompt: {error}")))?;
     let maximum_prompt_tokens = 1_792_usize;
     if tokens.is_empty() || tokens.len() > maximum_prompt_tokens {
@@ -315,6 +369,7 @@ fn generate_gguf(
             tokens.len()
         )));
     }
+    let prompt_token_count = tokens.len();
 
     let mut batch = LlamaBatch::new(2_048, 1);
     let last = tokens.len() - 1;
@@ -330,19 +385,30 @@ fn generate_gguf(
             )
             .map_err(|error| PortError::Internal(format!("build llama.cpp batch: {error}")))?;
     }
+    let prompt_decode_started = Instant::now();
     context
         .decode(&mut batch)
         .map_err(|error| PortError::Internal(format!("evaluate generation prompt: {error}")))?;
+    let prompt_decode_ms =
+        u64::try_from(prompt_decode_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
+    // Arm the wall-clock budget only now that the model is resident and the prompt
+    // is evaluated, so a slow cold load never eats into generation time.
+    let deadline = Instant::now() + GENERATION_DEADLINE;
+    let generation_started = Instant::now();
     let mut sampler = LlamaSampler::greedy();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    for position in (batch.n_tokens()..).take(256) {
+    let mut generated_tokens = 0_usize;
+    let mut stop_reason = "token_cap";
+    for position in (batch.n_tokens()..).take(MAX_GENERATED_TOKENS) {
         if should_stop_generation(deadline, Instant::now()) {
+            stop_reason = "deadline";
             break;
         }
         let token = sampler.sample(&context, batch.n_tokens() - 1);
         sampler.accept(token);
         if cached.model.is_eog_token(token) {
+            stop_reason = "eog";
             break;
         }
         let piece = cached
@@ -352,6 +418,7 @@ fn generate_gguf(
         if !piece.is_empty() {
             emit(piece)?;
         }
+        generated_tokens += 1;
         batch.clear();
         batch
             .add(token, position, &[0], true)
@@ -360,6 +427,15 @@ fn generate_gguf(
             .decode(&mut batch)
             .map_err(|error| PortError::Internal(format!("evaluate generated token: {error}")))?;
     }
+    info!(
+        threads,
+        prompt_tokens = prompt_token_count,
+        prompt_decode_ms,
+        generated_tokens,
+        generate_ms = u64::try_from(generation_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        stop_reason,
+        "completed local generation"
+    );
     Ok(())
 }
 

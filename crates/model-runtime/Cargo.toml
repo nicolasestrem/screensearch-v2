@@ -13,10 +13,12 @@ encoding_rs.workspace = true
 fastembed.workspace = true
 futures.workspace = true
 llama-cpp-2.workspace = true
+num_cpus.workspace = true
 screensearch-domain = { path = "../domain" }
 screensearch-ports = { path = "../ports" }
 tokio.workspace = true
 tokio-stream.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

@@ -32,6 +32,7 @@ fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-
 image = { version = "0.25", default-features = false, features = ["png"] }
 llama-cpp-2 = { version = "0.1.150", default-features = false, features = ["common"] }
 libsql = { version = "0.9.29", default-features = false, features = ["core"] }
+num_cpus = "1.16"
 prost = "0.14"
 protoc-bin-vendored = "3.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }

@@ -2,6 +2,29 @@
 
 This log records meaningful AI-assisted repository changes and their reasons. It is not a substitute for Git history.
 
+## 2026-06-22 — Local generation throughput + chat-template fix
+
+### Changed
+
+- Diagnosed the "report generation does nothing" report from a live daemon log: a `Ministral-3-3B-Reasoning` GGUF loaded fully, then generation ran **CPU-only on a hardcoded two threads**, so a 3B reasoning model crawled and the answer pane appeared frozen.
+- Replaced the hardcoded `n_threads(2)` / `n_threads_batch(2)` in `generate_gguf` with a physical-core budget (`cpu_thread_budget`, via `num_cpus`).
+- Moved the 120 s generation deadline so it is armed **after** the model is resident and the prompt is decoded — a slow cold load can no longer silently consume the budget and return an empty "answered".
+- Applied the model's own chat template (`apply_chat_format` → `LlamaModel::chat_template`/`apply_chat_template`) before tokenizing, so instruct and reasoning models receive the role markers + trailing assistant tag they expect instead of a raw text blob. Falls back to the raw prompt for base models with no template.
+- Raised the evaluation context to `GENERATION_CONTEXT_TOKENS = 4096` and the per-request token cap to 768 so a reasoning model can finish its `<think>` span and still reach an answer (the wall-clock deadline stays the real bound). The daemon now stamps each model's `context_tokens` from that shared constant, keeping the stored metadata truthful.
+- Added content-free generation diagnostics (`load_ms`, `prompt_tokens`, `prompt_decode_ms`, `generated_tokens`, `generate_ms`, `stop_reason`, `threads`) and broadened the worker's tracing filter so `screensearch_model_runtime` logs surface. No prompt/answer/query text is logged.
+
+### Why
+
+The model loaded fine; generation was just starved (two CPU threads) and unformatted (no chat template), so a reasoning model never surfaced an answer. These fixes are CPU-only and fully verifiable. GPU acceleration was explored but **descoped at the user's request** for this change.
+
+### Verification
+
+- `cargo fmt --check` (exit 0), `cargo clippy --workspace --all-targets -- -D warnings` (exit 0), `cargo test --workspace` (52 passed, 7 ignored).
+
+### Not changed
+
+- The worker boundary contract, IPC, and persistence schema are unchanged. Items 15/16 remain open.
+
 ## 2026-06-21 — Specification engineering baseline
 
 ### Changed
