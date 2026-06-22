@@ -8,7 +8,7 @@ This repository is a clean-room V2 implementation. It contains no legacy code, c
 
 - A persistent Rust daemon owns capture, durable jobs, storage, search, and policy enforcement.
 - A Tauri 2 shell hosts the React user interface and proxies typed requests to the daemon.
-- A model-worker process owns OCR, embedding, and generation runtimes; the daemon supervises it and keeps durable archive state.
+- A model-worker process owns OCR, embedding, and generation runtimes; the daemon supervises it — detecting crashes, restarting it within a bounded budget, and tying its lifetime to the daemon — while keeping durable archive state.
 - Protobuf messages travel over local-only Windows named pipes; screen buffers and model files never cross IPC inline.
 - libSQL stores relational metadata, FTS5 text, vector indexes, jobs, and transactional outbox events.
 

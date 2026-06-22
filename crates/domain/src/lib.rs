@@ -581,7 +581,81 @@ pub enum DomainError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArchiveSettings, BoundingBox};
+    use super::{ArchiveSettings, BoundingBox, DomainError, GenerationModel, ModelSourceKind};
+
+    fn valid_generation_model() -> GenerationModel {
+        GenerationModel {
+            id: "qwen2-5-1-5b-instruct".to_owned(),
+            display_name: "Qwen2.5 1.5B Instruct".to_owned(),
+            source: ModelSourceKind::Local,
+            repository: None,
+            filename: "qwen2.5-1.5b-instruct-q4_k_m.gguf".to_owned(),
+            relative_path: "qwen2-5-1-5b-instruct/qwen2.5-1.5b-instruct-q4_k_m.gguf".to_owned(),
+            content_hash: Some("a".repeat(64)),
+            byte_length: 1_024,
+            architecture: Some("Qwen".to_owned()),
+            quantization: Some("Q4_K_M".to_owned()),
+            context_tokens: Some(2_048),
+            supports_vision: false,
+            active: false,
+        }
+    }
+
+    #[test]
+    fn generation_model_accepts_bounded_metadata() {
+        assert!(valid_generation_model().validate().is_ok());
+    }
+
+    #[test]
+    fn generation_model_rejects_relative_path_escapes() {
+        let mut traversal = valid_generation_model();
+        traversal.relative_path = "../escape/model.gguf".to_owned();
+        assert!(matches!(
+            traversal.validate(),
+            Err(DomainError::InvalidModelCatalog(_))
+        ));
+
+        let mut absolute = valid_generation_model();
+        absolute.relative_path = "/etc/model.gguf".to_owned();
+        assert!(matches!(
+            absolute.validate(),
+            Err(DomainError::InvalidModelCatalog(_))
+        ));
+    }
+
+    #[test]
+    fn generation_model_rejects_out_of_range_fields() {
+        let mut empty_id = valid_generation_model();
+        empty_id.id = String::new();
+        assert!(empty_id.validate().is_err());
+
+        let mut short_hash = valid_generation_model();
+        short_hash.content_hash = Some("abc".to_owned());
+        assert!(short_hash.validate().is_err());
+
+        let mut zero_bytes = valid_generation_model();
+        zero_bytes.byte_length = 0;
+        assert!(zero_bytes.validate().is_err());
+    }
+
+    #[test]
+    fn generation_model_accepts_a_full_length_content_hash() {
+        let mut model = valid_generation_model();
+        model.content_hash = Some("f".repeat(64));
+        assert!(model.validate().is_ok());
+    }
+
+    #[test]
+    fn model_source_kind_round_trips_through_its_persistence_value() {
+        for kind in [
+            ModelSourceKind::Local,
+            ModelSourceKind::HuggingFace,
+            ModelSourceKind::Bundled,
+        ] {
+            assert_eq!(ModelSourceKind::parse(kind.as_str()), Ok(kind));
+        }
+        assert!(ModelSourceKind::parse("totally-unknown").is_err());
+    }
 
     #[test]
     fn bounding_box_rejects_coordinates_outside_capture() {

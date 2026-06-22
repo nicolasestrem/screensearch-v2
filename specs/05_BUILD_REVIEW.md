@@ -41,7 +41,7 @@ Build reviewed: completed P0 truthful evidence loop and P1 semantic-retrieval/sc
 ## Placeholder behavior that must not be mistaken for product behavior
 
 - Fake providers remain for deterministic tests and are no longer composed by the production daemon.
-- The P3 branch changes the model-worker executable into the intended inference endpoint and routes daemon model ports through it, but this is not yet verified by the required checks in this session.
+- The P3 branch makes the model-worker executable the real inference endpoint, routes daemon model ports through it, and supervises it (bounded restarts + parent lifeline). The required Rust/frontend checks pass; live-Windows GGUF generation benchmarking of a selected candidate is still pending before items 15/16 close.
 
 ## Existing strengths
 
@@ -56,7 +56,7 @@ Build reviewed: completed P0 truthful evidence loop and P1 semantic-retrieval/sc
 2. Capture and analysis share one daemon; queue backpressure is implemented, but model process isolation remains necessary for release resilience.
 3. First model acquisition currently depends on Hugging Face connectivity and lacks a signed manifest flow.
 4. The fixed 384-dimensional vector table is correct for MiniLM but requires a new migration for future dimensions.
-5. The native model-worker boundary is declared but not exercised.
+5. The native model-worker boundary is now supervised (bounded restarts + parent lifeline) and exercised by gated integration tests, but live-Windows GGUF generation benchmarking and the GAP-002/GAP-003 model decisions remain before items 15/16 close.
 6. Current logging review has not yet proven that all future native errors are content-free.
 7. Long-duration capture CPU/storage growth and perceptual-threshold tuning remain release-hardening work beyond the completed P1 engineering baseline.
 
@@ -78,4 +78,15 @@ P0 remains verified and P1 is complete. The build has real revision-consistent h
 
 ## P3 branch review note
 
-The current `p3-model-selection-worker` branch adds generation-model catalog persistence, local GGUF import, explicit Hugging Face download, active-model selection, answer completion statuses, and worker IPC for OCR, embeddings, and generation. This note does not close P3: required Rust/frontend verification and live local-model benchmarking were blocked by the command-execution environment during implementation.
+The `p3-model-selection-worker` branch adds generation-model catalog persistence, local GGUF import, explicit Hugging Face download, active-model selection, answer completion statuses, and worker IPC for OCR, embeddings, and generation.
+
+A 2026-06-22 review-and-harden pass made the worker boundary genuinely *supervised* (patch-plan item 16) and gave the generation model a real memory lifecycle (item 15), then ran the full required verification that the original implementation session could not:
+
+- **Worker supervision.** The daemon now runs a supervisor task that detects worker exits and restarts the worker within a sliding-window bounded budget (`RestartPolicy`, unit-tested); exhausting the budget surfaces as a loud daemon exit. A per-instance parent **lifeline pipe** ties the worker's lifetime to the daemon, so a daemon crash no longer orphans a worker that would squat the worker pipe. Both restart budget/backoff and the lifeline use safe Rust and code constants — no new environment variables, no new `unsafe`.
+- **Memory lifecycle.** An idle-timeout loop unloads the resident generation model after inactivity by issuing a raw worker unload that keeps the catalog selection intact, so the next query reloads lazily. A generation wall-clock deadline backstops cancellation, and `is_loaded()` is now lock-free so a health probe never blocks behind an in-flight generation. (Memory-pressure-triggered unload is deferred — see GAP-008.)
+- **Revision integrity.** The daemon's worker client now verifies the worker-reported OCR/embedding revision against the expected id and fails loudly on drift, protecting the ADR 0002 invariant.
+- **Tests.** New CI-run tests cover the catalog invariants, domain validation, every `answer_status` branch, the restart policy, and the deadline predicate. A new gated `apps/daemon/tests/worker_supervision.rs` (opt-in `SCREENSEARCH_RUN_WORKER_IT=1`, GGUF cases on `SCREENSEARCH_TEST_GGUF`) exercises readiness, lifeline-exit, kill→restart recovery, cancellation, and idle unload against the real worker process.
+
+Verification on 2026-06-22 (Windows): `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` all passed (52 passed, 7 ignored gated); `npm run lint` and `npm run build` passed in `apps/desktop`.
+
+**Items 15 and 16 stay open.** Closing them additionally requires a live-Windows GGUF benchmark of a selected candidate model and the human/legal model decisions in GAP-002/GAP-003; the benchmark harness exists but candidate measurements are still pending.

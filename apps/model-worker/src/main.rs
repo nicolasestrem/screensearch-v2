@@ -11,7 +11,7 @@ use futures::{StreamExt, stream};
 use screensearch_domain::AssetRef;
 use screensearch_ipc::{
     IpcError, RequestHandler, ResponseStream,
-    transport::{DEFAULT_WORKER_PIPE_NAME, serve},
+    transport::{DEFAULT_WORKER_PIPE_NAME, serve, watch_worker_lifeline},
     v1::{
         ErrorResponse, NormalizedRect, ResponseEnvelope, Token, WorkerEmbeddingResponse,
         WorkerGenerationCompleted, WorkerGenerationEvent, WorkerHealthResponse, WorkerOcrBlock,
@@ -23,7 +23,7 @@ use screensearch_model_runtime::{FastEmbedEngine, LlamaCppTextGenerator};
 use screensearch_ports::{EmbeddingEngine, OcrEngine, TextGenerator};
 use screensearch_windows::WindowsOcrEngine;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 struct WorkerHandler {
     model_root: PathBuf,
@@ -60,8 +60,7 @@ impl RequestHandler for WorkerHandler {
                 let generation = self.generation.lock().await;
                 let generation_loaded = generation
                     .as_ref()
-                    .and_then(|cached| cached.generator.is_loaded().ok())
-                    .unwrap_or(false);
+                    .is_some_and(|cached| cached.generator.is_loaded());
                 let active_generation_model_id = generation
                     .as_ref()
                     .map(|cached| cached.model_id.clone())
@@ -249,7 +248,21 @@ async fn main() -> anyhow::Result<()> {
         return benchmark_model(model_path).await;
     }
 
-    let (asset_root, model_root, pipe_name) = worker_config()?;
+    let WorkerConfig {
+        asset_root,
+        model_root,
+        pipe_name,
+        lifeline_pipe,
+    } = worker_config()?;
+    if let Some(lifeline_pipe) = lifeline_pipe {
+        tokio::spawn(async move {
+            if let Err(error) = watch_worker_lifeline(&lifeline_pipe).await {
+                warn!(%error, "model-worker lifeline watch failed");
+            }
+            info!("daemon lifeline closed; model worker exiting");
+            std::process::exit(0);
+        });
+    }
     let handler = Arc::new(WorkerHandler {
         model_root: model_root.clone(),
         ocr: Arc::new(WindowsOcrEngine::new(asset_root)),
@@ -295,25 +308,35 @@ fn benchmark_model_arg() -> Option<PathBuf> {
     None
 }
 
-fn worker_config() -> anyhow::Result<(PathBuf, PathBuf, String)> {
+struct WorkerConfig {
+    asset_root: PathBuf,
+    model_root: PathBuf,
+    pipe_name: String,
+    lifeline_pipe: Option<String>,
+}
+
+fn worker_config() -> anyhow::Result<WorkerConfig> {
     let mut asset_root = None;
     let mut model_root = None;
     let mut pipe_name = None;
+    let mut lifeline_pipe = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--asset-root" => asset_root = args.next().map(PathBuf::from),
             "--model-root" => model_root = args.next().map(PathBuf::from),
             "--pipe" => pipe_name = args.next(),
+            "--lifeline-pipe" => lifeline_pipe = args.next(),
             _ => {}
         }
     }
     let data_root = data_directory()?;
-    Ok((
-        asset_root.unwrap_or_else(|| data_root.join("assets")),
-        model_root.unwrap_or_else(|| data_root.join("models")),
-        pipe_name.unwrap_or_else(|| DEFAULT_WORKER_PIPE_NAME.to_owned()),
-    ))
+    Ok(WorkerConfig {
+        asset_root: asset_root.unwrap_or_else(|| data_root.join("assets")),
+        model_root: model_root.unwrap_or_else(|| data_root.join("models")),
+        pipe_name: pipe_name.unwrap_or_else(|| DEFAULT_WORKER_PIPE_NAME.to_owned()),
+        lifeline_pipe,
+    })
 }
 
 fn data_directory() -> anyhow::Result<PathBuf> {

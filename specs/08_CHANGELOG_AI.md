@@ -264,3 +264,36 @@ Not run in this implementation session. The Windows sandbox failed before launch
 ### Remaining boundary
 
 Items 15 and 16 remain open until the branch compiles cleanly, the model-worker is verified against local GGUF candidates, and a benchmark report selects a default model for the use case. Legal/license approval remains intentionally deferred for this engineering slice.
+
+## 2026-06-22 — P3 review-and-harden: worker supervision and model memory lifecycle
+
+### Changed
+
+- **Worker supervision (item 16).** Added `apps/daemon/src/supervisor.rs` with a sliding-window bounded `RestartPolicy` (exponential backoff, capped; failures outside the window decay) and a daemon `worker_supervisor_loop` that detects worker exits via `Child::wait`, restarts within budget, owns the clean-shutdown kill/reap, and surfaces budget exhaustion as a loud non-zero daemon exit. The worker is no longer spawned once and forgotten.
+- **Orphan prevention (item 16).** Added a per-instance parent **lifeline pipe**: the daemon creates it (`create_worker_lifeline`) before spawning and passes `--lifeline-pipe`; the worker watches it (`watch_worker_lifeline`) and self-exits on EOF, so a daemon crash cannot leave an orphaned worker squatting the worker pipe. Pure safe Rust over the existing named-pipe transport — no new `unsafe`.
+- **Memory lifecycle (item 15).** Added a daemon `idle_unload_loop` that, after an idle timeout, issues a **raw** worker unload (not the catalog-clearing daemon handler) so the active selection survives and the next query reloads lazily. Added a generation wall-clock deadline in `LlamaCppTextGenerator`, and made `is_loaded()` lock-free (an `AtomicBool`) so a health probe never blocks behind an in-flight generation holding the model mutex.
+- **Revision integrity (ADR 0002).** `WorkerModelClient` now compares the worker-reported OCR/embedding revision against the expected id and fails loudly (`PortError::Internal` + content-free `warn!`) on drift instead of silently stamping derived records with a constant.
+- **README.** Tightened the architecture line so the now-true "the daemon supervises it" claim describes crash detection, bounded restarts, and the lifeline.
+
+### Tests
+
+- New CI tests: `crates/persistence/tests/generation_model_catalog.rs` (catalog ordering, single-active invariant, delete-active denied, select-unregistered rejected, clear-active keeps rows), domain `GenerationModel::validate`/`ModelSourceKind::parse` cases, `crates/application/tests/answer_status.rs` (every terminal status branch via test doubles), `supervisor::tests` (restart-policy backoff/give-up/decay), and a model-runtime deadline-predicate test — 24 new CI-run tests.
+- New gated `apps/daemon/tests/worker_supervision.rs` (5 `#[ignore]` cases, opt-in `SCREENSEARCH_RUN_WORKER_IT=1`; generation cases on `SCREENSEARCH_TEST_GGUF`): readiness + lifeline-exit, kill→restart recovery, generation round-trip after restart, cancellation keeps health responsive, and the idle-unload primitive.
+
+### Decisions made
+
+- Tunables (restart budget/backoff, idle timeout, generation deadline) are **code constants**, not environment variables (operating rule 5; the spec names none).
+- Chose a parent-lifeline pipe over a Windows Job Object to keep the workspace free of `unsafe`.
+- Memory-pressure-triggered unload is deferred (idle-timeout unload ships); the pressure-signal source is recorded as **GAP-008** so item 15's "memory lifecycle" is honestly scoped.
+- The `answer_status` test uses an inline fake `ArchiveRepository` (test double) rather than adding `application → persistence` as a dev-dependency.
+
+### Verification evidence
+
+- `cargo fmt --check` — clean (exit 0); the only earlier breakage was rustfmt/CRLF drift left by the prior session, fixed by `cargo fmt`.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean (exit 0).
+- `cargo test --workspace` — **52 passed, 0 failed, 7 ignored** (the 5 new gated worker-supervision cases plus the pre-existing scale and live-archive tests). Includes the new catalog (7), answer-status (7), domain generation-model (5), supervisor (4), and deadline (1) tests.
+- `npm run lint` and `npm run build` (`apps/desktop`) — clean (exit 0).
+
+### Remaining boundary
+
+Items 15 and 16 **stay open**. Closing them additionally requires a live-Windows GGUF benchmark of a selected candidate model (the harness exists; candidate measurements are pending), the GAP-002/GAP-003 model/licensing decisions, and the memory-pressure unload path (GAP-008). The gated worker-supervision tests must also be run on Windows with a test GGUF to confirm the runtime end to end.
