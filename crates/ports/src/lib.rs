@@ -51,8 +51,15 @@ pub trait ArchiveRepository: Send + Sync {
     /// Claims one available job using a bounded lease.
     async fn claim_job(&self, worker_id: &str) -> Result<Option<AnalysisJob>, PortError>;
 
+    /// Extends the current worker lease for a running job.
+    async fn renew_job_lease(&self, job: &AnalysisJob) -> Result<AnalysisJob, PortError>;
+
     /// Commits OCR, chunks, embeddings, outbox events, and job completion atomically.
-    async fn complete_analysis(&self, result: AnalysisResult) -> Result<(), PortError>;
+    async fn complete_analysis(
+        &self,
+        job: &AnalysisJob,
+        result: AnalysisResult,
+    ) -> Result<(), PortError>;
 
     /// Records a failed attempt and schedules a retry or dead-letters the job.
     async fn fail_job(&self, job: &AnalysisJob, reason: &str) -> Result<(), PortError>;

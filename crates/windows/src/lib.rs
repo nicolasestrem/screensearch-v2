@@ -17,7 +17,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use image::{DynamicImage, ImageFormat, imageops::FilterType};
+use image::{DynamicImage, ImageFormat};
 use screensearch_domain::{BoundingBox, CapturedFrame, OcrBlock};
 use screensearch_ports::{CaptureSource, OcrEngine, PortError};
 use windows::{
@@ -27,7 +27,13 @@ use windows::{
 };
 use xcap::{Monitor, Window};
 
-const MAX_CAPTURE_DIMENSION: u32 = 2_600;
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EncodedFrame {
+    width: u32,
+    height: u32,
+    bytes: Vec<u8>,
+    media_type: String,
+}
 
 /// Deterministic frame source retained for contract and integration tests.
 #[derive(Default)]
@@ -91,26 +97,29 @@ fn capture_focused_monitor() -> Result<CapturedFrame, PortError> {
         |_| "windows-monitor-unknown".to_owned(),
         |id| format!("windows-monitor-{id}"),
     );
-    let mut image = DynamicImage::ImageRgba8(monitor.capture_image().map_err(capture_error)?);
-    if image.width().max(image.height()) > MAX_CAPTURE_DIMENSION {
-        image = image.resize(
-            MAX_CAPTURE_DIMENSION,
-            MAX_CAPTURE_DIMENSION,
-            FilterType::Triangle,
-        );
-    }
-    let width = image.width();
-    let height = image.height();
-    let mut encoded = Cursor::new(Vec::new());
-    image
-        .write_to(&mut encoded, ImageFormat::Png)
-        .map_err(|error| PortError::Internal(format!("encode PNG capture: {error}")))?;
+    let image = DynamicImage::ImageRgba8(monitor.capture_image().map_err(capture_error)?);
+    let encoded = encode_png_frame(&image)?;
 
     Ok(CapturedFrame {
         captured_at: chrono::Utc::now(),
         monitor_id,
         application,
         window_title,
+        width: encoded.width,
+        height: encoded.height,
+        bytes: encoded.bytes,
+        media_type: encoded.media_type,
+    })
+}
+
+fn encode_png_frame(image: &DynamicImage) -> Result<EncodedFrame, PortError> {
+    let width = image.width();
+    let height = image.height();
+    let mut encoded = Cursor::new(Vec::new());
+    image
+        .write_to(&mut encoded, ImageFormat::Png)
+        .map_err(|error| PortError::Internal(format!("encode PNG capture: {error}")))?;
+    Ok(EncodedFrame {
         width,
         height,
         bytes: encoded.into_inner(),
@@ -272,6 +281,7 @@ fn ocr_error(error: windows::core::Error) -> PortError {
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod tests {
+    use image::DynamicImage;
     use screensearch_domain::{
         AutomationFailureCode, AutomationKey, AutomationTarget, KeyModifier,
     };
@@ -279,9 +289,20 @@ mod tests {
     use windows::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, KEYEVENTF_UNICODE};
 
     use super::{
-        encode_key_chord_inputs, encode_text_inputs, keyboard_event, target_identity_matches,
-        validate_send_input_count,
+        encode_key_chord_inputs, encode_png_frame, encode_text_inputs, keyboard_event,
+        target_identity_matches, validate_send_input_count,
     };
+
+    #[test]
+    fn png_encoding_preserves_native_dimensions_above_previous_cap() {
+        let image = DynamicImage::new_rgba8(3_001, 3);
+
+        let encoded = encode_png_frame(&image).unwrap();
+
+        assert_eq!(encoded.width, 3_001);
+        assert_eq!(encoded.height, 3);
+        assert_eq!(encoded.media_type, "image/png");
+    }
 
     #[test]
     fn target_identity_requires_exact_hwnd_pid_and_executable() {

@@ -31,6 +31,7 @@ const MIGRATION_0004: &str = include_str!("../migrations/0004_real_embedding_mod
 const MIGRATION_0005: &str = include_str!("../migrations/0005_archive_policy.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_generation_model_catalog.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_guarded_automation.sql");
+const MIGRATION_0008: &str = include_str!("../migrations/0008_chunk_reading_order_range.sql");
 const MAX_JOB_ATTEMPTS: u32 = 5;
 const BRUTE_FORCE_VECTOR_THRESHOLD: u64 = 50_000;
 
@@ -243,8 +244,27 @@ impl LibSqlArchive {
         }
         Ok(bytes)
     }
+
+    async fn apply_migration_if_missing(&self, version: u32, sql: &str) -> Result<(), PortError> {
+        let mut rows = self
+            .connection()
+            .query(
+                "SELECT 1 FROM schema_migration WHERE version = ? LIMIT 1",
+                params![i64::from(version)],
+            )
+            .await
+            .map_err(database_error)?;
+        if rows.next().await.map_err(database_error)?.is_none() {
+            self.connection()
+                .execute_batch(sql)
+                .await
+                .map_err(database_error)?;
+        }
+        Ok(())
+    }
 }
 
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl ArchiveRepository for LibSqlArchive {
     async fn migrate(&self) -> Result<(), PortError> {
@@ -253,89 +273,16 @@ impl ArchiveRepository for LibSqlArchive {
             .execute_batch(MIGRATION_0001)
             .await
             .map_err(database_error)?;
-        let mut rows = self
-            .connection()
-            .query(
-                "SELECT 1 FROM schema_migration WHERE version = 2 LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(database_error)?;
-        if rows.next().await.map_err(database_error)?.is_none() {
-            self.connection()
-                .execute_batch(MIGRATION_0002)
-                .await
-                .map_err(database_error)?;
-        }
-        let mut rows = self
-            .connection()
-            .query(
-                "SELECT 1 FROM schema_migration WHERE version = 3 LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(database_error)?;
-        if rows.next().await.map_err(database_error)?.is_none() {
-            self.connection()
-                .execute_batch(MIGRATION_0003)
-                .await
-                .map_err(database_error)?;
-        }
-        let mut rows = self
-            .connection()
-            .query(
-                "SELECT 1 FROM schema_migration WHERE version = 4 LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(database_error)?;
-        if rows.next().await.map_err(database_error)?.is_none() {
-            self.connection()
-                .execute_batch(MIGRATION_0004)
-                .await
-                .map_err(database_error)?;
-        }
-        let mut rows = self
-            .connection()
-            .query(
-                "SELECT 1 FROM schema_migration WHERE version = 5 LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(database_error)?;
-        if rows.next().await.map_err(database_error)?.is_none() {
-            self.connection()
-                .execute_batch(MIGRATION_0005)
-                .await
-                .map_err(database_error)?;
-        }
-        let mut rows = self
-            .connection()
-            .query(
-                "SELECT 1 FROM schema_migration WHERE version = 6 LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(database_error)?;
-        if rows.next().await.map_err(database_error)?.is_none() {
-            self.connection()
-                .execute_batch(MIGRATION_0006)
-                .await
-                .map_err(database_error)?;
-        }
-        let mut rows = self
-            .connection()
-            .query(
-                "SELECT 1 FROM schema_migration WHERE version = 7 LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(database_error)?;
-        if rows.next().await.map_err(database_error)?.is_none() {
-            self.connection()
-                .execute_batch(MIGRATION_0007)
-                .await
-                .map_err(database_error)?;
+        for (version, sql) in [
+            (2, MIGRATION_0002),
+            (3, MIGRATION_0003),
+            (4, MIGRATION_0004),
+            (5, MIGRATION_0005),
+            (6, MIGRATION_0006),
+            (7, MIGRATION_0007),
+            (8, MIGRATION_0008),
+        ] {
+            self.apply_migration_if_missing(version, sql).await?;
         }
         Ok(())
     }
@@ -421,6 +368,8 @@ impl ArchiveRepository for LibSqlArchive {
         let transaction = connection.transaction().await.map_err(database_error)?;
         let now = Utc::now();
         let now_text = timestamp(now);
+        let lease_until = now + Duration::minutes(2);
+        let lease_until_text = timestamp(lease_until);
         transaction
             .execute(
                 "UPDATE analysis_job SET status = 'pending', lease_owner = NULL, lease_until = NULL WHERE status = 'running' AND lease_until < ?",
@@ -464,7 +413,7 @@ impl ArchiveRepository for LibSqlArchive {
                 "UPDATE analysis_job SET status = 'running', lease_owner = ?, lease_until = ? WHERE id = ? AND status = 'pending'",
                 params![
                     worker_id,
-                    timestamp(now + Duration::minutes(2)),
+                    lease_until_text,
                     job_id_text.clone(),
                 ],
             )
@@ -478,10 +427,56 @@ impl ArchiveRepository for LibSqlArchive {
             asset,
             attempt: u32::try_from(attempt)
                 .map_err(|_| PortError::InvalidData("invalid job attempt".to_owned()))?,
+            lease_owner: worker_id.to_owned(),
+            lease_until,
         }))
     }
 
-    async fn complete_analysis(&self, result: AnalysisResult) -> Result<(), PortError> {
+    async fn renew_job_lease(&self, job: &AnalysisJob) -> Result<AnalysisJob, PortError> {
+        let _write_guard = self.write_gate.lock().await;
+        let connection = self.connection();
+        let now = Utc::now();
+        let renewed_until = now + Duration::minutes(2);
+        let changed = connection
+            .execute(
+                "UPDATE analysis_job
+                 SET lease_until = ?
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND lease_owner = ?
+                   AND lease_until = ?
+                   AND lease_until >= ?",
+                params![
+                    timestamp(renewed_until),
+                    job.id.to_string(),
+                    job.lease_owner.clone(),
+                    timestamp(job.lease_until),
+                    timestamp(now),
+                ],
+            )
+            .await
+            .map_err(database_error)?;
+        if changed != 1 {
+            return Err(PortError::InvalidData(
+                "analysis job lease is no longer current".to_owned(),
+            ));
+        }
+        Ok(AnalysisJob {
+            lease_until: renewed_until,
+            ..job.clone()
+        })
+    }
+
+    async fn complete_analysis(
+        &self,
+        job: &AnalysisJob,
+        result: AnalysisResult,
+    ) -> Result<(), PortError> {
+        if job.id != result.job_id || job.capture_id != result.capture_id {
+            return Err(PortError::InvalidData(
+                "analysis result does not match leased job".to_owned(),
+            ));
+        }
         let _write_guard = self.write_gate.lock().await;
         let connection = self.connection();
         let transaction = connection.transaction().await.map_err(database_error)?;
@@ -528,13 +523,14 @@ impl ArchiveRepository for LibSqlArchive {
             }
             transaction
                 .execute(
-                    "INSERT OR REPLACE INTO search_chunk(id, capture_id, text, created_at, source_reading_order) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO search_chunk(id, capture_id, text, created_at, source_reading_order, source_end_reading_order) VALUES (?, ?, ?, ?, ?, ?)",
                     params![
                         chunk.id.to_string(),
                         chunk.capture_id.to_string(),
                         chunk.text,
                         now.clone(),
                         i64::from(chunk.source_reading_order),
+                        i64::from(chunk.source_end_reading_order),
                     ],
                 )
                 .await
@@ -555,14 +551,26 @@ impl ArchiveRepository for LibSqlArchive {
 
         let changed = transaction
             .execute(
-                "UPDATE analysis_job SET status = 'complete', completed_at = ?, lease_owner = NULL, lease_until = NULL WHERE id = ? AND status = 'running'",
-                params![now.clone(), result.job_id.to_string()],
+                "UPDATE analysis_job
+                 SET status = 'complete', completed_at = ?, lease_owner = NULL, lease_until = NULL
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND lease_owner = ?
+                   AND lease_until = ?
+                   AND lease_until >= ?",
+                params![
+                    now.clone(),
+                    result.job_id.to_string(),
+                    job.lease_owner.clone(),
+                    timestamp(job.lease_until),
+                    now.clone(),
+                ],
             )
             .await
             .map_err(database_error)?;
         if changed != 1 {
             return Err(PortError::InvalidData(
-                "analysis job was not running at completion".to_owned(),
+                "analysis job lease was not current at completion".to_owned(),
             ));
         }
         transaction
@@ -582,35 +590,69 @@ impl ArchiveRepository for LibSqlArchive {
         let transaction = connection.transaction().await.map_err(database_error)?;
         let attempt = job.attempt + 1;
         let now = Utc::now();
+        let now_text = timestamp(now);
+        let lease_until_text = timestamp(job.lease_until);
         if attempt >= MAX_JOB_ATTEMPTS {
-            transaction
+            let changed = transaction
                 .execute(
-                    "UPDATE analysis_job SET status = 'dead', attempt = ?, last_error = ?, lease_owner = NULL, lease_until = NULL WHERE id = ?",
-                    params![i64::from(attempt), reason, job.id.to_string()],
+                    "UPDATE analysis_job
+                     SET status = 'dead', attempt = ?, last_error = ?, lease_owner = NULL, lease_until = NULL
+                     WHERE id = ?
+                       AND status = 'running'
+                       AND lease_owner = ?
+                       AND lease_until = ?
+                       AND lease_until >= ?",
+                    params![
+                        i64::from(attempt),
+                        reason,
+                        job.id.to_string(),
+                        job.lease_owner.clone(),
+                        lease_until_text.clone(),
+                        now_text.clone(),
+                    ],
                 )
                 .await
                 .map_err(database_error)?;
+            if changed != 1 {
+                return Err(PortError::InvalidData(
+                    "analysis job lease was not current at failure".to_owned(),
+                ));
+            }
             transaction
                 .execute(
                     "INSERT OR REPLACE INTO dead_letter(job_id, reason, failed_at) VALUES (?, ?, ?)",
-                    params![job.id.to_string(), reason, timestamp(now)],
+                    params![job.id.to_string(), reason, now_text],
                 )
                 .await
                 .map_err(database_error)?;
         } else {
             let backoff_seconds = i64::from(2_u32.pow(attempt.min(8)));
-            transaction
+            let changed = transaction
                 .execute(
-                    "UPDATE analysis_job SET status = 'pending', attempt = ?, last_error = ?, next_run_at = ?, lease_owner = NULL, lease_until = NULL WHERE id = ?",
+                    "UPDATE analysis_job
+                     SET status = 'pending', attempt = ?, last_error = ?, next_run_at = ?, lease_owner = NULL, lease_until = NULL
+                     WHERE id = ?
+                       AND status = 'running'
+                       AND lease_owner = ?
+                       AND lease_until = ?
+                       AND lease_until >= ?",
                     params![
                         i64::from(attempt),
                         reason,
                         timestamp(now + Duration::seconds(backoff_seconds)),
                         job.id.to_string(),
+                        job.lease_owner.clone(),
+                        lease_until_text,
+                        now_text,
                     ],
                 )
                 .await
                 .map_err(database_error)?;
+            if changed != 1 {
+                return Err(PortError::InvalidData(
+                    "analysis job lease was not current at failure".to_owned(),
+                ));
+            }
         }
         transaction.commit().await.map_err(database_error)?;
         Ok(())
@@ -1489,14 +1531,12 @@ async fn add_lexical_results(
         "SELECT sc.id, sc.capture_id, sc.text,
                 c.captured_at, c.application, c.window_title, c.width, c.height,
                 a.content_hash, a.relative_path, a.media_type, a.byte_length,
-                ob.x, ob.y, ob.width, ob.height, ob.model_id
+                sc.source_reading_order, sc.source_end_reading_order
          FROM search_chunk_fts f
          JOIN search_chunk sc ON sc.rowid = f.rowid
          JOIN chunk_embedding_384 ce ON ce.chunk_id = sc.id AND ce.model_id = ?
          JOIN capture c ON c.id = sc.capture_id
          JOIN asset a ON a.content_hash = c.asset_hash
-         JOIN ocr_block ob ON ob.capture_id = sc.capture_id
-             AND ob.reading_order = sc.source_reading_order
          WHERE search_chunk_fts MATCH ?",
     );
     let mut values = vec![Value::Text(model_id.to_owned()), Value::Text(query)];
@@ -1515,7 +1555,7 @@ async fn add_lexical_results(
         .map_err(database_error)?;
     let mut rank = 1_usize;
     while let Some(row) = rows.next().await.map_err(database_error)? {
-        let hit = parse_search_hit(&row, model_id, SearchMatchKind::Lexical)?;
+        let hit = parse_search_hit(connection, &row, model_id, SearchMatchKind::Lexical).await?;
         merge_rank(scores, hit, rank, SearchMatchKind::Lexical);
         rank += 1;
     }
@@ -1538,13 +1578,11 @@ async fn add_semantic_results(
             "SELECT sc.id, sc.capture_id, sc.text,
                     c.captured_at, c.application, c.window_title, c.width, c.height,
                     a.content_hash, a.relative_path, a.media_type, a.byte_length,
-                    ob.x, ob.y, ob.width, ob.height, ob.model_id
+                    sc.source_reading_order, sc.source_end_reading_order
              FROM chunk_embedding_384 ce
              JOIN search_chunk sc ON sc.id = ce.chunk_id
              JOIN capture c ON c.id = sc.capture_id
              JOIN asset a ON a.content_hash = c.asset_hash
-             JOIN ocr_block ob ON ob.capture_id = sc.capture_id
-                 AND ob.reading_order = sc.source_reading_order
              WHERE ce.model_id = ?",
         );
         let mut values = vec![Value::Text(model_id.to_owned())];
@@ -1565,14 +1603,12 @@ async fn add_semantic_results(
                 "SELECT sc.id, sc.capture_id, sc.text,
                         c.captured_at, c.application, c.window_title, c.width, c.height,
                         a.content_hash, a.relative_path, a.media_type, a.byte_length,
-                        ob.x, ob.y, ob.width, ob.height, ob.model_id
+                        sc.source_reading_order, sc.source_end_reading_order
                  FROM vector_top_k('chunk_embedding_384_vector_idx', ?, ?) AS vector
                  JOIN chunk_embedding_384 ce ON ce.id = vector.id
                  JOIN search_chunk sc ON sc.id = ce.chunk_id
                  JOIN capture c ON c.id = sc.capture_id
                  JOIN asset a ON a.content_hash = c.asset_hash
-                 JOIN ocr_block ob ON ob.capture_id = sc.capture_id
-                     AND ob.reading_order = sc.source_reading_order
                  WHERE ce.model_id = ?",
                 params![vector, limit, model_id],
             )
@@ -1581,7 +1617,7 @@ async fn add_semantic_results(
     };
     let mut rank = 1_usize;
     while let Some(row) = rows.next().await.map_err(database_error)? {
-        let hit = parse_search_hit(&row, model_id, SearchMatchKind::Semantic)?;
+        let hit = parse_search_hit(connection, &row, model_id, SearchMatchKind::Semantic).await?;
         merge_rank(scores, hit, rank, SearchMatchKind::Semantic);
         rank += 1;
     }
@@ -1662,29 +1698,55 @@ fn merge_rank(
         });
 }
 
-#[allow(clippy::cast_possible_truncation)]
-fn parse_search_hit(
+struct SearchHitSeed {
+    chunk_id: ChunkId,
+    capture_id: CaptureId,
+    text: String,
+    captured_at: chrono::DateTime<Utc>,
+    application: String,
+    window_title: String,
+    width: u32,
+    height: u32,
+    asset: AssetRef,
+    source_reading_order: u32,
+    source_end_reading_order: u32,
+}
+
+async fn parse_search_hit(
+    connection: &libsql::Connection,
     row: &libsql::Row,
     embedding_model_id: &str,
     match_kind: SearchMatchKind,
 ) -> Result<SearchHit, PortError> {
+    let seed = parse_search_hit_seed(row)?;
+    let (bounds, ocr_model_id) = load_chunk_bounds(connection, &seed).await?;
+    Ok(SearchHit {
+        chunk_id: seed.chunk_id,
+        capture_id: seed.capture_id,
+        text: seed.text,
+        score: 0.0,
+        captured_at: seed.captured_at,
+        application: seed.application,
+        window_title: seed.window_title,
+        width: seed.width,
+        height: seed.height,
+        asset: seed.asset,
+        bounds,
+        match_kind,
+        ocr_model_id,
+        embedding_model_id: embedding_model_id.to_owned(),
+    })
+}
+
+fn parse_search_hit_seed(row: &libsql::Row) -> Result<SearchHitSeed, PortError> {
     let captured_at: String = row.get(3).map_err(database_error)?;
     let captured_at = chrono::DateTime::parse_from_rfc3339(&captured_at)
         .map_err(|error| PortError::InvalidData(format!("invalid capture timestamp: {error}")))?
         .with_timezone(&Utc);
-    let bounds = BoundingBox {
-        x: row.get::<f64>(12).map_err(database_error)? as f32,
-        y: row.get::<f64>(13).map_err(database_error)? as f32,
-        width: row.get::<f64>(14).map_err(database_error)? as f32,
-        height: row.get::<f64>(15).map_err(database_error)? as f32,
-    }
-    .validate()
-    .map_err(|error| PortError::InvalidData(error.to_string()))?;
-    Ok(SearchHit {
+    Ok(SearchHitSeed {
         chunk_id: parse_chunk_id(&row.get::<String>(0).map_err(database_error)?)?,
         capture_id: parse_capture_id(&row.get::<String>(1).map_err(database_error)?)?,
         text: row.get(2).map_err(database_error)?,
-        score: 0.0,
         captured_at,
         application: row.get(4).map_err(database_error)?,
         window_title: row.get(5).map_err(database_error)?,
@@ -1699,11 +1761,50 @@ fn parse_search_hit(
             byte_length: u64::try_from(row.get::<i64>(11).map_err(database_error)?)
                 .map_err(|_| PortError::InvalidData("negative asset size".to_owned()))?,
         },
-        bounds: vec![bounds],
-        match_kind,
-        ocr_model_id: row.get(16).map_err(database_error)?,
-        embedding_model_id: embedding_model_id.to_owned(),
+        source_reading_order: u32::try_from(row.get::<i64>(12).map_err(database_error)?)
+            .map_err(|_| PortError::InvalidData("invalid chunk start".to_owned()))?,
+        source_end_reading_order: u32::try_from(row.get::<i64>(13).map_err(database_error)?)
+            .map_err(|_| PortError::InvalidData("invalid chunk end".to_owned()))?,
     })
+}
+
+#[allow(clippy::cast_possible_truncation)]
+async fn load_chunk_bounds(
+    connection: &libsql::Connection,
+    seed: &SearchHitSeed,
+) -> Result<(Vec<BoundingBox>, String), PortError> {
+    let mut rows = connection
+        .query(
+            "SELECT x, y, width, height, model_id
+             FROM ocr_block
+             WHERE capture_id = ?
+               AND reading_order BETWEEN ? AND ?
+             ORDER BY reading_order ASC",
+            params![
+                seed.capture_id.to_string(),
+                i64::from(seed.source_reading_order),
+                i64::from(seed.source_end_reading_order),
+            ],
+        )
+        .await
+        .map_err(database_error)?;
+    let mut bounds = Vec::new();
+    let mut ocr_model_id = String::new();
+    while let Some(row) = rows.next().await.map_err(database_error)? {
+        let bounds_value = BoundingBox {
+            x: row.get::<f64>(0).map_err(database_error)? as f32,
+            y: row.get::<f64>(1).map_err(database_error)? as f32,
+            width: row.get::<f64>(2).map_err(database_error)? as f32,
+            height: row.get::<f64>(3).map_err(database_error)? as f32,
+        }
+        .validate()
+        .map_err(|error| PortError::InvalidData(error.to_string()))?;
+        if ocr_model_id.is_empty() {
+            ocr_model_id = row.get(4).map_err(database_error)?;
+        }
+        bounds.push(bounds_value);
+    }
+    Ok((bounds, ocr_model_id))
 }
 
 fn map_generation_model(row: &libsql::Row) -> Result<GenerationModel, PortError> {
@@ -1791,8 +1892,8 @@ fn fts_query(query: &str) -> String {
 fn fts_terms(query: &str) -> Vec<String> {
     let mut normalized = String::with_capacity(query.len());
     for character in query.chars() {
-        if character.is_ascii_alphanumeric() {
-            normalized.push(character.to_ascii_lowercase());
+        if character.is_alphanumeric() {
+            normalized.extend(character.to_lowercase());
         } else {
             normalized.push(' ');
         }
@@ -2121,7 +2222,7 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use super::{FileAssetStore, LibSqlArchive, MAX_JOB_ATTEMPTS, timestamp};
+    use super::{FileAssetStore, LibSqlArchive, MAX_JOB_ATTEMPTS, fts_terms, timestamp};
 
     struct TestCapture;
 
@@ -2198,31 +2299,35 @@ mod tests {
             .unwrap()
             .unwrap();
         repository
-            .complete_analysis(AnalysisResult {
-                job_id: job.id,
-                capture_id,
-                blocks: vec![OcrBlock {
-                    reading_order: 0,
-                    bounds: BoundingBox {
-                        x: 0.0,
-                        y: 0.0,
-                        width: 1.0,
-                        height: 0.1,
-                    },
-                    text: text.to_owned(),
-                    confidence: Some(1.0),
-                    language: Some("en".to_owned()),
-                }],
-                chunks: vec![IndexedChunk {
-                    id: ChunkId::new(),
+            .complete_analysis(
+                &job,
+                AnalysisResult {
+                    job_id: job.id,
                     capture_id,
-                    text: text.to_owned(),
-                    source_reading_order: 0,
-                    model_id: model_id.to_owned(),
-                    embedding,
-                }],
-                ocr_model_id: "ranking-ocr".to_owned(),
-            })
+                    blocks: vec![OcrBlock {
+                        reading_order: 0,
+                        bounds: BoundingBox {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 1.0,
+                            height: 0.1,
+                        },
+                        text: text.to_owned(),
+                        confidence: Some(1.0),
+                        language: Some("en".to_owned()),
+                    }],
+                    chunks: vec![IndexedChunk {
+                        id: ChunkId::new(),
+                        capture_id,
+                        text: text.to_owned(),
+                        source_reading_order: 0,
+                        source_end_reading_order: 0,
+                        model_id: model_id.to_owned(),
+                        embedding,
+                    }],
+                    ocr_model_id: "ranking-ocr".to_owned(),
+                },
+            )
             .await
             .unwrap();
         capture_id
@@ -2263,31 +2368,35 @@ mod tests {
             .unwrap()
             .unwrap();
         repository
-            .complete_analysis(AnalysisResult {
-                job_id: job.id,
-                capture_id,
-                blocks: vec![OcrBlock {
-                    reading_order: 0,
-                    bounds: BoundingBox {
-                        x: 0.0,
-                        y: 0.0,
-                        width: 1.0,
-                        height: 0.1,
-                    },
-                    text: fixture.text.to_owned(),
-                    confidence: Some(1.0),
-                    language: Some("en".to_owned()),
-                }],
-                chunks: vec![IndexedChunk {
-                    id: ChunkId::new(),
+            .complete_analysis(
+                &job,
+                AnalysisResult {
+                    job_id: job.id,
                     capture_id,
-                    text: fixture.text.to_owned(),
-                    source_reading_order: 0,
-                    model_id: fixture.model_id.to_owned(),
-                    embedding: fixture.embedding,
-                }],
-                ocr_model_id: "filtered-search-ocr".to_owned(),
-            })
+                    blocks: vec![OcrBlock {
+                        reading_order: 0,
+                        bounds: BoundingBox {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 1.0,
+                            height: 0.1,
+                        },
+                        text: fixture.text.to_owned(),
+                        confidence: Some(1.0),
+                        language: Some("en".to_owned()),
+                    }],
+                    chunks: vec![IndexedChunk {
+                        id: ChunkId::new(),
+                        capture_id,
+                        text: fixture.text.to_owned(),
+                        source_reading_order: 0,
+                        source_end_reading_order: 0,
+                        model_id: fixture.model_id.to_owned(),
+                        embedding: fixture.embedding,
+                    }],
+                    ocr_model_id: "filtered-search-ocr".to_owned(),
+                },
+            )
             .await
             .unwrap();
         capture_id
@@ -2334,18 +2443,22 @@ mod tests {
                 capture_id,
                 text: text.to_owned(),
                 source_reading_order: u32::try_from(index).unwrap(),
+                source_end_reading_order: u32::try_from(index).unwrap(),
                 model_id: fixture.model_id.to_owned(),
                 embedding,
             })
             .collect::<Vec<_>>();
         repository
-            .complete_analysis(AnalysisResult {
-                job_id: job.id,
-                capture_id,
-                blocks,
-                chunks,
-                ocr_model_id: "multi-chunk-search-ocr".to_owned(),
-            })
+            .complete_analysis(
+                &job,
+                AnalysisResult {
+                    job_id: job.id,
+                    capture_id,
+                    blocks,
+                    chunks,
+                    ocr_model_id: "multi-chunk-search-ocr".to_owned(),
+                },
+            )
             .await
             .unwrap();
         capture_id
@@ -2393,6 +2506,25 @@ mod tests {
         let metrics = repository.storage_metrics().await.unwrap();
         assert_eq!(metrics.capture_count, 1);
         assert_eq!(metrics.asset_bytes, 200 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn migration_adds_inclusive_chunk_end_reading_order() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+
+        let mut rows = repository
+            .connection()
+            .query("PRAGMA table_info(search_chunk)", ())
+            .await
+            .unwrap();
+        let mut found = false;
+        while let Some(row) = rows.next().await.unwrap() {
+            let column_name: String = row.get(1).unwrap();
+            found |= column_name == "source_end_reading_order";
+        }
+
+        assert!(found);
     }
 
     #[tokio::test]
@@ -2654,6 +2786,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hybrid_search_returns_all_bounds_for_multiblock_chunk() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        let embeddings = FakeEmbeddingEngine;
+        let model_id = embeddings.model_id();
+        let query = "quarterly plan";
+        let query_vector = embeddings.embed(query).await.unwrap();
+        let capture = capture(28, 0, 1);
+        let capture_id = capture.id;
+        repository.enqueue_capture(capture).await.unwrap();
+        let job = repository
+            .claim_job("multi-bound-worker")
+            .await
+            .unwrap()
+            .unwrap();
+        repository
+            .complete_analysis(
+                &job,
+                AnalysisResult {
+                    job_id: job.id,
+                    capture_id,
+                    blocks: vec![
+                        OcrBlock {
+                            reading_order: 0,
+                            bounds: BoundingBox {
+                                x: 0.1,
+                                y: 0.2,
+                                width: 0.3,
+                                height: 0.1,
+                            },
+                            text: "quarterly".to_owned(),
+                            confidence: Some(1.0),
+                            language: Some("en".to_owned()),
+                        },
+                        OcrBlock {
+                            reading_order: 1,
+                            bounds: BoundingBox {
+                                x: 0.4,
+                                y: 0.5,
+                                width: 0.2,
+                                height: 0.1,
+                            },
+                            text: "plan".to_owned(),
+                            confidence: Some(1.0),
+                            language: Some("en".to_owned()),
+                        },
+                    ],
+                    chunks: vec![IndexedChunk {
+                        id: ChunkId::new(),
+                        capture_id,
+                        text: "quarterly plan".to_owned(),
+                        source_reading_order: 0,
+                        source_end_reading_order: 1,
+                        model_id: model_id.to_owned(),
+                        embedding: query_vector.clone(),
+                    }],
+                    ocr_model_id: "multi-bound-ocr".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let hits = repository
+            .hybrid_search(
+                query,
+                &query_vector,
+                model_id,
+                &SearchFilters::default(),
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].bounds.len(), 2);
+        assert!((hits[0].bounds[0].x - 0.1).abs() < 0.000_001);
+        assert!((hits[0].bounds[1].x - 0.4).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn fts_terms_preserve_unicode_for_unicode61_tokenizer() {
+        assert_eq!(
+            fts_terms("Beyoncé café 2026"),
+            vec!["beyoncé".to_owned(), "café".to_owned(), "2026".to_owned()]
+        );
+    }
+
+    #[tokio::test]
     async fn lexical_search_uses_or_fallback_for_partial_terms() {
         let repository = LibSqlArchive::in_memory().await.unwrap();
         repository.migrate().await.unwrap();
@@ -2826,14 +3046,28 @@ mod tests {
         repository.enqueue_capture(capture(1, 0, 1)).await.unwrap();
         let mut job = repository.claim_job("retry-worker").await.unwrap().unwrap();
 
-        // Drive attempts deterministically: the first attempts reschedule, the final one
-        // reaches MAX_JOB_ATTEMPTS and dead-letters the job.
-        for attempt in 0..MAX_JOB_ATTEMPTS {
-            job.attempt = attempt;
+        // Drive attempts deterministically: each retry must be claimed with the current lease.
+        loop {
+            let is_final_attempt = job.attempt + 1 >= MAX_JOB_ATTEMPTS;
             repository
                 .fail_job(&job, "persistent analysis failure")
                 .await
                 .unwrap();
+            if is_final_attempt {
+                break;
+            }
+            repository
+                .connection()
+                .execute(
+                    "UPDATE analysis_job SET next_run_at = ? WHERE id = ?",
+                    params![
+                        timestamp(Utc::now() - Duration::seconds(1)),
+                        job.id.to_string()
+                    ],
+                )
+                .await
+                .unwrap();
+            job = repository.claim_job("retry-worker").await.unwrap().unwrap();
         }
 
         let mut rows = repository
@@ -2863,6 +3097,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_leased_job_cannot_complete_or_fail_reclaimed_work() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        let capture = capture(2, 0, 1);
+        let capture_id = capture.id;
+        repository.enqueue_capture(capture).await.unwrap();
+        let stale_job = repository.claim_job("stale-worker").await.unwrap().unwrap();
+        repository
+            .connection()
+            .execute(
+                "UPDATE analysis_job SET lease_until = ? WHERE id = ?",
+                params![
+                    timestamp(Utc::now() - Duration::minutes(1)),
+                    stale_job.id.to_string()
+                ],
+            )
+            .await
+            .unwrap();
+        let current_job = repository
+            .claim_job("current-worker")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current_job.id, stale_job.id);
+        assert_ne!(current_job.lease_owner, stale_job.lease_owner);
+
+        let stale_completion = repository
+            .complete_analysis(
+                &stale_job,
+                AnalysisResult {
+                    job_id: stale_job.id,
+                    capture_id,
+                    blocks: Vec::new(),
+                    chunks: Vec::new(),
+                    ocr_model_id: "stale-ocr".to_owned(),
+                },
+            )
+            .await;
+        assert!(matches!(stale_completion, Err(PortError::InvalidData(_))));
+
+        let stale_failure = repository.fail_job(&stale_job, "late failure").await;
+        assert!(matches!(stale_failure, Err(PortError::InvalidData(_))));
+
+        repository
+            .complete_analysis(
+                &current_job,
+                AnalysisResult {
+                    job_id: current_job.id,
+                    capture_id,
+                    blocks: Vec::new(),
+                    chunks: Vec::new(),
+                    ocr_model_id: "current-ocr".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn complete_analysis_rejects_wrong_embedding_dimension() {
         let repository = LibSqlArchive::in_memory().await.unwrap();
         repository.migrate().await.unwrap();
@@ -2874,20 +3167,24 @@ mod tests {
             .unwrap();
 
         let result = repository
-            .complete_analysis(AnalysisResult {
-                job_id: job.id,
-                capture_id: job.capture_id,
-                blocks: Vec::new(),
-                chunks: vec![IndexedChunk {
-                    id: ChunkId::new(),
+            .complete_analysis(
+                &job,
+                AnalysisResult {
+                    job_id: job.id,
                     capture_id: job.capture_id,
-                    text: "mismatched embedding".to_owned(),
-                    source_reading_order: 0,
-                    model_id: "fastembed-all-minilm-l6-v2-q-384-v1".to_owned(),
-                    embedding: vec![0.1; 8],
-                }],
-                ocr_model_id: "dimension-ocr".to_owned(),
-            })
+                    blocks: Vec::new(),
+                    chunks: vec![IndexedChunk {
+                        id: ChunkId::new(),
+                        capture_id: job.capture_id,
+                        text: "mismatched embedding".to_owned(),
+                        source_reading_order: 0,
+                        source_end_reading_order: 0,
+                        model_id: "fastembed-all-minilm-l6-v2-q-384-v1".to_owned(),
+                        embedding: vec![0.1; 8],
+                    }],
+                    ocr_model_id: "dimension-ocr".to_owned(),
+                },
+            )
             .await;
 
         assert!(matches!(result, Err(PortError::InvalidData(_))));

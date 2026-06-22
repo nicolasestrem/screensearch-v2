@@ -908,6 +908,10 @@ pub struct AnalysisJob {
     pub asset: AssetRef,
     /// Zero-based retry count.
     pub attempt: u32,
+    /// Worker identity that currently owns the lease.
+    pub lease_owner: String,
+    /// UTC instant at which the current lease expires.
+    pub lease_until: DateTime<Utc>,
 }
 
 /// A normalized rectangle relative to the full capture.
@@ -967,6 +971,8 @@ pub struct IndexedChunk {
     pub text: String,
     /// OCR block reading order used to recover positioned evidence.
     pub source_reading_order: u32,
+    /// Inclusive ending OCR block reading order used to recover positioned evidence.
+    pub source_end_reading_order: u32,
     /// Embedding model revision.
     pub model_id: String,
     /// Fixed-dimension vector.

@@ -48,6 +48,8 @@ type SettingsDraft = {
   excludedTitles: string;
 };
 
+const diagnosticsEnabled = import.meta.env.DEV;
+
 export function App() {
   const queryClient = useQueryClient();
   const searchInput = useRef<HTMLInputElement>(null);
@@ -242,7 +244,7 @@ export function App() {
   const paused = health.data?.capturePaused ?? false;
   const captureState = health.data?.captureState ?? "paused";
   const backpressured = captureState === "backpressured";
-  const error = health.error || capture.error || pause.error || search.error;
+  const error = health.error || (diagnosticsEnabled ? capture.error : null) || pause.error || search.error;
 
   return (
     <main className="app-frame">
@@ -386,7 +388,7 @@ export function App() {
         </span>
       </footer>
 
-      {capture.data && (
+      {diagnosticsEnabled && capture.data && (
         <div className="toast" role="status">
           <CheckCircle weight="fill" />
           {capture.data.skippedReason
@@ -398,7 +400,15 @@ export function App() {
       )}
       {error && <div className="error-toast" role="alert">{String(error)}</div>}
       {modal === "automation" && <AutomationModal onClose={closeModal} />}
-      {modal && modal !== "automation" && <SettingsModal name={modal} paused={paused} onClose={closeModal} onCapture={() => capture.mutate()} />}
+      {modal && modal !== "automation" && (
+        <SettingsModal
+          name={modal}
+          paused={paused}
+          diagnosticsEnabled={diagnosticsEnabled}
+          onClose={closeModal}
+          onCapture={() => capture.mutate()}
+        />
+      )}
     </main>
   );
 }
@@ -789,7 +799,19 @@ function errorText(error: unknown) {
   return String(error);
 }
 
-function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<ModalName, null | "automation">; paused: boolean; onClose: () => void; onCapture: () => void }) {
+function SettingsModal({
+  name,
+  paused,
+  diagnosticsEnabled,
+  onClose,
+  onCapture,
+}: {
+  name: Exclude<ModalName, null | "automation">;
+  paused: boolean;
+  diagnosticsEnabled: boolean;
+  onClose: () => void;
+  onCapture: () => void;
+}) {
   const queryClient = useQueryClient();
   const dialogRef = useRef<HTMLElement>(null);
   const health = useQuery({ queryKey: ["health"], queryFn: api.health });
@@ -968,7 +990,9 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
                 <button type="button" onClick={() => save.mutate()} disabled={settings.isPending || save.isPending}>{save.isPending ? "Applying…" : "Save storage policy"}</button>
               </div>
             </div>
-            <div className="setting-row"><span><strong>Capture current frame</strong><small>Queue an immediate frame without changing the automatic cadence.</small></span><button type="button" onClick={onCapture}><Camera /> Capture now</button></div>
+            {diagnosticsEnabled && (
+              <div className="setting-row"><span><strong>Capture current frame</strong><small>Queue an immediate frame without changing the automatic cadence.</small></span><button type="button" onClick={onCapture}><Camera /> Capture now</button></div>
+            )}
             <div className="setting-row"><span><strong>Search shortcut</strong><small>Focus search from anywhere in this window.</small></span><kbd>Ctrl K</kbd></div>
             <div className="setting-row"><span><strong>Summon shortcut</strong><small>Bring ScreenSearch to the front from any application.</small></span><HotkeyCapture value={shell.data?.hotkey ?? DEFAULT_HOTKEY} busy={saveHotkey.isPending} onChange={(hotkey) => saveHotkey.mutate(hotkey)} /></div>
             <ModelSettings

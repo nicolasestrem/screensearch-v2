@@ -40,9 +40,9 @@ Migration `0001_initial.sql` creates:
 - `search_chunk`, FTS5, and 384-dimensional vector tables;
 - `outbox_event`, `dead_letter`, and `automation_run` tables.
 
-Migrations `0002` through `0004` make OCR confidence nullable for providers that do not expose it, connect search chunks to positioned OCR evidence, and register the active real embedding revision. Migration `0005_archive_policy.sql` adds the singleton archive settings record, application/title exclusions, and durable unreferenced-asset cleanup work. Migration `0007_guarded_automation.sql` adds default-off automation settings plus a content-free v2 automation approval/run ledger.
+Migrations `0002` through `0004` make OCR confidence nullable for providers that do not expose it, connect search chunks to positioned OCR evidence, and register the active real embedding revision. Migration `0005_archive_policy.sql` adds the singleton archive settings record, application/title exclusions, and durable unreferenced-asset cleanup work. Migration `0006_generation_model_catalog.sql` adds the explicit generation-model catalog. Migration `0007_guarded_automation.sql` adds default-off automation settings plus a content-free v2 automation approval/run ledger. Migration `0008_chunk_reading_order_range.sql` records inclusive OCR reading-order ranges for multi-block search chunks.
 
-Capture metadata and an analysis job are committed transactionally. Analysis completion commits OCR blocks, chunks, embeddings, an outbox event, and job completion atomically. Jobs use leases and bounded retries.
+Capture metadata and an analysis job are committed transactionally. Analysis completion commits OCR blocks, bounded adjacent OCR chunks, embeddings, an outbox event, and job completion atomically. Jobs use owner-bound renewable leases and bounded retries; stale workers cannot complete or fail reclaimed work.
 
 ## What is real
 
@@ -59,11 +59,11 @@ Capture metadata and an analysis job are committed transactionally. Analysis com
 - Daemon-owned guarded automation orchestration with default-off settings, fresh abort heartbeat requirement, exact-plan BLAKE3 digest verification, single-flight execution, foreground/session checks before each action, abort latching/reset, restart recovery, and content-free audit transitions.
 - Native Windows guarded automation emission through exact HWND/PID/executable target identity, WTS unlocked-session checks, unique UI Automation ID lookup beneath the approved HWND, Invoke/Value pattern support, and `SendInput` keyboard/text fallback with UTF-16 input, modifier release, and partial-injection detection.
 - Typed protobuf and Tauri automation operations for status, enablement, foreground target capture, approval, execution, abort, reset, and safety heartbeat.
-- Focused-monitor Windows capture encoded as PNG through XCap.
+- Focused-monitor Windows capture encoded as native-dimension PNG through XCap.
 - Automatic two-second capture scheduling and continuous durable-job draining.
 - Offline Windows Media OCR using installed user language packs, including line bounds and language.
 - Quantized `Xenova/all-MiniLM-L6-v2` ONNX embeddings through fastembed, cached below the app data directory and executed locally.
-- Evidence-rich search citations containing screenshot, time, application, title, excerpt, match provenance, model revisions, and highlight bounds.
+- Evidence-rich search citations containing screenshot, time, application, title, excerpt, match provenance, model revisions, and all highlight bounds covered by the returned OCR chunk.
 - Authorized screenshot retrieval by capture identifier and screenshot rendering in the diagnostics UI.
 - The selected Memory Timeline product interface with search, client-side date/application filtering, grouped evidence, a screenshot inspector, OCR highlights, metadata/provenance tabs, and optional answer state.
 - A real pause/resume control propagated over IPC to the daemon capture loop.
@@ -87,7 +87,7 @@ Capture metadata and an analysis job are committed transactionally. Analysis com
 
 ## Current user experience
 
-The React screen implements the product-owner-selected Memory Timeline direction. Capture and analysis are automatic; search renders chronologically grouped screenshot evidence with timestamps, application/window metadata, excerpts, provenance, and positioned OCR highlights. Search, date/application filters, evidence selection, detail tabs, pause/resume, live privacy exclusions, retention/storage settings, confirmed captured-history deletion, manual capture, optional generation states, and the guarded automation approval workflow are interactive. The automation UI remains preview-safe outside Tauri and non-emitting until the native shell/daemon path is enabled.
+The React screen implements the product-owner-selected Memory Timeline direction. Capture and analysis are automatic; search renders chronologically grouped screenshot evidence with timestamps, application/window metadata, excerpts, provenance, and positioned OCR highlights. Search, date/application filters, evidence selection, detail tabs, pause/resume, live privacy exclusions, retention/storage settings, confirmed captured-history deletion, optional generation states, and the guarded automation approval workflow are interactive. Manual capture and job-processing controls are diagnostics-only in development builds and are excluded from the production desktop surface. The automation UI remains preview-safe outside Tauri and non-emitting until the native shell/daemon path is enabled.
 
 ## Current dependencies and infrastructure
 

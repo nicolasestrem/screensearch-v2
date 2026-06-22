@@ -214,10 +214,20 @@ export const api = {
       ocrBlockCount: 1_482,
       searchChunkCount: 1_201,
     }),
-  capture: () => isTauri
-    ? invoke<CaptureResult>("capture_once")
-    : Promise.resolve({ captureId: "preview-capture-new", duplicate: false, skippedReason: "" }),
-  processJobs: (maximum = 10) => invoke<number>("process_jobs", { maximum }),
+  capture: () => {
+    if (!import.meta.env.DEV) {
+      return Promise.reject(new Error("manual capture is available only in diagnostics builds"));
+    }
+    return isTauri
+      ? invoke<CaptureResult>("capture_once")
+      : Promise.resolve({ captureId: "preview-capture-new", duplicate: false, skippedReason: "" });
+  },
+  processJobs: (maximum = 10) => {
+    if (!import.meta.env.DEV) {
+      return Promise.reject(new Error("manual job processing is available only in diagnostics builds"));
+    }
+    return isTauri ? invoke<number>("process_jobs", { maximum }) : Promise.resolve(0);
+  },
   captureAsset: async (captureId: string) => {
     if (isTauri) return invoke<CaptureAsset>("capture_asset", { captureId });
     const content = [...new Uint8Array(await (await fetch("/qa-capture.png")).arrayBuffer())];

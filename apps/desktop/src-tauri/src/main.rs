@@ -86,6 +86,7 @@ struct DeleteResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(debug_assertions)]
 struct CaptureResult {
     capture_id: String,
     duplicate: bool,
@@ -810,6 +811,7 @@ async fn set_capture_paused(paused: bool) -> Result<bool, String> {
 }
 
 #[tauri::command]
+#[cfg(debug_assertions)]
 async fn capture_once() -> Result<CaptureResult, String> {
     let responses = request(request_envelope::Body::Capture(CaptureRequest {})).await?;
     for response in responses {
@@ -829,6 +831,7 @@ async fn capture_once() -> Result<CaptureResult, String> {
 }
 
 #[tauri::command]
+#[cfg(debug_assertions)]
 async fn process_jobs(maximum: u32) -> Result<u32, String> {
     let responses = request(request_envelope::Body::ProcessJobs(ProcessJobsRequest {
         maximum,
@@ -1324,7 +1327,7 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
 }
 
 fn main() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -1355,33 +1358,63 @@ fn main() {
                 api.prevent_close();
                 let _ = window.hide();
             }
-        })
-        .invoke_handler(tauri::generate_handler![
-            health,
-            capture_once,
-            process_jobs,
-            capture_asset,
-            set_capture_paused,
-            archive_settings,
-            update_archive_settings,
-            delete_all_captures,
-            generation_models,
-            import_local_generation_model,
-            download_generation_model,
-            select_generation_model,
-            delete_generation_model,
-            unload_generation_model,
-            search,
-            get_shell_settings,
-            set_shell_settings,
-            automation_status,
-            set_automation_enabled,
-            automation_foreground_target,
-            approve_automation,
-            execute_automation,
-            abort_automation,
-            reset_automation_abort
-        ])
+        });
+
+    #[cfg(debug_assertions)]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        health,
+        capture_once,
+        process_jobs,
+        capture_asset,
+        set_capture_paused,
+        archive_settings,
+        update_archive_settings,
+        delete_all_captures,
+        generation_models,
+        import_local_generation_model,
+        download_generation_model,
+        select_generation_model,
+        delete_generation_model,
+        unload_generation_model,
+        search,
+        get_shell_settings,
+        set_shell_settings,
+        automation_status,
+        set_automation_enabled,
+        automation_foreground_target,
+        approve_automation,
+        execute_automation,
+        abort_automation,
+        reset_automation_abort
+    ]);
+
+    #[cfg(not(debug_assertions))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        health,
+        capture_asset,
+        set_capture_paused,
+        archive_settings,
+        update_archive_settings,
+        delete_all_captures,
+        generation_models,
+        import_local_generation_model,
+        download_generation_model,
+        select_generation_model,
+        delete_generation_model,
+        unload_generation_model,
+        search,
+        get_shell_settings,
+        set_shell_settings,
+        automation_status,
+        set_automation_enabled,
+        automation_foreground_target,
+        approve_automation,
+        execute_automation,
+        abort_automation,
+        reset_automation_abort
+    ]);
+
+    builder
         .run(tauri::generate_context!())
         .expect("run ScreenSearch V2 desktop application");
 }

@@ -20,7 +20,7 @@ use futures::{Stream, StreamExt, lock::Mutex};
 use image::imageops::FilterType;
 use screensearch_domain::{
     AnalysisResult, ArchiveSettings, CaptureDisposition, CaptureId, CaptureSkipReason,
-    CapturedFrame, ChunkId, DeleteCaptures, DeletionSummary, IndexedChunk, NewCapture,
+    CapturedFrame, ChunkId, DeleteCaptures, DeletionSummary, IndexedChunk, NewCapture, OcrBlock,
     QueueMetrics, SearchEvent, SearchFilters, SearchOptions, SearchPlan, StorageMetrics,
 };
 use screensearch_ports::{
@@ -38,12 +38,121 @@ const PERCEPTUAL_MAX_MEAN_DELTA: u64 = 2;
 const PERCEPTUAL_SIGNIFICANT_DELTA: u8 = 12;
 const PERCEPTUAL_MAX_SIGNIFICANT_PERCENT: usize = 1;
 const PROMPT_OCR_EXCERPT_CHARS: usize = 500;
+const MAX_INDEX_CHUNK_CHARS: usize = 1_200;
+const INDEX_CHUNK_OVERLAP_CHARS: usize = 200;
 const SOURCE_HINTS: &[(&str, &str)] = &[
     ("telegram", "telegram"),
     ("github", "github"),
     ("codex", "codex"),
     ("amazon", "amazon"),
 ];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ChunkTextRange {
+    text: String,
+    source_reading_order: u32,
+    source_end_reading_order: u32,
+}
+
+fn chunk_ocr_blocks(blocks: &[OcrBlock]) -> Vec<ChunkTextRange> {
+    let mut chunks = Vec::new();
+    let mut current: Option<ChunkTextRange> = None;
+
+    for block in blocks {
+        let text = normalize_ocr_chunk_text(&block.text);
+        if text.is_empty() {
+            continue;
+        }
+
+        if text.chars().count() > MAX_INDEX_CHUNK_CHARS {
+            if let Some(chunk) = current.take() {
+                chunks.push(chunk);
+            }
+            split_overlong_block(block.reading_order, &text, &mut chunks);
+            continue;
+        }
+
+        match current.take() {
+            None => {
+                current = Some(ChunkTextRange {
+                    text,
+                    source_reading_order: block.reading_order,
+                    source_end_reading_order: block.reading_order,
+                });
+            }
+            Some(mut chunk) => {
+                let candidate = format!("{} {}", chunk.text, text);
+                if candidate.chars().count() <= MAX_INDEX_CHUNK_CHARS {
+                    chunk.text = candidate;
+                    chunk.source_end_reading_order = block.reading_order;
+                    current = Some(chunk);
+                } else {
+                    let overlap_budget = MAX_INDEX_CHUNK_CHARS
+                        .saturating_sub(text.chars().count())
+                        .saturating_sub(1)
+                        .min(INDEX_CHUNK_OVERLAP_CHARS);
+                    let overlap = suffix_chars(&chunk.text, overlap_budget);
+                    let next = if overlap.is_empty() {
+                        ChunkTextRange {
+                            text,
+                            source_reading_order: block.reading_order,
+                            source_end_reading_order: block.reading_order,
+                        }
+                    } else {
+                        ChunkTextRange {
+                            text: format!("{overlap} {text}"),
+                            source_reading_order: chunk.source_end_reading_order,
+                            source_end_reading_order: block.reading_order,
+                        }
+                    };
+                    chunks.push(chunk);
+                    current = Some(next);
+                }
+            }
+        }
+    }
+
+    if let Some(chunk) = current {
+        chunks.push(chunk);
+    }
+
+    chunks
+}
+
+fn normalize_ocr_chunk_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn split_overlong_block(reading_order: u32, text: &str, chunks: &mut Vec<ChunkTextRange>) {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut start = 0;
+    while start < characters.len() {
+        let end = (start + MAX_INDEX_CHUNK_CHARS).min(characters.len());
+        let piece = characters[start..end].iter().collect::<String>();
+        chunks.push(ChunkTextRange {
+            text: piece,
+            source_reading_order: reading_order,
+            source_end_reading_order: reading_order,
+        });
+        if end == characters.len() {
+            break;
+        }
+        start = end.saturating_sub(INDEX_CHUNK_OVERLAP_CHARS);
+    }
+}
+
+fn suffix_chars(text: &str, count: usize) -> String {
+    if count == 0 {
+        return String::new();
+    }
+    text.chars()
+        .rev()
+        .take(count)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
+}
 
 /// Builds a deterministic local-time search plan for a natural language query.
 pub fn plan_search(query: &str, now: DateTime<FixedOffset>) -> Result<SearchPlan, PortError> {
@@ -631,19 +740,16 @@ impl AnalysisService {
 
     /// Claims and processes at most one durable job.
     pub async fn process_one(&self) -> Result<bool, PortError> {
-        let Some(job) = self.repository.claim_job(&self.worker_id).await? else {
+        let Some(mut job) = self.repository.claim_job(&self.worker_id).await? else {
             return Ok(false);
         };
 
         let operation = async {
             let blocks = self.ocr.recognize(&job.asset).await?;
+            job = self.repository.renew_job_lease(&job).await?;
             let mut chunks = Vec::new();
-            for block in &blocks {
-                let text = block.text.trim();
-                if text.is_empty() {
-                    continue;
-                }
-                let embedding = self.embeddings.embed(text).await?;
+            for chunk in chunk_ocr_blocks(&blocks) {
+                let embedding = self.embeddings.embed(&chunk.text).await?;
                 if embedding.len() != self.embeddings.dimensions() {
                     return Err(PortError::InvalidData(format!(
                         "embedding provider returned {} dimensions, expected {}",
@@ -654,21 +760,25 @@ impl AnalysisService {
                 chunks.push(IndexedChunk {
                     id: ChunkId::new(),
                     capture_id: job.capture_id,
-                    text: text.to_owned(),
-                    source_reading_order: block.reading_order,
+                    text: chunk.text,
+                    source_reading_order: chunk.source_reading_order,
+                    source_end_reading_order: chunk.source_end_reading_order,
                     model_id: self.embeddings.model_id().to_owned(),
                     embedding,
                 });
             }
 
             self.repository
-                .complete_analysis(AnalysisResult {
-                    job_id: job.id,
-                    capture_id: job.capture_id,
-                    blocks,
-                    chunks,
-                    ocr_model_id: self.ocr.model_id().to_owned(),
-                })
+                .complete_analysis(
+                    &job,
+                    AnalysisResult {
+                        job_id: job.id,
+                        capture_id: job.capture_id,
+                        blocks,
+                        chunks,
+                        ocr_model_id: self.ocr.model_id().to_owned(),
+                    },
+                )
                 .await
         }
         .await;
@@ -894,11 +1004,14 @@ fn bounded_prompt_excerpt(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
-    use screensearch_domain::{CaptureId, CaptureSkipReason, ChunkId, QueueMetrics, SearchHit};
+    use screensearch_domain::{
+        BoundingBox, CaptureId, CaptureSkipReason, ChunkId, OcrBlock, QueueMetrics, SearchHit,
+    };
 
     use super::{
-        CapturePolicy, CapturePolicyConfig, PROMPT_OCR_EXCERPT_CHARS, PerceptualSignature,
-        assemble_prompt, perceptually_equivalent, plan_search,
+        CapturePolicy, CapturePolicyConfig, INDEX_CHUNK_OVERLAP_CHARS, MAX_INDEX_CHUNK_CHARS,
+        PROMPT_OCR_EXCERPT_CHARS, PerceptualSignature, assemble_prompt, chunk_ocr_blocks,
+        perceptually_equivalent, plan_search,
     };
 
     fn policy() -> CapturePolicy {
@@ -1038,6 +1151,80 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    fn test_block(reading_order: u32, text: String) -> OcrBlock {
+        OcrBlock {
+            reading_order,
+            bounds: BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 0.1,
+            },
+            text,
+            confidence: Some(1.0),
+            language: Some("en".to_owned()),
+        }
+    }
+
+    #[test]
+    fn index_chunker_aggregates_adjacent_blocks_with_overlap() {
+        let blocks = vec![
+            test_block(0, "alpha ".repeat(90)),
+            test_block(1, "bravo ".repeat(90)),
+            test_block(2, "charlie ".repeat(90)),
+        ];
+
+        let chunks = chunk_ocr_blocks(&blocks);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].source_reading_order, 0);
+        assert_eq!(chunks[0].source_end_reading_order, 1);
+        assert!(chunks[0].text.len() <= MAX_INDEX_CHUNK_CHARS);
+        assert!(chunks[0].text.contains("alpha"));
+        assert!(chunks[0].text.contains("bravo"));
+        assert_eq!(chunks[1].source_reading_order, 1);
+        assert_eq!(chunks[1].source_end_reading_order, 2);
+        assert!(chunks[1].text.len() <= MAX_INDEX_CHUNK_CHARS);
+        assert!(chunks[1].text.contains("bravo"));
+        assert!(chunks[1].text.contains("charlie"));
+    }
+
+    #[test]
+    fn index_chunker_splits_overlong_single_blocks_on_character_boundaries() {
+        let text = "é".repeat(MAX_INDEX_CHUNK_CHARS + 50);
+        let blocks = vec![test_block(7, text)];
+
+        let chunks = chunk_ocr_blocks(&blocks);
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| chunk.source_reading_order == 7));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.source_end_reading_order == 7)
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.text.chars().count() <= MAX_INDEX_CHUNK_CHARS)
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.text.is_char_boundary(chunk.text.len()))
+        );
+        let overlap_suffix = chunks[0]
+            .text
+            .chars()
+            .rev()
+            .take(INDEX_CHUNK_OVERLAP_CHARS)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        assert!(chunks[1].text.starts_with(&overlap_suffix));
     }
 
     #[test]

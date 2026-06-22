@@ -41,7 +41,14 @@ impl ArchiveRepository for FakeRepository {
     async fn claim_job(&self, _worker_id: &str) -> Result<Option<AnalysisJob>, PortError> {
         unimplemented!("not exercised by answer-status tests")
     }
-    async fn complete_analysis(&self, _result: AnalysisResult) -> Result<(), PortError> {
+    async fn renew_job_lease(&self, _job: &AnalysisJob) -> Result<AnalysisJob, PortError> {
+        unimplemented!("not exercised by answer-status tests")
+    }
+    async fn complete_analysis(
+        &self,
+        _job: &AnalysisJob,
+        _result: AnalysisResult,
+    ) -> Result<(), PortError> {
         unimplemented!("not exercised by answer-status tests")
     }
     async fn fail_job(&self, _job: &AnalysisJob, _reason: &str) -> Result<(), PortError> {

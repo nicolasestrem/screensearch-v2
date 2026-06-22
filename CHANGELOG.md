@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added migration `0008` to persist inclusive OCR reading-order ranges for search chunks.
+- Added regression coverage for bounded multi-block OCR chunking, lease-bound analysis completion/failure, Unicode FTS terms, and native-dimension PNG capture encoding.
 - Added deterministic local-time search planning for useful local answers, including source/time filters for Telegram, GitHub PR, Codex settings, and Amazon book prompts.
 - Added a streamed search-plan event so the desktop can show interpreted retrieval terms, time bounds, source hints, and timezone basis before citations.
 - Added a content-free opt-in local archive answer smoke covering the four supplied prompts.
@@ -17,6 +19,11 @@
 
 ### Changed
 
+- Gated manual capture/job-processing diagnostics out of the production desktop surface and release Tauri invoke handler.
+- Changed Windows capture persistence to keep native lossless PNG dimensions instead of downscaling large monitors before metadata/OCR.
+- Changed analysis indexing to embed bounded adjacent OCR chunks with overlap, and changed hybrid search citations to return all OCR bounds covered by a chunk.
+- Hardened durable analysis leases so renew, complete, and fail operations require the current owner and lease expiry.
+- Preserved Unicode alphanumeric FTS query terms for SQLite `unicode61` tokenization.
 - Addressed PR #12 review follow-ups by capping per-hit OCR prompt excerpts, prompting every returned citation, clarifying local-day planning, matching source filters at capture level for browser pages, preserving Unicode query terms, avoiding unsupported day-modifier time filters, allowing HF downloads without a display-name field, and making `<think>` stripping robust for unclosed streaming spans.
 - Applied search time/source filters in backend hybrid retrieval before ranking, loosened FTS to phrase/exact boosts plus OR fallback, and enriched answer prompts with local timestamp/source metadata and citation/uncertainty requirements.
 - Redesigned Settings around answer readiness, timezone basis, active/installed answer models, blank guided local GGUF import, advanced HF download fields, explicit storage policy state, and conservative reset.
@@ -27,6 +34,7 @@
 
 ### Documentation
 
+- Recorded the P0-P3 conformance hardening pass in the patch plan and AI-assisted changelog; release gaps for model approval/memory pressure and locked-session hardening remain open.
 - Recorded known gaps for source-vocabulary expansion, client timezone propagation, and further prompt hardening for application/window-title metadata.
 - Added `docs/design/useful-local-answers.md` and narrowed the remaining patch plan to genuine item-15 and item-18 release gaps.
 - Addressed PR #10 review feedback by making the GGUF full-GPU-offload sentinel explicit and correcting stale Claude changelog guidance.

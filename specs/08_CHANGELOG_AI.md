@@ -2,6 +2,21 @@
 
 This log records meaningful AI-assisted repository changes and their reasons. It is not a substitute for Git history.
 
+## 2026-06-22 — P0-P3 conformance hardening
+
+### Changed
+
+- Gated manual capture and manual job-processing diagnostics out of production desktop builds while keeping them available in dev diagnostics.
+- Removed the Windows capture downscale cap so persisted PNG bytes and capture dimensions remain native physical pixels.
+- Added bounded adjacent OCR chunking with overlap, persisted inclusive OCR block ranges for each chunk, and returned all OCR bounds covered by a search hit.
+- Made durable analysis leases authoritative: renewal, completion, and failure require the current lease owner and expiry.
+- Preserved Unicode alphanumeric FTS terms for the existing SQLite `unicode61 remove_diacritics 2` tokenizer.
+- Added regression tests for chunking, migration/range citation bounds, stale lease rejection, Unicode FTS terms, and native PNG dimensions.
+
+### Why
+
+A P0-P3 spec review found that the architecture was broadly correct but several edge contracts were not yet enforced: production still exposed diagnostics, large captures had false dimensions, chunks were one OCR block, stale workers could mutate reclaimed jobs, and accented lexical terms were damaged before FTS.
+
 ## 2026-06-22 — PR #12 review follow-up
 
 ### Changed
