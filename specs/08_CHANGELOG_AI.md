@@ -2,6 +2,18 @@
 
 This log records meaningful AI-assisted repository changes and their reasons. It is not a substitute for Git history.
 
+## 2026-06-22 — PR #10 review follow-up
+
+### Changed
+
+- Replaced the GGUF GPU offload request sentinel with an explicit `i32::MAX as u32` constant so full layer offload no longer relies on `llama-cpp-2` clamping an overflowing `u32::MAX` input.
+- Added a unit assertion documenting the representable offload limit used by `LlamaModelParams::with_n_gpu_layers`.
+- Corrected stale Claude guidance so future changes update `CHANGELOG.md` and `specs/08_CHANGELOG_AI.md` when each is relevant.
+
+### Why
+
+PR #10 review identified that `u32::MAX` worked only because the current dependency clamps it internally. Passing the largest value the API can represent directly is clearer and avoids a future runtime panic if the dependency changes its conversion behavior.
+
 ## 2026-06-22 — P2/P3 validation closeout
 
 ### Changed

@@ -218,6 +218,8 @@ pub const GENERATION_CONTEXT_TOKENS: u32 = 4_096;
 /// still reach an answer; the wall-clock deadline remains the real bound.
 const MAX_GENERATED_TOKENS: usize = 768;
 
+const FULL_GPU_LAYER_OFFLOAD: u32 = i32::MAX as u32;
+
 /// Picks the CPU thread budget for llama.cpp inference.
 ///
 /// Local generation is memory-bandwidth bound, so physical cores outperform SMT
@@ -238,7 +240,7 @@ fn model_params_for_available_hardware(
 ) -> (LlamaModelParams, &'static str) {
     if gpu_offload_supported {
         (
-            LlamaModelParams::default().with_n_gpu_layers(u32::MAX),
+            LlamaModelParams::default().with_n_gpu_layers(FULL_GPU_LAYER_OFFLOAD),
             "gpu",
         )
     } else {
@@ -515,8 +517,8 @@ mod tests {
     use screensearch_ports::EmbeddingEngine;
 
     use super::{
-        FakeEmbeddingEngine, dedupe_leading_bos, model_params_for_available_hardware,
-        should_stop_generation,
+        FULL_GPU_LAYER_OFFLOAD, FakeEmbeddingEngine, dedupe_leading_bos,
+        model_params_for_available_hardware, should_stop_generation,
     };
 
     #[tokio::test]
@@ -549,6 +551,7 @@ mod tests {
     fn model_params_offload_all_layers_when_gpu_is_available() {
         let (params, backend) = model_params_for_available_hardware(true);
 
+        assert_eq!(FULL_GPU_LAYER_OFFLOAD, i32::MAX as u32);
         assert_eq!(backend, "gpu");
         assert_eq!(params.n_gpu_layers(), i32::MAX);
     }

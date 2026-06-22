@@ -87,5 +87,5 @@ UI → Tauri command → Protobuf `RequestEnvelope` over named pipe → `DaemonH
 ## Documentation & data safety
 
 - Architecture decisions: `docs/adr/`. Product/UI decisions: `docs/design/`. Performance baselines: `docs/performance/`. The `specs/` directory is a 9-file spec pipeline (`00`–`08`) separating current truth from desired direction, plus a human-owned known-gaps register (`07_KNOWN_GAPS.md`).
-- **The changelog lives at `specs/08_CHANGELOG_AI.md`, not `CHANGELOG.md`** (there is no `CHANGELOG.md`). Record meaningful AI-assisted changes there.
+- **Changelog updates belong in both places when relevant:** use `CHANGELOG.md` for user-facing repository changes and `specs/08_CHANGELOG_AI.md` for meaningful AI-assisted implementation notes.
 - **Never commit** captures, databases, logs, secrets, model weights, generated IPC output, or any user screen data — the `.gitignore` already excludes `data/`, `models/`, `captures/`, `*.db*`, `*.log`, and `src-tauri/gen/`.
