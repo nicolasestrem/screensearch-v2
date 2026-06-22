@@ -11,6 +11,7 @@ use std::{
 
 use async_stream::try_stream;
 use async_trait::async_trait;
+use encoding_rs::CoderResult;
 use futures::StreamExt;
 use reqwest::{Client, header};
 use screensearch_ports::{PortError, TextGenerator, TokenStream};
@@ -583,14 +584,12 @@ fn run_llama_cli(binary: &Path, model_path: &Path, prompt: &str) -> Result<Token
             if read == 0 {
                 break;
             }
-            let mut text = String::new();
-            let _ = decoder.decode_to_string(&buffer[..read], &mut text, false);
+            let text = decode_sidecar_stdout(&mut decoder, &buffer[..read], false)?;
             if !text.is_empty() {
                 yield text;
             }
         }
-        let mut trailing = String::new();
-        let _ = decoder.decode_to_string(&[], &mut trailing, true);
+        let trailing = decode_sidecar_stdout(&mut decoder, &[], true)?;
         if !trailing.is_empty() {
             yield trailing;
         }
@@ -604,6 +603,24 @@ fn run_llama_cli(binary: &Path, model_path: &Path, prompt: &str) -> Result<Token
             )))?;
         }
     }))
+}
+
+fn decode_sidecar_stdout(
+    decoder: &mut encoding_rs::Decoder,
+    bytes: &[u8],
+    last: bool,
+) -> Result<String, PortError> {
+    let capacity = decoder
+        .max_utf8_buffer_length(bytes.len())
+        .ok_or_else(|| PortError::Internal("sidecar stdout chunk is too large".to_owned()))?;
+    let mut text = String::with_capacity(capacity);
+    let (result, _, _) = decoder.decode_to_string(bytes, &mut text, last);
+    if result == CoderResult::OutputFull {
+        return Err(PortError::Internal(
+            "sidecar stdout decoder output buffer was exhausted".to_owned(),
+        ));
+    }
+    Ok(text)
 }
 
 async fn read_sidecar_stdout(
@@ -714,8 +731,9 @@ mod tests {
     };
 
     use super::{
-        GitHubAsset, GitHubRelease, asset_matches_windows_vulkan, extract_zip_safely,
-        extract_zip_safely_with_limit, release_api_url_from_override, select_release_asset,
+        GitHubAsset, GitHubRelease, asset_matches_windows_vulkan, decode_sidecar_stdout,
+        extract_zip_safely, extract_zip_safely_with_limit, release_api_url_from_override,
+        select_release_asset,
     };
 
     fn release(tag: &str, draft: bool, assets: &[&str]) -> GitHubRelease {
@@ -888,6 +906,21 @@ mod tests {
         let error = extract_zip_safely_with_limit(&archive, &staging, 5).unwrap_err();
 
         assert!(error.to_string().contains("size limit"));
+    }
+
+    #[test]
+    fn sidecar_stdout_decoder_preserves_split_utf8() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+
+        let ascii = decode_sidecar_stdout(&mut decoder, b"hello ", false).unwrap();
+        let pending = decode_sidecar_stdout(&mut decoder, &[0xF0, 0x9F], false).unwrap();
+        let completed = decode_sidecar_stdout(&mut decoder, &[0x92, 0xA1], false).unwrap();
+        let trailing = decode_sidecar_stdout(&mut decoder, &[], true).unwrap();
+
+        assert_eq!(ascii, "hello ");
+        assert_eq!(pending, "");
+        assert_eq!(completed, "\u{1F4A1}");
+        assert_eq!(trailing, "");
     }
 
     fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
