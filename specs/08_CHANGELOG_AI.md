@@ -2,6 +2,32 @@
 
 This log records meaningful AI-assisted repository changes and their reasons. It is not a substitute for Git history.
 
+## 2026-06-22 — P4 guarded automation
+
+### Changed
+
+- Specified Guarded Automation V1 in the master spec, ADRs, and `docs/design/p4-guarded-automation.md`: typed actions, safety bounds, approval lifecycle, abort heartbeat, foreground/session checks, and content-free privacy rules.
+- Added domain policy for `AutomationPlanV1`, `AutomationTarget`, `UiaInvoke`, `UiaSetValue`, `KeyChord`, and `TypeText` with limits for action count, field length, unsupported action classes, Windows-key exclusion, approval TTL, execution timeout, and pacing.
+- Added migration `0007_guarded_automation.sql` with default-off settings and a v2 content-free approval/run ledger. The ledger stores only identifiers, canonical BLAKE3 plan digest, action count, status, timestamps, expiry, and stable failure code.
+- Added an `AutomationRepository` port and libSQL implementation for settings, approvals, atomic run claims, terminal transitions, and interrupted-run recovery.
+- Added daemon-owned `AutomationService` plus typed protobuf/Tauri operations for status, enablement, foreground target capture, approval, execution, abort, reset, and safety heartbeat.
+- Implemented native Windows automation through exact HWND/PID/executable identity, WTS unlocked-session checks, unique UIA Automation ID lookup under the approved HWND, Invoke/Value patterns, and `SendInput` keyboard/text fallback with UTF-16 input, modifier release, and partial-injection detection.
+- Added the desktop guarded automation modal with warning confirmation, abort-state visibility, target capture, ordered action editing, exact JSON review, separate approve/execute steps, execution result display, and abort reset. Preview mode remains non-emitting.
+- Added an opt-in synthetic Win32 fixture for native automation verification. The fixture creates and controls only its own test window.
+
+### Why
+
+Patch-plan item 17 required a real but tightly guarded automation path. This implementation keeps automation out of autonomous/model-generated flows and exposes it only through explicit user enablement, target capture, exact review, one-shot approval, and repeated safety checks.
+
+### Verification evidence
+
+- Focused domain, persistence, application, IPC, daemon, desktop, and Windows tests were added during implementation.
+- The gated Windows automation fixture passed with `SCREENSEARCH_RUN_AUTOMATION_IT=1`.
+
+### Remaining boundary
+
+P2/P3 gaps and release-hardening item 18 remain open. Guarded automation is included behind explicit default-off opt-in, not enabled by default.
+
 ## 2026-06-22 — Local generation throughput + chat-template fix
 
 ### Changed

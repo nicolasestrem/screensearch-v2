@@ -1,12 +1,12 @@
 # ScreenSearch V2 Project Context
 
-Last verified: 2026-06-21
+Last verified: 2026-06-22
 
 This document answers one question: **what is true today?** It does not select future implementation details.
 
 ## Repository status
 
-ScreenSearch V2 is an independent, uncommitted Git repository on branch `main`. It is a Rust 2024 workspace with a Tauri 2 React/TypeScript desktop shell. P0 and P1 are implemented: the truthful evidence loop, semantic retrieval, capture growth controls, retention/storage policy, and the synthetic scale target all pass their required checks as of the date above.
+ScreenSearch V2 is an independent Git repository. It is a Rust 2024 workspace with a Tauri 2 React/TypeScript desktop shell. P0 and P1 are implemented: the truthful evidence loop, semantic retrieval, capture growth controls, retention/storage policy, and the synthetic scale target all pass their required checks as of the date above. The `codex/p4-guarded-automation` branch also implements patch-plan item 17: guarded Windows automation behind explicit default-off opt-in.
 
 ## Current process boundaries
 
@@ -18,7 +18,7 @@ ScreenSearch V2 is an independent, uncommitted Git repository on branch `main`. 
 ## Current workspace
 
 - `crates/domain`: identifiers, captures, OCR blocks, indexed chunks, search hits, and streamed search events.
-- `crates/ports`: capture, asset, archive, OCR, embedding, generation, and automation interfaces.
+- `crates/ports`: capture, asset, archive, OCR, embedding, generation, automation platform, and automation repository interfaces.
 - `crates/application`: capture ingestion, durable analysis, prompt assembly, and streamed cited search orchestration.
 - `crates/persistence`: content-addressed file assets and a libSQL archive.
 - `crates/ipc`: protobuf contracts and named-pipe transport.
@@ -40,7 +40,7 @@ Migration `0001_initial.sql` creates:
 - `search_chunk`, FTS5, and 384-dimensional vector tables;
 - `outbox_event`, `dead_letter`, and `automation_run` tables.
 
-Migrations `0002` through `0004` make OCR confidence nullable for providers that do not expose it, connect search chunks to positioned OCR evidence, and register the active real embedding revision. Migration `0005_archive_policy.sql` adds the singleton archive settings record, application/title exclusions, and durable unreferenced-asset cleanup work.
+Migrations `0002` through `0004` make OCR confidence nullable for providers that do not expose it, connect search chunks to positioned OCR evidence, and register the active real embedding revision. Migration `0005_archive_policy.sql` adds the singleton archive settings record, application/title exclusions, and durable unreferenced-asset cleanup work. Migration `0007_guarded_automation.sql` adds default-off automation settings plus a content-free v2 automation approval/run ledger.
 
 Capture metadata and an analysis job are committed transactionally. Analysis completion commits OCR blocks, chunks, embeddings, an outbox event, and job completion atomically. Jobs use leases and bounded retries.
 
@@ -55,7 +55,10 @@ Capture metadata and an analysis job are committed transactionally. Analysis com
 - Protobuf framing and local named-pipe request/stream semantics.
 - Tauri-to-daemon communication.
 - Citation events followed by streamed token events.
-- Approval, foreground-window, and abort policy checks for automation.
+- Guarded automation policy validation: 1–10 typed actions, 512-character bounds, no mouse/clipboard/shell actions, no Windows-key chords, 60-second one-shot approvals, 10-second execution deadline, and 100 ms pacing.
+- Daemon-owned guarded automation orchestration with default-off settings, fresh abort heartbeat requirement, exact-plan BLAKE3 digest verification, single-flight execution, foreground/session checks before each action, abort latching/reset, restart recovery, and content-free audit transitions.
+- Native Windows guarded automation emission through exact HWND/PID/executable target identity, WTS unlocked-session checks, unique UI Automation ID lookup beneath the approved HWND, Invoke/Value pattern support, and `SendInput` keyboard/text fallback with UTF-16 input, modifier release, and partial-injection detection.
+- Typed protobuf and Tauri automation operations for status, enablement, foreground target capture, approval, execution, abort, reset, and safety heartbeat.
 - Focused-monitor Windows capture encoded as PNG through XCap.
 - Automatic two-second capture scheduling and continuous durable-job draining.
 - Offline Windows Media OCR using installed user language packs, including line bounds and language.
@@ -78,11 +81,11 @@ Capture metadata and an analysis job are committed transactionally. Analysis com
 - Deterministic fake capture, OCR, embeddings, and generation remain available only for tests.
 - No GGUF generation model is selected or installed by default; the diagnostics UI requests evidence-only search.
 - The model-worker process does not perform inference.
-- OS automation validates policy but emits no keyboard or mouse input.
+- Guarded automation is disabled by default and never runs from generated plans. It emits native input only after manual enablement, target capture, exact review, one-shot approval, and same-plan execution while all safety gates still pass.
 
 ## Current user experience
 
-The React screen implements the product-owner-selected Memory Timeline direction. Capture and analysis are automatic; search renders chronologically grouped screenshot evidence with timestamps, application/window metadata, excerpts, provenance, and positioned OCR highlights. Search, date/application filters, evidence selection, detail tabs, pause/resume, live privacy exclusions, retention/storage settings, confirmed captured-history deletion, manual capture, and optional generation states are interactive. Tray lifecycle and a system-wide hotkey remain unimplemented.
+The React screen implements the product-owner-selected Memory Timeline direction. Capture and analysis are automatic; search renders chronologically grouped screenshot evidence with timestamps, application/window metadata, excerpts, provenance, and positioned OCR highlights. Search, date/application filters, evidence selection, detail tabs, pause/resume, live privacy exclusions, retention/storage settings, confirmed captured-history deletion, manual capture, optional generation states, and the guarded automation approval workflow are interactive. The automation UI remains preview-safe outside Tauri and non-emitting until the native shell/daemon path is enabled.
 
 ## Current dependencies and infrastructure
 
@@ -100,10 +103,10 @@ The React screen implements the product-owner-selected Memory Timeline direction
 3. No global hotkey or tray lifecycle exists yet; Ctrl+K currently focuses search only inside the window.
 4. The model worker boundary is not yet exercised; OCR and embeddings currently execute in the daemon process.
 5. The GGUF provider has no approved default model, manifest, acquisition flow, or packaged weights.
-6. Automation policy is real, but native input emission remains disabled.
+6. Guarded automation is included behind explicit default-off opt-in; it still needs release sign-off for user-facing scope and support policy.
 7. Idle/active capture CPU, long-duration storage growth, and OCR/embedding queue latency still need release-hardware soak measurements; the P1 metadata-scale and live-search baselines are complete.
 8. A full factory-reset scope covering archive database and model files is not implemented; confirmed deletion currently covers captured history and its derived evidence/assets.
-9. Locked-session detection is still unimplemented and must land before production privacy acceptance.
+9. Capture-side locked-session privacy handling remains open for release hardening; guarded automation has its own fail-closed WTS unlocked-session check.
 10. Named-pipe access-control hardening and release signing remain incomplete.
 
 ## Non-goals

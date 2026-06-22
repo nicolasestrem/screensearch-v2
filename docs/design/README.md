@@ -40,8 +40,10 @@ The full P2 shell reference and manual Windows verification runbook is in
 
 ## Guarded automation (P4)
 
-The default-off manual approval flow, daemon safety gates, privacy contract, and Windows fixture
-runbook are specified in [`p4-guarded-automation.md`](p4-guarded-automation.md).
+The default-off manual approval flow, daemon safety gates, privacy contract, and gated Windows
+fixture runbook are specified in [`p4-guarded-automation.md`](p4-guarded-automation.md). The
+production path is included only behind explicit opt-in; preview mode and generated plans remain
+non-emitting.
 
 ## Keyboard model (P2)
 

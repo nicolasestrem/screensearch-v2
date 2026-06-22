@@ -32,11 +32,12 @@ Build reviewed: completed P0 truthful evidence loop and P1 semantic-retrieval/sc
 - A system tray with at-a-glance capture state (tooltip + status line refreshed by a daemon health poll), Pause/Resume, Open, and Quit; closing the window hides it to the tray while the separate capture daemon keeps running (P2, native runtime pending manual Windows verification).
 - A configurable system-wide summon hotkey (default `Ctrl+Shift+Space`) registered from Rust via `tauri-plugin-global-shortcut`, persisted as a shell-local JSON setting decoupled from the daemon archive, editable in Settings, and emitting a window-focus event to the UI.
 - Complete keyboard navigation in the Memory Timeline UI: arrow/Home/End result selection with roving tab index and a typing guard, ARIA tablist arrow keys for evidence detail tabs, dialog focus trapping, Escape-to-close with focus restoration, and Ctrl+K search focus.
+- Guarded automation V1 on the `codex/p4-guarded-automation` branch: domain policy, content-free persistence, daemon orchestration, typed protobuf/Tauri IPC, native Windows UIA/keyboard emission, manual approval UI, and a gated synthetic Windows fixture.
 
 ## Deliberately skipped
 
 - An approved and installed default GGUF generation model.
-- Locked-session detection, model acquisition, signing, factory reset of database/model files, and production automation.
+- Model acquisition/release selection, signing, factory reset of database/model files, capture-side locked-session privacy handling, and release-hardening item 18.
 
 ## Placeholder behavior that must not be mistaken for product behavior
 
@@ -48,7 +49,7 @@ Build reviewed: completed P0 truthful evidence loop and P1 semantic-retrieval/sc
 - The modular-monolith shape is appropriate for a single-user desktop application.
 - Persistence and IPC boundaries can survive replacement of adapters.
 - The archive already treats OCR and embeddings as derived, versioned data.
-- Safety policy is separated from native automation emission.
+- Automation policy, persistence, daemon orchestration, UI approval, and native Windows emission stay separated behind ports. Persistence/audit records and stable failure surfaces stay content-free; approval/execute IPC carries the reviewed typed plan.
 
 ## Risks found
 
@@ -59,6 +60,7 @@ Build reviewed: completed P0 truthful evidence loop and P1 semantic-retrieval/sc
 5. The native model-worker boundary is now supervised (bounded restarts + parent lifeline) and exercised by gated integration tests, but live-Windows GGUF generation benchmarking and the GAP-002/GAP-003 model decisions remain before items 15/16 close.
 6. Current logging review has not yet proven that all future native errors are content-free.
 7. Long-duration capture CPU/storage growth and perceptual-threshold tuning remain release-hardening work beyond the completed P1 engineering baseline.
+8. Guarded automation is intentionally default-off and narrowly scoped. Support policy, packaging/signing, and broader release-hardening remain before public release.
 
 ## Verification evidence
 
@@ -90,3 +92,16 @@ A 2026-06-22 review-and-harden pass made the worker boundary genuinely *supervis
 Verification on 2026-06-22 (Windows): `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` all passed (52 passed, 7 ignored gated); `npm run lint` and `npm run build` passed in `apps/desktop`.
 
 **Items 15 and 16 stay open.** Closing them additionally requires a live-Windows GGUF benchmark of a selected candidate model and the human/legal model decisions in GAP-002/GAP-003; the benchmark harness exists but candidate measurements are still pending.
+
+## P4 branch review note
+
+The `codex/p4-guarded-automation` branch implements patch-plan item 17 as a production path behind explicit default-off opt-in.
+
+- **Specification and ADRs.** The master specification and ADR set now define the approved action schema, safety bounds, approval lifecycle, abort heartbeat, and privacy contract. `docs/design/p4-guarded-automation.md` is the durable design/runbook reference.
+- **Domain and persistence.** `AutomationPlanV1`, `AutomationTarget`, `AutomationAction`, validation, canonical BLAKE3 plan digests, default-off settings, and the content-free v2 run ledger are implemented. Persistence stores only identifiers, plan digest, action count, lifecycle status, timestamps, expiry, and stable failure code.
+- **Daemon and IPC.** `AutomationService` owns enablement, heartbeat freshness, one-shot approval, exact-plan verification, single-flight execution, abort latching/reset, timeout/rate gates, repeated foreground/session checks, terminal audit transitions, and restart recovery. Protobuf/Tauri operations cover status, enable, foreground target, approve, execute, abort, reset, and safety heartbeat.
+- **Windows emission.** `WindowsAutomationPlatform` identifies targets by HWND/PID/executable, fails closed on lock/identity drift, resolves UIA controls uniquely by exact Automation ID below the approved HWND, supports Invoke and writable Value patterns, and uses `SendInput` for typed chords/text with UTF-16 encoding, modifier release, and partial-injection detection. Mouse, clipboard, shell, elevation bypass, and Windows-key actions are absent.
+- **Manual UI.** The desktop adds a default-off guarded automation modal with warning confirmation, live abort state, target capture, ordered action editing, exact JSON review, separate approve/execute steps, execution result display, and explicit abort reset. Preview mode is non-emitting.
+- **Verification coverage.** CI-run tests cover policy validation, digest stability, persistence privacy/default-off/approval lifecycle/recovery, daemon heartbeat/focus/session/abort/concurrency/timeout gates, protobuf/handler mappings, and Windows input encoding/identity behavior. A gated `crates/windows/tests/guarded_automation_fixture.rs` creates its own synthetic Win32 window and verifies UIA set-value, UIA invoke, UTF-16 text, key-chord fallback, and foreground rejection without controlling unrelated applications.
+
+Item 17 is closed by this branch. P2/P3 open items and release-hardening item 18 remain open.

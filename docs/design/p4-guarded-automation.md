@@ -101,3 +101,13 @@ The UI may add human-readable explanations, but IPC and persistence use these st
 The gated Windows fixture may operate only on a synthetic test window created by the fixture. It
 must verify invoke, set-value, keyboard fallback, focus rejection, timeout, and global abort. The
 test must never locate or control unrelated applications.
+
+Implemented fixture command:
+
+```powershell
+$env:SCREENSEARCH_RUN_AUTOMATION_IT='1'
+cargo test -p screensearch-windows guarded_windows_automation_fixture_exercises_native_paths -- --ignored --nocapture
+```
+
+The committed fixture verifies UIA set-value, UIA invoke, UTF-16 text input, key-chord fallback,
+and foreground rejection against its owned synthetic Win32 window.
