@@ -7,7 +7,7 @@ use futures::Stream;
 use thiserror::Error;
 
 /// Generated V1 IPC contract.
-#[allow(missing_docs)]
+#[allow(missing_docs, clippy::struct_excessive_bools)]
 pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/screensearch.v1.rs"));
 }
@@ -324,8 +324,10 @@ mod tests {
     use prost::Message;
 
     use super::v1::{
-        HealthRequest, HealthResponse, RequestEnvelope, ResponseEnvelope,
-        UpdateArchiveSettingsRequest, request_envelope, response_envelope,
+        ApproveAutomationRequest, AutomationAction, AutomationKeyChord, AutomationPlanV1,
+        AutomationTarget, ErrorResponse, HealthRequest, HealthResponse, RequestEnvelope,
+        ResponseEnvelope, TypeTextAction, UpdateArchiveSettingsRequest, automation_action,
+        request_envelope, response_envelope,
     };
 
     #[test]
@@ -396,6 +398,67 @@ mod tests {
         };
         assert_eq!(settings.retention_days, Some(30));
         assert_eq!(settings.excluded_applications, ["private.exe"]);
+    }
+
+    #[test]
+    fn automation_plan_request_round_trips_typed_actions() {
+        let request = RequestEnvelope {
+            request_id: "automation-request".to_owned(),
+            body: Some(request_envelope::Body::ApproveAutomation(
+                ApproveAutomationRequest {
+                    plan: Some(AutomationPlanV1 {
+                        target: Some(AutomationTarget {
+                            process_id: 42,
+                            window_handle: 9001,
+                            executable_name: "fixture.exe".to_owned(),
+                            display_title: "Fixture".to_owned(),
+                        }),
+                        actions: vec![
+                            AutomationAction {
+                                action: Some(automation_action::Action::KeyChord(
+                                    AutomationKeyChord {
+                                        modifiers: vec![1, 3],
+                                        key: 19,
+                                    },
+                                )),
+                            },
+                            AutomationAction {
+                                action: Some(automation_action::Action::TypeText(TypeTextAction {
+                                    text: "hello".to_owned(),
+                                })),
+                            },
+                        ],
+                    }),
+                },
+            )),
+        };
+
+        let decoded = RequestEnvelope::decode(request.encode_to_vec().as_slice()).unwrap();
+        let Some(request_envelope::Body::ApproveAutomation(approval)) = decoded.body else {
+            panic!("expected automation approval request");
+        };
+        let plan = approval.plan.unwrap();
+        assert_eq!(plan.target.unwrap().window_handle, 9001);
+        assert_eq!(plan.actions.len(), 2);
+    }
+
+    #[test]
+    fn automation_failure_response_round_trips_stable_code() {
+        let response = ResponseEnvelope {
+            request_id: "automation-failure".to_owned(),
+            terminal: true,
+            body: Some(response_envelope::Body::Error(ErrorResponse {
+                code: "target_changed".to_owned(),
+                message: "The foreground target changed.".to_owned(),
+                retryable: false,
+            })),
+        };
+
+        let decoded = ResponseEnvelope::decode(response.encode_to_vec().as_slice()).unwrap();
+        let Some(response_envelope::Body::Error(error)) = decoded.body else {
+            panic!("expected structured error");
+        };
+        assert_eq!(error.code, "target_changed");
     }
 
     #[cfg(windows)]

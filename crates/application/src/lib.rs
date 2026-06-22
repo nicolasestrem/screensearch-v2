@@ -1,5 +1,9 @@
 //! Use-case orchestration for capture ingestion, durable analysis, and cited search.
 
+mod automation;
+
+pub use automation::{AutomationService, AutomationServiceConfig, AutomationServiceStatus};
+
 use std::{
     collections::HashMap,
     fmt::Write as _,

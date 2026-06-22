@@ -20,6 +20,14 @@ message RequestEnvelope {
     SelectGenerationModelRequest select_generation_model = 22;
     DeleteGenerationModelRequest delete_generation_model = 23;
     UnloadGenerationModelRequest unload_generation_model = 24;
+    AutomationStatusRequest automation_status = 25;
+    SetAutomationEnabledRequest set_automation_enabled = 26;
+    GetAutomationForegroundTargetRequest get_automation_foreground_target = 27;
+    ApproveAutomationRequest approve_automation = 28;
+    ExecuteAutomationRequest execute_automation = 29;
+    AbortAutomationRequest abort_automation = 30;
+    ResetAutomationAbortRequest reset_automation_abort = 31;
+    AutomationSafetyHeartbeatRequest automation_safety_heartbeat = 32;
     WorkerHealthRequest worker_health = 100;
     WorkerOcrRequest worker_ocr = 101;
     WorkerEmbeddingRequest worker_embedding = 102;
@@ -46,6 +54,14 @@ message ResponseEnvelope {
     GenerationModelResponse generation_model = 21;
     DeleteGenerationModelResponse delete_generation_model = 22;
     UnloadGenerationModelResponse unload_generation_model = 23;
+    AutomationStatusResponse automation_status = 25;
+    SetAutomationEnabledResponse set_automation_enabled = 26;
+    AutomationForegroundTargetResponse automation_foreground_target = 27;
+    ApproveAutomationResponse approve_automation = 28;
+    ExecuteAutomationResponse execute_automation = 29;
+    AbortAutomationResponse abort_automation = 30;
+    ResetAutomationAbortResponse reset_automation_abort = 31;
+    AutomationSafetyHeartbeatResponse automation_safety_heartbeat = 32;
     WorkerHealthResponse worker_health = 100;
     WorkerOcrResponse worker_ocr = 101;
     WorkerEmbeddingResponse worker_embedding = 102;
@@ -234,6 +250,178 @@ message DeleteGenerationModelResponse {
 
 message UnloadGenerationModelResponse {
   bool unloaded = 1;
+}
+
+message AutomationStatusRequest {}
+
+message AutomationStatusResponse {
+  bool enabled = 1;
+  bool abort_available = 2;
+  bool abort_active = 3;
+  bool running = 4;
+}
+
+message SetAutomationEnabledRequest {
+  bool enabled = 1;
+}
+
+message SetAutomationEnabledResponse {
+  AutomationStatusResponse status = 1;
+}
+
+message GetAutomationForegroundTargetRequest {}
+
+message AutomationForegroundTargetResponse {
+  AutomationTarget target = 1;
+}
+
+message ApproveAutomationRequest {
+  AutomationPlanV1 plan = 1;
+}
+
+message ApproveAutomationResponse {
+  string approval_id = 1;
+  string expires_at = 2;
+  uint32 action_count = 3;
+}
+
+message ExecuteAutomationRequest {
+  string approval_id = 1;
+  AutomationPlanV1 plan = 2;
+}
+
+message ExecuteAutomationResponse {
+  string status = 1;
+}
+
+message AbortAutomationRequest {}
+
+message AbortAutomationResponse {
+  bool abort_active = 1;
+}
+
+message ResetAutomationAbortRequest {}
+
+message ResetAutomationAbortResponse {
+  bool abort_active = 1;
+}
+
+message AutomationSafetyHeartbeatRequest {
+  bool abort_registered = 1;
+}
+
+message AutomationSafetyHeartbeatResponse {
+  bool accepted = 1;
+}
+
+message AutomationPlanV1 {
+  AutomationTarget target = 1;
+  repeated AutomationAction actions = 2;
+}
+
+message AutomationTarget {
+  uint32 process_id = 1;
+  uint64 window_handle = 2;
+  string executable_name = 3;
+  string display_title = 4;
+}
+
+message AutomationAction {
+  oneof action {
+    UiaInvokeAction uia_invoke = 1;
+    UiaSetValueAction uia_set_value = 2;
+    AutomationKeyChord key_chord = 3;
+    TypeTextAction type_text = 4;
+  }
+}
+
+message UiaInvokeAction {
+  string automation_id = 1;
+}
+
+message UiaSetValueAction {
+  string automation_id = 1;
+  string value = 2;
+}
+
+message AutomationKeyChord {
+  repeated AutomationKeyModifier modifiers = 1;
+  AutomationKey key = 2;
+}
+
+message TypeTextAction {
+  string text = 1;
+}
+
+enum AutomationKeyModifier {
+  AUTOMATION_KEY_MODIFIER_UNSPECIFIED = 0;
+  AUTOMATION_KEY_MODIFIER_CONTROL = 1;
+  AUTOMATION_KEY_MODIFIER_ALT = 2;
+  AUTOMATION_KEY_MODIFIER_SHIFT = 3;
+}
+
+enum AutomationKey {
+  AUTOMATION_KEY_UNSPECIFIED = 0;
+  AUTOMATION_KEY_A = 1;
+  AUTOMATION_KEY_B = 2;
+  AUTOMATION_KEY_C = 3;
+  AUTOMATION_KEY_D = 4;
+  AUTOMATION_KEY_E = 5;
+  AUTOMATION_KEY_F = 6;
+  AUTOMATION_KEY_G = 7;
+  AUTOMATION_KEY_H = 8;
+  AUTOMATION_KEY_I = 9;
+  AUTOMATION_KEY_J = 10;
+  AUTOMATION_KEY_K = 11;
+  AUTOMATION_KEY_L = 12;
+  AUTOMATION_KEY_M = 13;
+  AUTOMATION_KEY_N = 14;
+  AUTOMATION_KEY_O = 15;
+  AUTOMATION_KEY_P = 16;
+  AUTOMATION_KEY_Q = 17;
+  AUTOMATION_KEY_R = 18;
+  AUTOMATION_KEY_S = 19;
+  AUTOMATION_KEY_T = 20;
+  AUTOMATION_KEY_U = 21;
+  AUTOMATION_KEY_V = 22;
+  AUTOMATION_KEY_W = 23;
+  AUTOMATION_KEY_X = 24;
+  AUTOMATION_KEY_Y = 25;
+  AUTOMATION_KEY_Z = 26;
+  AUTOMATION_KEY_DIGIT_0 = 27;
+  AUTOMATION_KEY_DIGIT_1 = 28;
+  AUTOMATION_KEY_DIGIT_2 = 29;
+  AUTOMATION_KEY_DIGIT_3 = 30;
+  AUTOMATION_KEY_DIGIT_4 = 31;
+  AUTOMATION_KEY_DIGIT_5 = 32;
+  AUTOMATION_KEY_DIGIT_6 = 33;
+  AUTOMATION_KEY_DIGIT_7 = 34;
+  AUTOMATION_KEY_DIGIT_8 = 35;
+  AUTOMATION_KEY_DIGIT_9 = 36;
+  AUTOMATION_KEY_ENTER = 37;
+  AUTOMATION_KEY_ESCAPE = 38;
+  AUTOMATION_KEY_TAB = 39;
+  AUTOMATION_KEY_SPACE = 40;
+  AUTOMATION_KEY_BACKSPACE = 41;
+  AUTOMATION_KEY_DELETE = 42;
+  AUTOMATION_KEY_ARROW_LEFT = 43;
+  AUTOMATION_KEY_ARROW_RIGHT = 44;
+  AUTOMATION_KEY_ARROW_UP = 45;
+  AUTOMATION_KEY_ARROW_DOWN = 46;
+  AUTOMATION_KEY_HOME = 47;
+  AUTOMATION_KEY_END = 48;
+  AUTOMATION_KEY_F1 = 49;
+  AUTOMATION_KEY_F2 = 50;
+  AUTOMATION_KEY_F3 = 51;
+  AUTOMATION_KEY_F4 = 52;
+  AUTOMATION_KEY_F5 = 53;
+  AUTOMATION_KEY_F6 = 54;
+  AUTOMATION_KEY_F7 = 55;
+  AUTOMATION_KEY_F8 = 56;
+  AUTOMATION_KEY_F9 = 57;
+  AUTOMATION_KEY_F10 = 58;
+  AUTOMATION_KEY_F11 = 59;
+  AUTOMATION_KEY_F12 = 60;
 }
 
 message GenerationModel {
