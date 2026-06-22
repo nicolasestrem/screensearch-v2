@@ -6,7 +6,7 @@ use std::{
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::Stdio,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_stream::try_stream;
@@ -37,6 +37,8 @@ const RELEASE_OVERRIDE_ENV: &str = "SSV2C_LLAMA_RELEASE_URL";
 const CURRENT_INSTALL_DIR: &str = "current";
 const LLAMA_CLI_EXE: &str = "llama-cli.exe";
 const STDOUT_READ_BYTES: usize = 512;
+const STDOUT_STREAM_CHUNK_BYTES: usize = 512;
+const MAX_SIDECAR_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 500 * 1024 * 1024;
 const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -534,31 +536,16 @@ fn run_llama_cli(binary: &Path, model_path: &Path, prompt: &str) -> Result<Token
     let threads = cpu_thread_budget().to_string();
     let context_tokens = GENERATION_CONTEXT_TOKENS.to_string();
     let token_cap = MAX_GENERATED_TOKENS.to_string();
+    let args = build_llama_cli_args(
+        model_path,
+        prompt_file.path(),
+        &threads,
+        &context_tokens,
+        &token_cap,
+    );
     let mut command = tokio::process::Command::new(binary);
     command
-        .arg("--model")
-        .arg(model_path)
-        .arg("--file")
-        .arg(prompt_file.path())
-        .arg("--ctx-size")
-        .arg(context_tokens)
-        .arg("--threads")
-        .arg(&threads)
-        .arg("--threads-batch")
-        .arg(threads)
-        .arg("--gpu-layers")
-        .arg("all")
-        .arg("--predict")
-        .arg(token_cap)
-        // Together these flags make chat-template models produce one assistant turn and exit.
-        // If upstream behavior regresses, the generation deadline still kills the sidecar.
-        .arg("--conversation")
-        .arg("--single-turn")
-        .arg("--no-display-prompt")
-        .arg("--no-show-timings")
-        .arg("--color")
-        .arg("off")
-        .arg("--log-disable")
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
@@ -572,26 +559,32 @@ fn run_llama_cli(binary: &Path, model_path: &Path, prompt: &str) -> Result<Token
         .stdout
         .take()
         .ok_or_else(|| PortError::Internal("llama sidecar stdout was not piped".to_owned()))?;
+    info!(
+        threads = %threads,
+        context_tokens = %context_tokens,
+        token_cap = %token_cap,
+        "starting llama.cpp Vulkan sidecar generation"
+    );
+    let prompt_text = prompt.to_owned();
     Ok(Box::pin(try_stream! {
         let _prompt_file = prompt_file;
         let mut stdout = stdout;
         let mut buffer = [0_u8; STDOUT_READ_BYTES];
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut stdout_bytes = Vec::new();
         let deadline = TokioInstant::now() + GENERATION_DEADLINE;
+        let started = Instant::now();
         loop {
             let read =
                 read_sidecar_stdout(&mut stdout, &mut child, &mut buffer, deadline).await?;
             if read == 0 {
                 break;
             }
-            let text = decode_sidecar_stdout(&mut decoder, &buffer[..read], false)?;
-            if !text.is_empty() {
-                yield text;
+            if stdout_bytes.len().saturating_add(read) > MAX_SIDECAR_STDOUT_BYTES {
+                Err(PortError::Unavailable(
+                    "llama sidecar stdout exceeded the capture limit".to_owned(),
+                ))?;
             }
-        }
-        let trailing = decode_sidecar_stdout(&mut decoder, &[], true)?;
-        if !trailing.is_empty() {
-            yield trailing;
+            stdout_bytes.extend_from_slice(&buffer[..read]);
         }
         let status = wait_for_sidecar_exit(&mut child, deadline).await?;
         if !status.success() {
@@ -602,7 +595,61 @@ fn run_llama_cli(binary: &Path, model_path: &Path, prompt: &str) -> Result<Token
                     .map_or_else(|| "terminated".to_owned(), |code| code.to_string())
             )))?;
         }
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let raw_stdout = decode_sidecar_stdout(&mut decoder, &stdout_bytes, true)?;
+        let answer = sanitize_sidecar_stdout(&raw_stdout, &prompt_text)?;
+        if answer.is_empty() {
+            Err(PortError::Unavailable(
+                "llama sidecar returned no answer text".to_owned(),
+            ))?;
+        }
+        info!(
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            stdout_bytes = stdout_bytes.len(),
+            answer_bytes = answer.len(),
+            "completed llama.cpp Vulkan sidecar generation"
+        );
+        for chunk in sidecar_output_chunks(&answer) {
+            yield chunk;
+        }
     }))
+}
+
+fn build_llama_cli_args(
+    model_path: &Path,
+    prompt_path: &Path,
+    threads: &str,
+    context_tokens: &str,
+    token_cap: &str,
+) -> Vec<String> {
+    vec![
+        "--model".to_owned(),
+        model_path.display().to_string(),
+        "--file".to_owned(),
+        prompt_path.display().to_string(),
+        "--ctx-size".to_owned(),
+        context_tokens.to_owned(),
+        "--threads".to_owned(),
+        threads.to_owned(),
+        "--threads-batch".to_owned(),
+        threads.to_owned(),
+        "--gpu-layers".to_owned(),
+        "all".to_owned(),
+        "--predict".to_owned(),
+        token_cap.to_owned(),
+        // Together these flags make chat-template models produce one assistant turn and exit.
+        // If upstream behavior regresses, the generation deadline still kills the sidecar.
+        "--conversation".to_owned(),
+        "--single-turn".to_owned(),
+        "--no-display-prompt".to_owned(),
+        "--no-show-timings".to_owned(),
+        "--color".to_owned(),
+        "off".to_owned(),
+        "--log-disable".to_owned(),
+        "--simple-io".to_owned(),
+        "--reasoning".to_owned(),
+        "off".to_owned(),
+    ]
 }
 
 fn decode_sidecar_stdout(
@@ -621,6 +668,57 @@ fn decode_sidecar_stdout(
         ));
     }
     Ok(text)
+}
+
+fn sanitize_sidecar_stdout(stdout: &str, prompt: &str) -> Result<String, PortError> {
+    let normalized_stdout = normalize_newlines(stdout);
+    let normalized_prompt = normalize_newlines(prompt);
+    let body = if looks_like_llama_cli_transcript(&normalized_stdout) {
+        let prompt_end = normalized_stdout
+            .find(&normalized_prompt)
+            .map(|offset| offset + normalized_prompt.len())
+            .ok_or_else(|| {
+                PortError::InvalidData(
+                    "llama sidecar emitted an interactive transcript without a prompt boundary"
+                        .to_owned(),
+                )
+            })?;
+        &normalized_stdout[prompt_end..]
+    } else {
+        normalized_stdout.as_str()
+    };
+    Ok(strip_llama_cli_trailer(body).trim().to_owned())
+}
+
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn looks_like_llama_cli_transcript(text: &str) -> bool {
+    text.contains("available commands:")
+        || (text.contains("Loading model") && text.lines().any(|line| line.starts_with("> ")))
+}
+
+fn strip_llama_cli_trailer(text: &str) -> &str {
+    let trimmed = text.trim();
+    trimmed
+        .strip_suffix("Exiting...")
+        .map_or(trimmed, str::trim)
+}
+
+fn sidecar_output_chunks(text: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    for (index, _) in text.char_indices().skip(1) {
+        if index.saturating_sub(start) >= STDOUT_STREAM_CHUNK_BYTES {
+            chunks.push(text[start..index].to_owned());
+            start = index;
+        }
+    }
+    if start < text.len() {
+        chunks.push(text[start..].to_owned());
+    }
+    chunks
 }
 
 async fn read_sidecar_stdout(
@@ -731,9 +829,9 @@ mod tests {
     };
 
     use super::{
-        GitHubAsset, GitHubRelease, asset_matches_windows_vulkan, decode_sidecar_stdout,
-        extract_zip_safely, extract_zip_safely_with_limit, release_api_url_from_override,
-        select_release_asset,
+        GitHubAsset, GitHubRelease, asset_matches_windows_vulkan, build_llama_cli_args,
+        decode_sidecar_stdout, extract_zip_safely, extract_zip_safely_with_limit,
+        release_api_url_from_override, sanitize_sidecar_stdout, select_release_asset,
     };
 
     fn release(tag: &str, draft: bool, assets: &[&str]) -> GitHubRelease {
@@ -921,6 +1019,47 @@ mod tests {
         assert_eq!(pending, "");
         assert_eq!(completed, "\u{1F4A1}");
         assert_eq!(trailing, "");
+    }
+
+    #[test]
+    fn sidecar_stdout_sanitizer_removes_llama_cli_transcript_and_prompt() {
+        let prompt = "Answer only from local captures.\n\nQuestion: What was visible?";
+        let stdout = format!(
+            "\nLoading model...\n\nbuild      : b9758\nmodel      : C:\\model.gguf\n\navailable commands:\n  /exit or Ctrl+C     stop or exit\n\n\n> {prompt}\n\nThe visible screen showed a terminal window.\n\nExiting...\n"
+        );
+
+        let sanitized = sanitize_sidecar_stdout(&stdout, prompt).unwrap();
+
+        assert_eq!(sanitized, "The visible screen showed a terminal window.");
+    }
+
+    #[test]
+    fn sidecar_stdout_sanitizer_rejects_ambiguous_interactive_transcript() {
+        let prompt = "Sensitive local prompt that must not leak";
+        let stdout = "\nLoading model...\n\navailable commands:\n  /exit or Ctrl+C     stop or exit\n\n\n> Sensitive local prompt";
+
+        let error = sanitize_sidecar_stdout(stdout, prompt).unwrap_err();
+
+        assert!(error.to_string().contains("interactive transcript"));
+    }
+
+    #[test]
+    fn sidecar_command_args_keep_prompt_in_file_and_disable_reasoning() {
+        let args = build_llama_cli_args(
+            Path::new("C:/models/local.gguf"),
+            Path::new("C:/Temp/prompt.txt"),
+            "8",
+            "4096",
+            "768",
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--file", "C:/Temp/prompt.txt"])
+        );
+        assert!(!args.iter().any(|arg| arg == "--prompt"));
+        assert!(args.windows(2).any(|pair| pair == ["--reasoning", "off"]));
+        assert!(args.iter().any(|arg| arg == "--simple-io"));
     }
 
     fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {

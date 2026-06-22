@@ -82,7 +82,7 @@ $env:SSV2C_LLAMA_RELEASE_URL = "https://github.com/ggml-org/llama.cpp/releases/t
 cargo build -p screensearch-model-worker
 ```
 
-The sidecar `llama-cli.exe` is invoked with full GPU layer offload, a 4096-token context, the current physical-core thread count, and the same generation token cap as the embedded provider. Sidecar downloads use temporary files and staging directories; zip entries are rejected if they escape the staging root. If sidecar acquisition or execution fails, diagnostics stay content-free and generation falls back to the embedded CPU provider so evidence search still works.
+The sidecar `llama-cli.exe` is invoked with full GPU layer offload, a 4096-token context, the current physical-core thread count, and the same generation token cap as the embedded provider. Sidecar downloads use temporary files and staging directories; zip entries are rejected if they escape the staging root. During generation, stdout is buffered until `llama-cli.exe` exits successfully, recognized llama-cli transcripts are reduced to answer text, and ambiguous transcript output is rejected before anything reaches the UI. If sidecar acquisition, execution, or stdout sanitization fails, diagnostics stay content-free and generation falls back to the embedded CPU provider so evidence search still works.
 
 The table above remains a CPU baseline. Rerun the benchmark and gated worker suite on GPU-capable hardware before comparing GPU latency or selecting a release default. The `gpu-vulkan` Cargo feature remains available for advanced local-build experiments, but it is no longer the normal GPU acceleration path and still requires the Vulkan SDK on the build machine.
 

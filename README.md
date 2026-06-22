@@ -37,7 +37,7 @@ cargo run -p screensearch-daemon
 
 `cargo run -p screensearch-daemon` does not automatically build sibling workspace binaries. Build `screensearch-model-worker` first when running from source; packaged builds must place the worker executable beside the daemon.
 
-GGUF generation uses the prebuilt llama.cpp Windows Vulkan sidecar as the preferred GPU path. The worker installs it under the ScreenSearch data directory on first use, reuses the installed sidecar afterward, and falls back to the embedded CPU provider if sidecar acquisition or execution fails.
+GGUF generation uses the prebuilt llama.cpp Windows Vulkan sidecar as the preferred GPU path. The worker installs it under the ScreenSearch data directory on first use, reuses the installed sidecar afterward, and falls back to the embedded CPU provider if sidecar acquisition, execution, or stdout sanitization fails. Sidecar lifecycle logs report only content-free metadata such as timing, byte counts, and failure category; prompts, model paths, captures, and llama-cli transcripts are not logged or shown as answer text.
 
 ```powershell
 $env:SSV2C_LLAMA_RELEASE_URL = "https://github.com/ggml-org/llama.cpp/releases/tag/<tag>" # optional pinned release

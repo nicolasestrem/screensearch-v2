@@ -14,8 +14,9 @@
 
 ### Changed
 
-- Hardened llama.cpp Vulkan sidecar installs with serialized acquisition, bounded network and extraction work, prerelease filtering, and live stdout streaming before CPU fallback.
+- Hardened llama.cpp Vulkan sidecar installs with serialized acquisition, bounded network and extraction work, prerelease filtering, and safe sidecar execution before CPU fallback.
 - Fixed llama.cpp sidecar stdout decoding so generated answers stream visible tokens, and made the evidence rail buttons select/focus recent or visual evidence instead of becoming no-ops.
+- Buffered and sanitized llama.cpp sidecar stdout before displaying answers, added content-free sidecar lifecycle logs, and disabled sidecar reasoning output where supported.
 
 ### Documentation
 
