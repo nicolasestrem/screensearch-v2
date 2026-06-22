@@ -1603,10 +1603,16 @@ fn append_capture_filters(sql: &mut String, values: &mut Vec<Value>, filters: &S
             continue;
         }
         let pattern = like_pattern(&source);
+        // The planner extracts known source words strictly, then persistence applies them as
+        // escaped substrings across metadata and OCR text. This keeps desktop apps such as
+        // telegram-desktop.exe filterable without dropping browser pages whose app/title omit the
+        // site name but whose captured text still shows GitHub, Amazon, and similar sources.
         sql.push_str(
             " AND (lower(c.application) LIKE ? ESCAPE '\\'
-                   OR lower(c.window_title) LIKE ? ESCAPE '\\')",
+                   OR lower(c.window_title) LIKE ? ESCAPE '\\'
+                   OR lower(sc.text) LIKE ? ESCAPE '\\')",
         );
+        values.push(Value::Text(pattern.clone()));
         values.push(Value::Text(pattern.clone()));
         values.push(Value::Text(pattern));
     }
@@ -2473,6 +2479,60 @@ mod tests {
         assert!(hits.iter().all(|hit| hit.capture_id != outside_time_id));
         assert!(hits.iter().all(|hit| hit.capture_id != wrong_source_id));
         assert_eq!(hits[0].application, "Telegram Desktop");
+    }
+
+    #[tokio::test]
+    async fn source_filters_can_match_browser_ocr_text_before_ranking() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        let embeddings = FakeEmbeddingEngine;
+        let model_id = embeddings.model_id();
+        let query_vector = embeddings.embed("github").await.unwrap();
+        let captured_at = Utc.with_ymd_and_hms(2026, 6, 22, 9, 30, 0).unwrap();
+        let expected_id = index_capture_with_metadata(
+            &repository,
+            SearchCaptureFixture {
+                index: 25,
+                text: "GitHub pull request Files changed +120 -8",
+                model_id,
+                embedding: query_vector.clone(),
+                captured_at,
+                application: "Microsoft Edge",
+                window_title: "nicolasestrem/screensearch-v2 pull request 12",
+            },
+        )
+        .await;
+        let excluded_id = index_capture_with_metadata(
+            &repository,
+            SearchCaptureFixture {
+                index: 26,
+                text: "Pull request Files changed +120 -8",
+                model_id,
+                embedding: query_vector.clone(),
+                captured_at,
+                application: "Microsoft Edge",
+                window_title: "nicolasestrem/screensearch-v2 pull request 11",
+            },
+        )
+        .await;
+
+        let hits = repository
+            .hybrid_search(
+                "",
+                &query_vector,
+                model_id,
+                &SearchFilters {
+                    source_terms: vec!["github".to_owned()],
+                    ..SearchFilters::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].capture_id, expected_id);
+        assert!(hits.iter().all(|hit| hit.capture_id != excluded_id));
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@
 
 ### Changed
 
+- Addressed PR #12 review follow-ups by capping per-hit OCR prompt excerpts, clarifying local-day planning, matching source filters against OCR text for browser pages, allowing HF downloads without a display-name field, and making `<think>` stripping robust for unclosed streaming spans.
 - Applied search time/source filters in backend hybrid retrieval before ranking, loosened FTS to phrase/exact boosts plus OR fallback, and enriched answer prompts with local timestamp/source metadata and citation/uncertainty requirements.
 - Redesigned Settings around answer readiness, timezone basis, active/installed answer models, blank guided local GGUF import, advanced HF download fields, explicit storage policy state, and conservative reset.
 - Hid generated model `<think>` spans before rendering answers in the desktop UI.
@@ -26,6 +27,7 @@
 
 ### Documentation
 
+- Recorded known gaps for source-vocabulary expansion, client timezone propagation, and further prompt hardening for application/window-title metadata.
 - Added `docs/design/useful-local-answers.md` and narrowed the remaining patch plan to genuine item-15 and item-18 release gaps.
 - Addressed PR #10 review feedback by making the GGUF full-GPU-offload sentinel explicit and correcting stale Claude changelog guidance.
 - Recorded local P3 GGUF smoke measurements and the remaining item-15 release blockers in `docs/performance/P3_MODEL_SELECTION.md`.

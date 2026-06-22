@@ -1098,7 +1098,7 @@ function ModelSettings({
             <span>Filename</span>
             <input value={draft.filename} onChange={(event) => onDraft({ ...draft, filename: event.target.value })} placeholder="model.Q4_K_M.gguf" />
           </label>
-          <button type="button" onClick={onDownload} disabled={busy || !draft.repository.trim() || !draft.filename.trim() || !draft.displayName.trim()}><Sparkle /> {downloadPending ? "Downloading…" : "Download HF"}</button>
+          <button type="button" onClick={onDownload} disabled={busy || !draft.repository.trim() || !draft.filename.trim()}><Sparkle /> {downloadPending ? "Downloading…" : "Download HF"}</button>
         </details>
       </div>
       {models.length > 0 ? (
@@ -1140,10 +1140,21 @@ function answerSubtitle(answer: string, status: string, message: string) {
 }
 
 function stripThinkSpans(value: string) {
-  return value
-    .replace(/<think>[\s\S]*?<\/think>/gi, "")
-    .replace(/<think>[\s\S]*$/i, "")
-    .trim();
+  const lower = value.toLowerCase();
+  let visible = "";
+  let index = 0;
+  while (index < value.length) {
+    const start = lower.indexOf("<think>", index);
+    if (start === -1) {
+      visible += value.slice(index);
+      break;
+    }
+    visible += value.slice(index, start);
+    const end = lower.indexOf("</think>", start + "<think>".length);
+    if (end === -1) break;
+    index = end + "</think>".length;
+  }
+  return visible.trim();
 }
 
 function planSummary(plan: SearchPlanEvent) {

@@ -14,6 +14,9 @@ This file contains decisions or external inputs that cannot be safely invented b
 | GAP-006 | Decide whether guarded automation belongs in the first public release or remains feature-disabled. | Product owner | Before release scope freeze | Resolved: included behind explicit default-off opt-in |
 | GAP-007 | Name the reference Windows hardware profile for latency and resource budgets. | Product owner / engineering | Before performance acceptance | Resolved for P1 engineering baseline: Ryzen 7 7800X3D, 32 GB RAM, Kingston NVMe, Windows 11 Pro |
 | GAP-008 | Choose the Windows memory-pressure signal that triggers an early generation-model unload (e.g. a memory-resource-notification or working-set threshold) and its policy. | Engineering | Before item 15 closes | Open; idle-timeout unload is implemented, the memory-pressure path is deferred |
+| GAP-009 | Expand the deterministic source-hint vocabulary beyond Telegram, GitHub, Codex, and Amazon without turning source extraction into model inference. | Engineering | Before broad app-specific answer planning | Open; current planner intentionally covers the four acceptance prompts |
+| GAP-010 | Carry the user-facing timezone/clock basis through `SearchRequest` instead of relying on the daemon's local clock. | Engineering | Before any split-user, VM, or remote-daemon deployment | Open; current supported topology is one Windows user session on one machine |
+| GAP-011 | Further harden generated-answer prompts against adversarial application/window-title metadata beyond the current untrusted-evidence instruction. | Engineering / security | Before release security review | Open; OCR and metadata are treated as untrusted in the prompt, but metadata escaping/audit is still a hardening task |
 
 ## Current safe assumptions
 

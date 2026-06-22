@@ -25,6 +25,8 @@ The planner leaves only useful evidence terms in `retrieval_query`. Examples:
 - Codex settings early afternoon: retrieval `settings`, source `codex`, 12:00-15:00 local
 - Amazon book this afternoon: retrieval `book`, source `amazon`, 12:00-18:00 local
 
+The source vocabulary is deliberately small and deterministic for this pass. GAP-009 tracks expanding it beyond the four acceptance sources.
+
 ## Retrieval
 
 `ArchiveRepository::hybrid_search` accepts `SearchFilters` and applies time/source constraints inside lexical and semantic candidate SQL before rank fusion. Filtered semantic search uses the exact vector-distance path instead of global `vector_top_k`, because global top-k would rank before source/time constraints.
@@ -32,6 +34,8 @@ The planner leaves only useful evidence terms in `retrieval_query`. Examples:
 FTS now uses a safe phrase clause plus OR fallback over normalized useful terms. A noisy extra term should not suppress a partial lexical match. Exact full-text matches still receive an additive boost, and matching useful terms receive a smaller additive boost. Capture-level dedupe and embedding model-revision isolation remain unchanged.
 
 Metadata-only searches still run semantic ranking over the filtered candidate set, using source hints or the original query only to build the embedding vector.
+
+Source hints are extracted as known whole words, then matched as escaped substrings against application names, window titles, and OCR chunk text so variants like `telegram-desktop.exe` still match and browser pages remain eligible when only the captured page text contains the site name.
 
 ## Answer Prompt
 
@@ -43,7 +47,7 @@ Answer prompts include, for each bounded evidence item:
 - window title
 - OCR excerpt
 
-The prompt states that OCR text is untrusted evidence, forbids external lookup, requires capture-id citations, and requires uncertainty when local captures do not show the requested fact. For largest-PR questions, changed-file/addition/deletion evidence must be visible; otherwise the answer must say it cannot determine the largest PR from local captures.
+The prompt states that OCR text and capture metadata are untrusted evidence, forbids external lookup, requires capture-id citations, and requires uncertainty when local captures do not show the requested fact. OCR excerpts are capped per hit before entering the prompt so one large chunk cannot consume the answer model context. For largest-PR questions, changed-file/addition/deletion evidence must be visible; otherwise the answer must say it cannot determine the largest PR from local captures.
 
 The desktop strips `<think>...</think>` spans before rendering generated text.
 
