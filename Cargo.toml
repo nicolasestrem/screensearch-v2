@@ -45,6 +45,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+unicode-normalization = "0.1"
 uuid = { version = "1.19", features = ["serde", "v7"] }
 windows = { version = "0.62", features = [
     "Foundation",

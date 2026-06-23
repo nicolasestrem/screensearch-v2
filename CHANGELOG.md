@@ -4,6 +4,9 @@
 
 ### Added
 
+- Closed P0/P1 spec-deviation gaps found in a scrupulous Phase 0→1 review: persisted the full embedding manifest (provider, model name, revision/hash, tokenizer revision, pooling, normalization, license, source URL) via migration `0008` and a matching `FastEmbedEngine::manifest()` accessor (spec §8.1).
+- Added a grace-period filesystem orphan sweep that removes asset files left by a capture whose database commit failed, never deleting referenced or recently written files (spec §5), wired into the daemon maintenance loop.
+- Added the §18 integration tests that were missing: expired-lease recovery, end-to-end queue saturation/backpressure resume, and capture-commit orphan handling.
 - Added deterministic local-time search planning for useful local answers, including source/time filters for Telegram, GitHub PR, Codex settings, and Amazon book prompts.
 - Added a streamed search-plan event so the desktop can show interpreted retrieval terms, time bounds, source hints, and timezone basis before citations.
 - Added a content-free opt-in local archive answer smoke covering the four supplied prompts.
@@ -17,6 +20,11 @@
 
 ### Changed
 
+- Hardened the orphan asset sweep after PR review: candidate-first walk that skips symlinked entries (root-confinement) and tolerates files vanishing mid-walk, bounded `IN (...)` reconciliation instead of loading every asset hash, an mtime refresh on reused files to close a capture/sweep race, and once-per-hour throttling.
+- Clarified embedding-manifest provenance: `revision_hash` is the advertised upstream revision (fastembed downloads `main` unpinned); within-archive isolation is enforced by `model_id`, with hard pinning tracked under GAP-002/GAP-003.
+- Added deterministic "equal jitter" to the analysis-job retry backoff (`base/2 + hash(job, attempt) mod base/2`) so retries de-correlate while staying reproducible and bounded by the exponential cap (spec §6).
+- Normalized Windows OCR block text to LF line endings and Unicode NFC before persistence so stored text, FTS terms, and embeddings share one canonical form (spec §7.2).
+- Refactored the libSQL migration runner to a single versioned-gate helper while adding migration `0008`.
 - Addressed PR #12 review follow-ups by capping per-hit OCR prompt excerpts, prompting every returned citation, clarifying local-day planning, matching source filters at capture level for browser pages, preserving Unicode query terms, avoiding unsupported day-modifier time filters, allowing HF downloads without a display-name field, and making `<think>` stripping robust for unclosed streaming spans.
 - Applied search time/source filters in backend hybrid retrieval before ranking, loosened FTS to phrase/exact boosts plus OR fallback, and enriched answer prompts with local timestamp/source metadata and citation/uncertainty requirements.
 - Redesigned Settings around answer readiness, timezone basis, active/installed answer models, blank guided local GGUF import, advanced HF download fields, explicit storage policy state, and conservative reset.

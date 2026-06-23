@@ -98,6 +98,45 @@ impl EmbeddingEngine for FakeEmbeddingEngine {
     }
 }
 
+/// Provenance manifest for the active embedding revision (spec §8.1).
+///
+/// The same values are persisted by persistence migration `0008_embedding_model_manifest.sql`, so
+/// the runtime and the archive agree on the model revision, tokenizer, pooling, normalization,
+/// license, and source. This keeps derived vectors reproducible and auditable.
+///
+/// **Within-archive isolation** (ADR 0002) is enforced by [`Self::model_id`], which is stamped on
+/// every derived row and filtered on every query — those weights never mix inside one archive.
+/// [`Self::revision_hash`] records the *advertised* upstream revision: `fastembed` resolves the
+/// model by its built-in `Xenova/all-MiniLM-L6-v2` identity and downloads the repo's `main`
+/// revision without pinning a commit, so a cold install could fetch newer upstream weights under
+/// the same `model_id`. Hard revision pinning or artifact-hash verification is a model-acquisition
+/// decision tracked under GAP-002 / GAP-003, not enforced here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmbeddingManifest {
+    /// Distributing project / runtime.
+    pub provider: &'static str,
+    /// Human-readable model name.
+    pub model_name: &'static str,
+    /// Active model revision id persisted on every derived row; the enforced isolation key.
+    pub model_id: &'static str,
+    /// Advertised upstream weight revision (see type docs — not download-pinned).
+    pub revision_hash: &'static str,
+    /// Tokenizer revision hash. Coincides with `revision_hash` for MiniLM-L6-v2 (the tokenizer
+    /// config lives in the same Hugging Face repo revision); kept separate for models where it may
+    /// differ.
+    pub tokenizer_revision: &'static str,
+    /// Output vector dimensionality.
+    pub dimensions: usize,
+    /// Token pooling strategy.
+    pub pooling: &'static str,
+    /// Vector normalization applied after pooling.
+    pub normalization: &'static str,
+    /// SPDX license identifier.
+    pub license: &'static str,
+    /// Canonical source URL for the weights.
+    pub source_url: &'static str,
+}
+
 /// Quantized ONNX sentence embedding provider backed by `fastembed`.
 #[derive(Clone)]
 pub struct FastEmbedEngine {
@@ -113,16 +152,33 @@ impl FastEmbedEngine {
             model: Arc::new(Mutex::new(None)),
         }
     }
+
+    /// Returns the provenance manifest for the active embedding revision (spec §8.1).
+    #[must_use]
+    pub fn manifest() -> EmbeddingManifest {
+        EmbeddingManifest {
+            provider: "Xenova (fastembed / ONNX Runtime)",
+            model_name: "all-MiniLM-L6-v2 (quantized ONNX)",
+            model_id: "fastembed-all-minilm-l6-v2-q-384-v1",
+            revision_hash: "751bff37182d3f1213fa05d7196b954e230abad9",
+            tokenizer_revision: "751bff37182d3f1213fa05d7196b954e230abad9",
+            dimensions: 384,
+            pooling: "mean",
+            normalization: "l2",
+            license: "Apache-2.0",
+            source_url: "https://huggingface.co/Xenova/all-MiniLM-L6-v2",
+        }
+    }
 }
 
 #[async_trait]
 impl EmbeddingEngine for FastEmbedEngine {
     fn model_id(&self) -> &'static str {
-        "fastembed-all-minilm-l6-v2-q-384-v1"
+        Self::manifest().model_id
     }
 
     fn dimensions(&self) -> usize {
-        384
+        Self::manifest().dimensions
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>, PortError> {
@@ -519,9 +575,33 @@ mod tests {
     use screensearch_ports::EmbeddingEngine;
 
     use super::{
-        FULL_GPU_LAYER_OFFLOAD, FakeEmbeddingEngine, dedupe_leading_bos,
+        FULL_GPU_LAYER_OFFLOAD, FakeEmbeddingEngine, FastEmbedEngine, dedupe_leading_bos,
         model_params_for_available_hardware, should_stop_generation,
     };
+
+    #[test]
+    fn embedding_manifest_matches_active_model_and_pins_revision() {
+        let manifest = FastEmbedEngine::manifest();
+        let engine = FastEmbedEngine::new(std::path::PathBuf::from("unused"));
+
+        // The manifest is the single source of truth for the active revision id and vector width.
+        assert_eq!(manifest.model_id, engine.model_id());
+        assert_eq!(manifest.dimensions, engine.dimensions());
+        assert_eq!(manifest.dimensions, 384);
+
+        // Spec §8.1 provenance fields are populated, not placeholders.
+        assert_eq!(
+            manifest.revision_hash,
+            "751bff37182d3f1213fa05d7196b954e230abad9"
+        );
+        assert_eq!(manifest.tokenizer_revision, manifest.revision_hash);
+        assert_eq!(manifest.pooling, "mean");
+        assert_eq!(manifest.normalization, "l2");
+        assert_eq!(manifest.license, "Apache-2.0");
+        assert!(manifest.source_url.starts_with("https://huggingface.co/"));
+        assert!(!manifest.provider.is_empty());
+        assert!(!manifest.model_name.is_empty());
+    }
 
     #[tokio::test]
     async fn fake_embeddings_are_normalized_and_fixed_width() {

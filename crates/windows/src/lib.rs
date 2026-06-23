@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use image::{DynamicImage, ImageFormat, imageops::FilterType};
 use screensearch_domain::{BoundingBox, CapturedFrame, OcrBlock};
 use screensearch_ports::{CaptureSource, OcrEngine, PortError};
+use unicode_normalization::UnicodeNormalization;
 use windows::{
     Graphics::Imaging::BitmapDecoder,
     Media::Ocr::OcrEngine as WinOcrEngine,
@@ -255,13 +256,23 @@ fn recognize_image(path: &Path) -> Result<Vec<OcrBlock>, PortError> {
             blocks.push(OcrBlock {
                 reading_order: u32::try_from(blocks.len()).unwrap_or(u32::MAX),
                 bounds,
-                text,
+                text: normalize_ocr_text(&text),
                 confidence: None,
                 language: language.clone(),
             });
         }
         Ok(blocks)
     })
+}
+
+/// Normalizes OCR line text to a canonical form while preserving human-readable content (spec §7.2).
+///
+/// Windows Media OCR returns one line per block, but the recognized string may carry platform line
+/// endings or decomposed Unicode. This collapses CR/CRLF to `\n` and applies Unicode NFC so the
+/// persisted block text, derived FTS terms, and chunk embeddings share one canonical representation.
+fn normalize_ocr_text(text: &str) -> String {
+    let unified = text.replace("\r\n", "\n").replace('\r', "\n");
+    unified.nfc().collect()
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -279,9 +290,22 @@ mod tests {
     use windows::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, KEYEVENTF_UNICODE};
 
     use super::{
-        encode_key_chord_inputs, encode_text_inputs, keyboard_event, target_identity_matches,
-        validate_send_input_count,
+        encode_key_chord_inputs, encode_text_inputs, keyboard_event, normalize_ocr_text,
+        target_identity_matches, validate_send_input_count,
     };
+
+    #[test]
+    fn ocr_text_is_normalized_to_lf_and_nfc() {
+        // CRLF and bare CR collapse to LF without otherwise altering the text.
+        assert_eq!(
+            normalize_ocr_text("line1\r\nline2\rline3"),
+            "line1\nline2\nline3"
+        );
+        // Decomposed "é" (e + U+0301 combining acute) becomes the composed NFC scalar U+00E9.
+        assert_eq!(normalize_ocr_text("e\u{0301}"), "\u{00e9}");
+        // Already-canonical ASCII text is returned unchanged.
+        assert_eq!(normalize_ocr_text("hello world"), "hello world");
+    }
 
     #[test]
     fn target_identity_requires_exact_hwnd_pid_and_executable() {

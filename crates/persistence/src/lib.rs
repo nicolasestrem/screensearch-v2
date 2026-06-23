@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    time::{Duration as StdDuration, Instant},
+    time::{Duration as StdDuration, Instant, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -31,8 +31,11 @@ const MIGRATION_0004: &str = include_str!("../migrations/0004_real_embedding_mod
 const MIGRATION_0005: &str = include_str!("../migrations/0005_archive_policy.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_generation_model_catalog.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_guarded_automation.sql");
+const MIGRATION_0008: &str = include_str!("../migrations/0008_embedding_model_manifest.sql");
 const MAX_JOB_ATTEMPTS: u32 = 5;
 const BRUTE_FORCE_VECTOR_THRESHOLD: u64 = 50_000;
+/// Maximum content hashes bound into one `IN (...)` orphan-reconciliation query.
+const ASSET_HASH_QUERY_BATCH: usize = 500;
 
 /// Content-addressed asset storage using atomic file replacement.
 #[derive(Clone, Debug)]
@@ -60,6 +63,104 @@ impl FileAssetStore {
         }
         Ok(self.root.join(relative))
     }
+
+    /// Collects asset files older than `grace` that may be orphans, pending a database cross-check.
+    ///
+    /// Implements the discovery half of the spec §5 orphan-cleanup allowance: a frame whose file was
+    /// written before its capture row failed to commit (or a stale write-temp from an interrupted
+    /// `put`) leaves an unreferenced file behind. The grace window protects files that may still be
+    /// mid-commit, and a reused file's modification time is refreshed by `put`, so a file in flight
+    /// is never collected. Only the shard directories under the asset root are walked; symlinked
+    /// shards and files are skipped via `DirEntry::file_type` (which does not follow links), so the
+    /// sweep can never escape the asset root onto the database or model files. Entries that vanish or
+    /// error mid-walk are skipped rather than aborting the sweep, since a concurrent capture or
+    /// retention pass can race directory listing. Returned candidates carry the BLAKE3 hash parsed
+    /// from each file name; the caller must drop any hash still referenced by the archive (see
+    /// `LibSqlArchive::referenced_asset_hashes_among`) before deleting. Inspecting only aged-out
+    /// files keeps memory bounded by the orphan count rather than the whole archive.
+    pub async fn collect_orphan_candidates(
+        &self,
+        grace: StdDuration,
+    ) -> Result<Vec<OrphanCandidate>, PortError> {
+        let now = SystemTime::now();
+        let mut candidates = Vec::new();
+        let mut shards = match fs::read_dir(&self.root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidates),
+            Err(error) => return Err(io_error(error)),
+        };
+        while let Some(shard) = shards.next_entry().await.map_err(io_error)? {
+            // `file_type` does not follow symlinks, so a symlinked shard is not a directory here and
+            // is skipped — the walk never descends outside the asset root.
+            match shard.file_type().await {
+                Ok(file_type) if file_type.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(io_error(error)),
+            }
+            let mut files = match fs::read_dir(shard.path()).await {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(io_error(error)),
+            };
+            while let Some(file) = files.next_entry().await.map_err(io_error)? {
+                match file.file_type().await {
+                    Ok(file_type) if file_type.is_file() => {}
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(io_error(error)),
+                }
+                let metadata = match file.metadata().await {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(io_error(error)),
+                };
+                // Skip anything younger than the grace window so an in-flight write is never raced.
+                let aged_out = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_some_and(|age| age >= grace);
+                if !aged_out {
+                    continue;
+                }
+                let path = file.path();
+                let Some(content_hash) = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                candidates.push(OrphanCandidate { path, content_hash });
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Removes the supplied orphan files, tolerating entries that already vanished.
+    ///
+    /// Callers pass only paths whose content hash is unreferenced by the archive. A file that is
+    /// missing or briefly inaccessible is skipped so a single locked entry never blocks the rest of
+    /// the sweep; the next maintenance pass retries. Returns the number of files actually removed.
+    pub async fn remove_files(&self, paths: &[PathBuf]) -> Result<u64, PortError> {
+        let mut removed = 0_u64;
+        for path in paths {
+            if fs::remove_file(path).await.is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// An asset file with no obvious owner, awaiting a database cross-check before deletion.
+#[derive(Clone, Debug)]
+pub struct OrphanCandidate {
+    /// Absolute path to the candidate file.
+    pub path: PathBuf,
+    /// BLAKE3 content hash parsed from the file name.
+    pub content_hash: String,
 }
 
 #[async_trait]
@@ -76,7 +177,12 @@ impl AssetStore for FileAssetStore {
         let target = self.root.join(&relative_path);
         fs::create_dir_all(&directory).await.map_err(io_error)?;
 
-        if !fs::try_exists(&target).await.map_err(io_error)? {
+        if fs::try_exists(&target).await.map_err(io_error)? {
+            // The bytes are already stored. Refresh the modification time so a reused file — e.g.
+            // re-captured bytes whose previous capture failed to commit — is protected by the
+            // orphan-sweep grace window until this capture's row commits.
+            refresh_modified_time(&target).await?;
+        } else {
             let temporary = directory.join(format!(".{}.{}.tmp", content_hash, Uuid::now_v7()));
             fs::write(&temporary, bytes).await.map_err(io_error)?;
             if let Err(error) = fs::rename(&temporary, &target).await {
@@ -136,6 +242,55 @@ impl LibSqlArchive {
 
     fn connection(&self) -> libsql::Connection {
         self.connection.clone()
+    }
+
+    /// Applies a versioned migration only when its `schema_migration` row is absent.
+    ///
+    /// Each migration script records its own version row, so this gate runs every step exactly once
+    /// and forward-only.
+    async fn apply_migration_if_absent(&self, version: i64, sql: &str) -> Result<(), PortError> {
+        let mut rows = self
+            .connection()
+            .query(
+                "SELECT 1 FROM schema_migration WHERE version = ? LIMIT 1",
+                params![version],
+            )
+            .await
+            .map_err(database_error)?;
+        if rows.next().await.map_err(database_error)?.is_none() {
+            self.connection()
+                .execute_batch(sql)
+                .await
+                .map_err(database_error)?;
+        }
+        Ok(())
+    }
+
+    /// Returns which of the supplied content hashes are still recorded in the asset table.
+    ///
+    /// Orphan cleanup passes the hashes parsed from aged-out asset files and deletes only those the
+    /// archive no longer references. Querying by candidate (in bounded batches) keeps memory and the
+    /// query proportional to the orphan count rather than the whole archive, which matters at the
+    /// spec's ten-million-capture scale.
+    pub async fn referenced_asset_hashes_among(
+        &self,
+        hashes: &[String],
+    ) -> Result<HashSet<String>, PortError> {
+        let mut referenced = HashSet::new();
+        for chunk in hashes.chunks(ASSET_HASH_QUERY_BATCH) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql =
+                format!("SELECT content_hash FROM asset WHERE content_hash IN ({placeholders})");
+            let mut rows = self
+                .connection()
+                .query(&sql, params_from_iter(chunk.iter().cloned()))
+                .await
+                .map_err(database_error)?;
+            while let Some(row) = rows.next().await.map_err(database_error)? {
+                referenced.insert(row.get::<String>(0).map_err(database_error)?);
+            }
+        }
+        Ok(referenced)
     }
 
     /// Seeds capture metadata without image assets for the explicit scale benchmark.
@@ -253,89 +408,16 @@ impl ArchiveRepository for LibSqlArchive {
             .execute_batch(MIGRATION_0001)
             .await
             .map_err(database_error)?;
-        let mut rows = self
-            .connection()
-            .query(
-                "SELECT 1 FROM schema_migration WHERE version = 2 LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(database_error)?;
-        if rows.next().await.map_err(database_error)?.is_none() {
-            self.connection()
-                .execute_batch(MIGRATION_0002)
-                .await
-                .map_err(database_error)?;
-        }
-        let mut rows = self
-            .connection()
-            .query(
-                "SELECT 1 FROM schema_migration WHERE version = 3 LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(database_error)?;
-        if rows.next().await.map_err(database_error)?.is_none() {
-            self.connection()
-                .execute_batch(MIGRATION_0003)
-                .await
-                .map_err(database_error)?;
-        }
-        let mut rows = self
-            .connection()
-            .query(
-                "SELECT 1 FROM schema_migration WHERE version = 4 LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(database_error)?;
-        if rows.next().await.map_err(database_error)?.is_none() {
-            self.connection()
-                .execute_batch(MIGRATION_0004)
-                .await
-                .map_err(database_error)?;
-        }
-        let mut rows = self
-            .connection()
-            .query(
-                "SELECT 1 FROM schema_migration WHERE version = 5 LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(database_error)?;
-        if rows.next().await.map_err(database_error)?.is_none() {
-            self.connection()
-                .execute_batch(MIGRATION_0005)
-                .await
-                .map_err(database_error)?;
-        }
-        let mut rows = self
-            .connection()
-            .query(
-                "SELECT 1 FROM schema_migration WHERE version = 6 LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(database_error)?;
-        if rows.next().await.map_err(database_error)?.is_none() {
-            self.connection()
-                .execute_batch(MIGRATION_0006)
-                .await
-                .map_err(database_error)?;
-        }
-        let mut rows = self
-            .connection()
-            .query(
-                "SELECT 1 FROM schema_migration WHERE version = 7 LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(database_error)?;
-        if rows.next().await.map_err(database_error)?.is_none() {
-            self.connection()
-                .execute_batch(MIGRATION_0007)
-                .await
-                .map_err(database_error)?;
+        for (version, sql) in [
+            (2, MIGRATION_0002),
+            (3, MIGRATION_0003),
+            (4, MIGRATION_0004),
+            (5, MIGRATION_0005),
+            (6, MIGRATION_0006),
+            (7, MIGRATION_0007),
+            (8, MIGRATION_0008),
+        ] {
+            self.apply_migration_if_absent(version, sql).await?;
         }
         Ok(())
     }
@@ -598,7 +680,7 @@ impl ArchiveRepository for LibSqlArchive {
                 .await
                 .map_err(database_error)?;
         } else {
-            let backoff_seconds = i64::from(2_u32.pow(attempt.min(8)));
+            let backoff_seconds = rescheduled_backoff_seconds(&job.id, attempt);
             transaction
                 .execute(
                     "UPDATE analysis_job SET status = 'pending', attempt = ?, last_error = ?, next_run_at = ?, lease_owner = NULL, lease_until = NULL WHERE id = ?",
@@ -1810,6 +1892,31 @@ fn timestamp(value: chrono::DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+/// Bounded exponential backoff with deterministic "equal jitter" (spec §6).
+///
+/// The capped exponential `2^min(attempt, 8)` is the upper bound. Following the equal-jitter
+/// strategy, the actual delay is `base/2 + rand(0, base/2)`, so retries of distinct jobs (and
+/// successive attempts of one job) spread out instead of firing in lockstep. The pseudo-random
+/// offset is derived from BLAKE3 over the job id and attempt, keeping the value reproducible for
+/// tests and free of a runtime RNG dependency while still de-correlating jobs. The result is never
+/// below one second and never exceeds the exponential cap.
+fn rescheduled_backoff_seconds(job_id: &JobId, attempt: u32) -> i64 {
+    let base = i64::from(2_u32.pow(attempt.min(8)));
+    let half = base / 2;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(job_id.to_string().as_bytes());
+    hasher.update(&attempt.to_le_bytes());
+    let digest = hasher.finalize();
+    let raw = u64::from_le_bytes(
+        digest.as_bytes()[..8]
+            .try_into()
+            .expect("blake3 digest is 32 bytes"),
+    );
+    let span = u64::try_from(half).unwrap_or(0).saturating_add(1);
+    let offset = i64::try_from(raw % span).unwrap_or(0);
+    (half + offset).max(1)
+}
+
 fn parse_timestamp(value: &str, label: &str) -> Result<chrono::DateTime<Utc>, PortError> {
     chrono::DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
@@ -2102,6 +2209,23 @@ fn io_error(error: std::io::Error) -> PortError {
     PortError::Internal(format!("asset storage: {error}"))
 }
 
+/// Refreshes a file's modification time to now.
+///
+/// `put` calls this when it reuses an already-stored content-addressed file so the orphan-sweep
+/// grace window protects the file until the new capture row commits.
+async fn refresh_modified_time(path: &Path) -> Result<(), PortError> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await
+        .map_err(io_error)?;
+    file.into_std()
+        .await
+        .set_modified(SystemTime::now())
+        .map_err(io_error)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2111,8 +2235,8 @@ mod tests {
     use screensearch_domain::{
         AnalysisResult, ArchiveSettings, AssetRef, AutomationFailureCode, AutomationRun,
         AutomationRunId, AutomationRunStatus, AutomationSettings, BoundingBox, CaptureDisposition,
-        CaptureId, CapturedFrame, ChunkId, IndexedChunk, NewCapture, OcrBlock, SearchEvent,
-        SearchFilters, SearchMatchKind,
+        CaptureId, CaptureSkipReason, CapturedFrame, ChunkId, DeleteCaptures, IndexedChunk,
+        NewCapture, OcrBlock, SearchEvent, SearchFilters, SearchMatchKind,
     };
     use screensearch_model_runtime::{FakeEmbeddingEngine, FakeOcrEngine, FakeTextGenerator};
     use screensearch_ports::{
@@ -2141,6 +2265,106 @@ mod tests {
         }
     }
 
+    /// Capture source that yields a distinct frame on every call so neither the exact-fingerprint
+    /// nor perceptual deduplication filters interfere with a queue-saturation test.
+    struct CountingCapture {
+        counter: std::sync::atomic::AtomicU32,
+    }
+
+    impl CountingCapture {
+        fn new() -> Self {
+            Self {
+                counter: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CaptureSource for CountingCapture {
+        async fn capture(&self) -> Result<CapturedFrame, screensearch_ports::PortError> {
+            let index = self
+                .counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(CapturedFrame {
+                captured_at: Utc::now(),
+                monitor_id: "saturation-monitor".to_owned(),
+                application: "saturation.exe".to_owned(),
+                window_title: format!("Frame {index}"),
+                width: 2,
+                height: 2,
+                bytes: format!("saturation-frame-{index}").into_bytes(),
+                media_type: "application/octet-stream".to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_backpressures_at_high_water_and_resumes_below_low_water() {
+        use screensearch_application::{CapturePolicy, CapturePolicyConfig, IngestService};
+
+        let directory = TempDir::new().unwrap();
+        let repository = Arc::new(LibSqlArchive::in_memory().await.unwrap());
+        repository.migrate().await.unwrap();
+        let assets = Arc::new(FileAssetStore::new(directory.path()));
+        let source = Arc::new(CountingCapture::new());
+        let policy = Arc::new(
+            CapturePolicy::new(CapturePolicyConfig {
+                queue_high_water: 2,
+                queue_low_water: 1,
+                excluded_applications: Vec::new(),
+                excluded_titles: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let ingest = IngestService::with_policy(source, assets, repository.clone(), policy.clone());
+
+        // Two real captures fill the durable queue to the high-water mark.
+        assert!(matches!(
+            ingest.capture_once().await.unwrap(),
+            CaptureDisposition::Enqueued { .. }
+        ));
+        assert!(matches!(
+            ingest.capture_once().await.unwrap(),
+            CaptureDisposition::Enqueued { .. }
+        ));
+        assert_eq!(repository.queue_metrics().await.unwrap().depth(), 2);
+
+        // At the high-water mark, capture is suppressed with a content-free skip reason.
+        assert!(matches!(
+            ingest.capture_once().await.unwrap(),
+            CaptureDisposition::Skipped {
+                reason: CaptureSkipReason::Backpressured
+            }
+        ));
+        assert!(policy.is_backpressured());
+        assert_eq!(repository.queue_metrics().await.unwrap().depth(), 2);
+
+        // Drain one job (which cascades to its analysis job) to the low-water mark.
+        let mut rows = repository
+            .connection()
+            .query("SELECT id FROM capture LIMIT 1", ())
+            .await
+            .unwrap();
+        let capture_id_text: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        drop(rows);
+        repository
+            .delete_captures(DeleteCaptures {
+                capture_ids: vec![super::parse_capture_id(&capture_id_text).unwrap()],
+                before: None,
+                delete_all: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(repository.queue_metrics().await.unwrap().depth(), 1);
+
+        // Below the low-water mark, capture resumes automatically on the next attempt.
+        assert!(matches!(
+            ingest.capture_once().await.unwrap(),
+            CaptureDisposition::Enqueued { .. }
+        ));
+        assert!(!policy.is_backpressured());
+    }
+
     #[tokio::test]
     async fn asset_writes_are_content_addressed_and_idempotent() {
         let directory = TempDir::new().unwrap();
@@ -2160,6 +2384,109 @@ mod tests {
         store.delete(&first).await.unwrap();
         store.delete(&first).await.unwrap();
         assert!(!store.resolve(&first).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn orphan_assets_are_swept_while_referenced_assets_survive() {
+        let directory = TempDir::new().unwrap();
+        let store = FileAssetStore::new(directory.path());
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+
+        // A committed capture writes its asset file and records the backing asset row.
+        let referenced_bytes = b"committed-capture-bytes";
+        let referenced_asset = store.put(referenced_bytes, "image/png").await.unwrap();
+        let mut committed = capture(1, 0, referenced_bytes.len() as u64);
+        committed.asset = referenced_asset.clone();
+        repository.enqueue_capture(committed).await.unwrap();
+
+        // Simulate a capture commit failure: the asset file was written by `put`, but the capture
+        // transaction never landed, so no capture or asset row references the file (spec §5).
+        let orphan_asset = store
+            .put(b"file-without-a-committed-row", "image/png")
+            .await
+            .unwrap();
+        assert!(store.resolve(&orphan_asset).unwrap().exists());
+
+        // The daemon's reconciliation: collect aged candidates, ask the archive which are still
+        // referenced, then delete only the rest.
+        let candidates = store
+            .collect_orphan_candidates(std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let hashes: Vec<String> = candidates.iter().map(|c| c.content_hash.clone()).collect();
+        assert!(hashes.contains(&referenced_asset.content_hash));
+        assert!(hashes.contains(&orphan_asset.content_hash));
+        let referenced = repository
+            .referenced_asset_hashes_among(&hashes)
+            .await
+            .unwrap();
+        assert!(referenced.contains(&referenced_asset.content_hash));
+        assert!(!referenced.contains(&orphan_asset.content_hash));
+        let orphan_paths: Vec<_> = candidates
+            .into_iter()
+            .filter(|candidate| !referenced.contains(&candidate.content_hash))
+            .map(|candidate| candidate.path)
+            .collect();
+        let removed = store.remove_files(&orphan_paths).await.unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(store.resolve(&referenced_asset).unwrap().exists());
+        assert!(!store.resolve(&orphan_asset).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_respects_the_grace_window() {
+        let directory = TempDir::new().unwrap();
+        let store = FileAssetStore::new(directory.path());
+
+        // A freshly written, unreferenced file may still belong to an in-flight capture, so a
+        // non-zero grace window must not even surface it as a candidate.
+        let recent = store
+            .put(b"recent-unreferenced", "image/png")
+            .await
+            .unwrap();
+        let candidates = store
+            .collect_orphan_candidates(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+
+        assert!(candidates.is_empty());
+        assert!(store.resolve(&recent).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn reused_asset_file_is_protected_by_a_refreshed_mtime() {
+        let directory = TempDir::new().unwrap();
+        let store = FileAssetStore::new(directory.path());
+
+        // An orphan file from a previous failed commit, aged well past the grace window.
+        let bytes = b"reused-content-addressed-bytes";
+        let asset = store.put(bytes, "image/png").await.unwrap();
+        let path = store.resolve(&asset).unwrap();
+        let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(aged)
+            .unwrap();
+
+        // Re-capturing the same bytes reuses the file; `put` must refresh its mtime so the grace
+        // window protects it until the new capture row commits (closes the put/enqueue race).
+        store.put(bytes, "image/png").await.unwrap();
+        let candidates = store
+            .collect_orphan_candidates(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.content_hash != asset.content_hash),
+            "a reused asset file must not be an orphan candidate within the grace window"
+        );
+        assert!(store.resolve(&asset).unwrap().exists());
     }
 
     fn capture(index: u32, age_days: i64, byte_length: u64) -> NewCapture {
@@ -2817,6 +3144,112 @@ mod tests {
         let metrics = repository.queue_metrics().await.unwrap();
         assert_eq!(metrics.pending, 1);
         assert_eq!(metrics.dead_letter_count, 0);
+    }
+
+    #[tokio::test]
+    async fn fail_job_backoff_is_bounded_and_jittered() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        repository.enqueue_capture(capture(1, 0, 1)).await.unwrap();
+        let job = repository
+            .claim_job("jitter-worker")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Equal-jitter window: max(1, base/2) <= backoff <= base, where base = 2^min(attempt, 8).
+        for attempt in 1..=9_u32 {
+            let base = i64::from(2_u32.pow(attempt.min(8)));
+            let backoff = super::rescheduled_backoff_seconds(&job.id, attempt);
+            let floor = (base / 2).max(1);
+            assert!(
+                backoff >= floor && backoff <= base,
+                "attempt {attempt}: backoff {backoff} outside [{floor}, {base}]"
+            );
+            // The pseudo-random offset is deterministic for a given job and attempt.
+            assert_eq!(
+                backoff,
+                super::rescheduled_backoff_seconds(&job.id, attempt),
+                "backoff is not reproducible for attempt {attempt}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_lease_is_reclaimed_by_a_new_worker() {
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        repository.enqueue_capture(capture(1, 0, 1)).await.unwrap();
+
+        // Worker A claims the job and holds the lease; no other worker may steal a live lease.
+        let claimed = repository.claim_job("worker-a").await.unwrap().unwrap();
+        assert!(repository.claim_job("worker-b").await.unwrap().is_none());
+
+        // Simulate a crashed or stalled worker by forcing the lease into the past, then verify a
+        // fresh worker reclaims the same job after restart (spec §6 expired-lease recovery).
+        repository
+            .connection()
+            .execute(
+                "UPDATE analysis_job SET lease_until = ? WHERE id = ?",
+                params![
+                    timestamp(Utc::now() - Duration::minutes(5)),
+                    claimed.id.to_string()
+                ],
+            )
+            .await
+            .unwrap();
+
+        let reclaimed = repository.claim_job("worker-b").await.unwrap().unwrap();
+        assert_eq!(reclaimed.id, claimed.id);
+        assert_eq!(reclaimed.capture_id, claimed.capture_id);
+        // Reclaiming does not burn a retry attempt; it resumes the same in-flight work.
+        assert_eq!(reclaimed.attempt, claimed.attempt);
+
+        let metrics = repository.queue_metrics().await.unwrap();
+        assert_eq!(metrics.running, 1);
+        assert_eq!(metrics.pending, 0);
+        assert_eq!(metrics.dead_letter_count, 0);
+    }
+
+    #[tokio::test]
+    async fn active_embedding_model_row_carries_the_provenance_manifest() {
+        use screensearch_model_runtime::FastEmbedEngine;
+
+        let repository = LibSqlArchive::in_memory().await.unwrap();
+        repository.migrate().await.unwrap();
+        let manifest = FastEmbedEngine::manifest();
+
+        // The persisted manifest (migration 0008) must match the runtime accessor field-for-field
+        // so derived vectors stay reproducible and auditable (spec §8.1).
+        let mut rows = repository
+            .connection()
+            .query(
+                "SELECT provider, model_name, revision_hash, tokenizer_revision, pooling,
+                        normalization, license, source_url, dimensions
+                 FROM embedding_model
+                 WHERE id = ? AND active = 1",
+                params![manifest.model_id],
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("active embedding model row exists");
+
+        assert_eq!(row.get::<String>(0).unwrap(), manifest.provider);
+        assert_eq!(row.get::<String>(1).unwrap(), manifest.model_name);
+        assert_eq!(row.get::<String>(2).unwrap(), manifest.revision_hash);
+        assert_eq!(row.get::<String>(3).unwrap(), manifest.tokenizer_revision);
+        assert_eq!(row.get::<String>(4).unwrap(), manifest.pooling);
+        assert_eq!(row.get::<String>(5).unwrap(), manifest.normalization);
+        assert_eq!(row.get::<String>(6).unwrap(), manifest.license);
+        assert_eq!(row.get::<String>(7).unwrap(), manifest.source_url);
+        assert_eq!(
+            row.get::<i64>(8).unwrap(),
+            i64::try_from(manifest.dimensions).unwrap()
+        );
     }
 
     #[tokio::test]

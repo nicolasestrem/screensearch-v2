@@ -7,7 +7,7 @@ This file contains decisions or external inputs that cannot be safely invented b
 | ID | Gap | Owner | Needed by | Status |
 |---|---|---|---|---|
 | GAP-001 | Select one of three product visual directions for the tray/hotkey search experience. | Product owner | Before production UI implementation | Resolved: Memory Timeline |
-| GAP-002 | Approve redistribution of the Apache-2.0 `Xenova/all-MiniLM-L6-v2` quantized ONNX files and approve the final selected GGUF generation model for release. | Product owner / legal | Before packaging model weights | Open; ignored for engineering model comparison |
+| GAP-002 | Approve redistribution of the Apache-2.0 `Xenova/all-MiniLM-L6-v2` quantized ONNX files and approve the final selected GGUF generation model for release. Also decide how the embedding revision is pinned/verified: `fastembed` downloads the repo's `main` branch unpinned, so the persisted `revision_hash` (migration 0008) is the advertised revision, not a download-verified hash. | Product owner / legal | Before packaging model weights | Open; ignored for engineering model comparison |
 | GAP-003 | Choose the release default between bundled model resources, explicit Hugging Face download, or both. | Product owner | Before release packaging | Open; engineering branch supports both acquisition paths |
 | GAP-004 | Define the default retention period or disk budget shown during first-run/settings. | Product owner | Before retention defaults ship | Resolved for P1: explicit `Keep all` / `No limit` conservative default |
 | GAP-005 | Provide Windows code-signing identity and release ownership. | Product owner | Before public distribution | Open |

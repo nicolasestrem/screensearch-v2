@@ -1794,6 +1794,8 @@ async fn main() -> anyhow::Result<()> {
     let analysis_task = tokio::spawn(analysis_loop(handler.analysis.clone(), shutdown_rx.clone()));
     let maintenance_task = tokio::spawn(maintenance_loop(
         handler.ingest.clone(),
+        handler.repository.clone(),
+        handler.assets.clone(),
         shutdown_rx.clone(),
     ));
     let idle_task = tokio::spawn(idle_unload_loop(last_generation, shutdown_rx.clone()));
@@ -1865,9 +1867,20 @@ async fn analysis_loop(analysis: Arc<AnalysisService>, mut shutdown: watch::Rece
     }
 }
 
-async fn maintenance_loop(ingest: Arc<IngestService>, mut shutdown: watch::Receiver<bool>) {
+/// Grace window before an unreferenced asset file is treated as an orphan and removed.
+const ORPHAN_ASSET_GRACE: Duration = Duration::from_secs(3600);
+/// Minimum spacing between filesystem orphan sweeps; the maintenance cadence is much finer.
+const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
+
+async fn maintenance_loop(
+    ingest: Arc<IngestService>,
+    repository: Arc<LibSqlArchive>,
+    assets: Arc<FileAssetStore>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut cadence = tokio::time::interval(Duration::from_secs(60));
     cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_orphan_sweep: Option<Instant> = None;
     loop {
         tokio::select! {
             _ = cadence.tick() => {
@@ -1882,6 +1895,26 @@ async fn maintenance_loop(ingest: Arc<IngestService>, mut shutdown: watch::Recei
                     Ok(_) => {}
                     Err(error) => warn!(error = %error, "archive retention failed"),
                 }
+                // Reconcile the filesystem against the archive: a frame whose file was written
+                // before its capture row failed to commit leaves an orphan that retention's
+                // database-driven cleanup never sees (spec §5). The full-directory walk is much
+                // coarser than the 60s retention cadence, so throttle it.
+                let sweep_due =
+                    last_orphan_sweep.is_none_or(|last| last.elapsed() >= ORPHAN_SWEEP_INTERVAL);
+                if sweep_due {
+                    match sweep_orphan_assets(&repository, &assets).await {
+                        Ok(removed) => {
+                            if removed > 0 {
+                                info!(
+                                    orphan_assets_removed = removed,
+                                    "orphan asset sweep completed"
+                                );
+                            }
+                            last_orphan_sweep = Some(Instant::now());
+                        }
+                        Err(error) => warn!(error = %error, "orphan asset sweep failed"),
+                    }
+                }
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1890,6 +1923,29 @@ async fn maintenance_loop(ingest: Arc<IngestService>, mut shutdown: watch::Recei
             }
         }
     }
+}
+
+async fn sweep_orphan_assets(
+    repository: &LibSqlArchive,
+    assets: &FileAssetStore,
+) -> Result<u64, PortError> {
+    // Walk the filesystem first so the in-memory working set is bounded by the number of aged-out
+    // candidate files (orphans are rare in a healthy archive), not the total asset count.
+    let candidates = assets.collect_orphan_candidates(ORPHAN_ASSET_GRACE).await?;
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let hashes: Vec<String> = candidates
+        .iter()
+        .map(|candidate| candidate.content_hash.clone())
+        .collect();
+    let referenced = repository.referenced_asset_hashes_among(&hashes).await?;
+    let orphans: Vec<PathBuf> = candidates
+        .into_iter()
+        .filter(|candidate| !referenced.contains(&candidate.content_hash))
+        .map(|candidate| candidate.path)
+        .collect();
+    assets.remove_files(&orphans).await
 }
 
 #[cfg(test)]

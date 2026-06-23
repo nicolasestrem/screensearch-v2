@@ -2,6 +2,41 @@
 
 This log records meaningful AI-assisted repository changes and their reasons. It is not a substitute for Git history.
 
+## 2026-06-23 — Phase 0→1 review remediation
+
+### Changed
+
+- **F1 — retry backoff jitter (spec §6).** Replaced the deterministic `2^min(attempt,8)` backoff with bounded "equal jitter" (`base/2 + (hash(job id, attempt) mod (base/2 + 1))`), keeping the exponential cap and a ≥1s floor. The offset is derived from BLAKE3 so it is reproducible (testable) and needs no runtime RNG dependency.
+- **F4 — OCR text normalization (spec §7.2).** `WindowsOcrEngine` now collapses CR/CRLF to LF and applies Unicode NFC to each block's text before persistence, so stored OCR text, FTS terms, and chunk embeddings share one canonical representation. Added a pure `normalize_ocr_text` helper + unit test (`unicode-normalization` dependency).
+- Refactored the libSQL migration runner into a single `apply_migration_if_absent` versioned-gate helper (also keeps `migrate()` under the clippy line limit) while adding migration `0008`.
+
+### Added
+
+- **F3 — embedding manifest (spec §8.1).** Migration `0008_embedding_model_manifest.sql` adds nullable manifest columns to `embedding_model` and records the active MiniLM revision (`751bff37…`), tokenizer revision, mean pooling, L2 normalization, Apache-2.0 license, and source URL. `FastEmbedEngine::manifest()` single-sources the same values and now backs `model_id()`/`dimensions()`; a persistence test asserts the DB row matches the runtime manifest field-for-field.
+- **F6 — missing §18 integration tests.** Added expired-lease recovery, end-to-end queue saturation/backpressure resume (through `IngestService` against a real archive), and capture-commit orphan handling.
+- **F6 orphan handling (spec §5).** Added `FileAssetStore::sweep_orphans` + `LibSqlArchive::referenced_asset_hashes`, wired into the daemon maintenance loop with a one-hour grace window. A frame whose asset file was written before its capture row failed to commit is now reconciled and removed; referenced and recently written files are never deleted. The sweep stays inside the content-addressed asset root, so it cannot touch the database or model files.
+
+### Why
+
+A scrupulous review of the completed P0 (truthful evidence loop) and P1 (semantic retrieval & scale) phases against `03_MASTER_PRODUCTION_SPEC.md` found the implementation faithful overall, with a few literal spec deviations (no backoff jitter, no OCR normalization, an incomplete embedding manifest), three §18-required integration tests absent, and the §5 file-orphan cleanup unimplemented. These are the low-risk, in-scope fixes; capture-side locked-session privacy (F5) remains a disclosed item-18 deferral, and the fixed/non-renewable analysis lease (F2) plus the diagnostic `processJobs` surface (F7) are recorded findings left out of this pass.
+
+### Verification
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` — all pass (persistence 23, model-runtime 24, windows 5; gated suites remain `#[ignore]`d).
+
+### PR #14 review follow-up
+
+Addressed the Claude / Codex / Gemini review comments on the remediation PR:
+
+- **Orphan sweep hardened.** Reworked the sweep to be candidate-first: `FileAssetStore::collect_orphan_candidates` walks the asset root, skips symlinked shards/files via `DirEntry::file_type` (root-confinement, per Codex), tolerates entries that vanish mid-walk (per Gemini/Claude), and returns only aged-out files; `LibSqlArchive::referenced_asset_hashes_among` then checks just those hashes in bounded `IN (...)` batches instead of loading every asset hash into memory (per Claude's 10M-scale note). `remove_files` skips locked/missing files instead of aborting the sweep.
+- **Capture/sweep race closed.** `FileAssetStore::put` now refreshes a reused file's modification time, so a re-captured orphan is protected by the grace window until its new capture row commits (Codex P2). Added a regression test.
+- **Sweep throttled** to once per hour in the maintenance loop rather than every 60 s tick (Gemini).
+- **Embedding manifest provenance clarified** (Codex P1): documented in the manifest type, migration `0008`, and GAP-002 that `revision_hash` is the *advertised* upstream revision — `fastembed` downloads `Xenova/all-MiniLM-L6-v2`'s `main` branch unpinned, so within-archive isolation is enforced by `model_id` while hard pinning/verification is a model-acquisition decision (GAP-002/GAP-003). Noted that `revision_hash` and `tokenizer_revision` coincide for MiniLM (Claude nit).
+
+### Why
+
+The review surfaced one P1 (manifest could over-claim a download-verified revision), two P2s (a narrow capture/sweep race and a symlink root-confinement gap), and scalability/resilience notes on the orphan sweep. All are addressed in code except the model-acquisition decision behind the P1, which is correctly owned by GAP-002/GAP-003.
+
 ## 2026-06-22 — PR #12 review follow-up
 
 ### Changed

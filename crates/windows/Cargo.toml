@@ -13,6 +13,7 @@ image.workspace = true
 screensearch-domain = { path = "../domain" }
 screensearch-ports = { path = "../ports" }
 tokio.workspace = true
+unicode-normalization.workspace = true
 windows.workspace = true
 xcap.workspace = true
 
