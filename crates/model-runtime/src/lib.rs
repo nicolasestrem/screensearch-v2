@@ -103,17 +103,27 @@ impl EmbeddingEngine for FakeEmbeddingEngine {
 /// The same values are persisted by persistence migration `0008_embedding_model_manifest.sql`, so
 /// the runtime and the archive agree on the model revision, tokenizer, pooling, normalization,
 /// license, and source. This keeps derived vectors reproducible and auditable.
+///
+/// **Within-archive isolation** (ADR 0002) is enforced by [`Self::model_id`], which is stamped on
+/// every derived row and filtered on every query — those weights never mix inside one archive.
+/// [`Self::revision_hash`] records the *advertised* upstream revision: `fastembed` resolves the
+/// model by its built-in `Xenova/all-MiniLM-L6-v2` identity and downloads the repo's `main`
+/// revision without pinning a commit, so a cold install could fetch newer upstream weights under
+/// the same `model_id`. Hard revision pinning or artifact-hash verification is a model-acquisition
+/// decision tracked under GAP-002 / GAP-003, not enforced here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EmbeddingManifest {
     /// Distributing project / runtime.
     pub provider: &'static str,
     /// Human-readable model name.
     pub model_name: &'static str,
-    /// Active model revision id persisted on every derived row.
+    /// Active model revision id persisted on every derived row; the enforced isolation key.
     pub model_id: &'static str,
-    /// Upstream weight revision hash.
+    /// Advertised upstream weight revision (see type docs — not download-pinned).
     pub revision_hash: &'static str,
-    /// Tokenizer revision hash.
+    /// Tokenizer revision hash. Coincides with `revision_hash` for MiniLM-L6-v2 (the tokenizer
+    /// config lives in the same Hugging Face repo revision); kept separate for models where it may
+    /// differ.
     pub tokenizer_revision: &'static str,
     /// Output vector dimensionality.
     pub dimensions: usize,

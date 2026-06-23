@@ -24,6 +24,19 @@ A scrupulous review of the completed P0 (truthful evidence loop) and P1 (semanti
 
 - `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` — all pass (persistence 23, model-runtime 24, windows 5; gated suites remain `#[ignore]`d).
 
+### PR #14 review follow-up
+
+Addressed the Claude / Codex / Gemini review comments on the remediation PR:
+
+- **Orphan sweep hardened.** Reworked the sweep to be candidate-first: `FileAssetStore::collect_orphan_candidates` walks the asset root, skips symlinked shards/files via `DirEntry::file_type` (root-confinement, per Codex), tolerates entries that vanish mid-walk (per Gemini/Claude), and returns only aged-out files; `LibSqlArchive::referenced_asset_hashes_among` then checks just those hashes in bounded `IN (...)` batches instead of loading every asset hash into memory (per Claude's 10M-scale note). `remove_files` skips locked/missing files instead of aborting the sweep.
+- **Capture/sweep race closed.** `FileAssetStore::put` now refreshes a reused file's modification time, so a re-captured orphan is protected by the grace window until its new capture row commits (Codex P2). Added a regression test.
+- **Sweep throttled** to once per hour in the maintenance loop rather than every 60 s tick (Gemini).
+- **Embedding manifest provenance clarified** (Codex P1): documented in the manifest type, migration `0008`, and GAP-002 that `revision_hash` is the *advertised* upstream revision — `fastembed` downloads `Xenova/all-MiniLM-L6-v2`'s `main` branch unpinned, so within-archive isolation is enforced by `model_id` while hard pinning/verification is a model-acquisition decision (GAP-002/GAP-003). Noted that `revision_hash` and `tokenizer_revision` coincide for MiniLM (Claude nit).
+
+### Why
+
+The review surfaced one P1 (manifest could over-claim a download-verified revision), two P2s (a narrow capture/sweep race and a symlink root-confinement gap), and scalability/resilience notes on the orphan sweep. All are addressed in code except the model-acquisition decision behind the P1, which is correctly owned by GAP-002/GAP-003.
+
 ## 2026-06-22 — PR #12 review follow-up
 
 ### Changed

@@ -34,6 +34,8 @@ const MIGRATION_0007: &str = include_str!("../migrations/0007_guarded_automation
 const MIGRATION_0008: &str = include_str!("../migrations/0008_embedding_model_manifest.sql");
 const MAX_JOB_ATTEMPTS: u32 = 5;
 const BRUTE_FORCE_VECTOR_THRESHOLD: u64 = 50_000;
+/// Maximum content hashes bound into one `IN (...)` orphan-reconciliation query.
+const ASSET_HASH_QUERY_BATCH: usize = 500;
 
 /// Content-addressed asset storage using atomic file replacement.
 #[derive(Clone, Debug)]
@@ -62,38 +64,57 @@ impl FileAssetStore {
         Ok(self.root.join(relative))
     }
 
-    /// Removes asset files that have no database record and are older than `grace`.
+    /// Collects asset files older than `grace` that may be orphans, pending a database cross-check.
     ///
-    /// Implements the spec §5 orphan-cleanup allowance: a frame whose file was written before its
-    /// capture row failed to commit (or a stale write-temp from an interrupted `put`) leaves an
-    /// unreferenced file behind. The grace window protects files that may still be mid-commit, and
-    /// the `referenced` content-hash set guarantees a live asset is never deleted. The sweep stays
-    /// inside the content-addressed asset root, so it never touches the database or model files.
-    /// Returns the number of files removed.
-    pub async fn sweep_orphans(
+    /// Implements the discovery half of the spec §5 orphan-cleanup allowance: a frame whose file was
+    /// written before its capture row failed to commit (or a stale write-temp from an interrupted
+    /// `put`) leaves an unreferenced file behind. The grace window protects files that may still be
+    /// mid-commit, and a reused file's modification time is refreshed by `put`, so a file in flight
+    /// is never collected. Only the shard directories under the asset root are walked; symlinked
+    /// shards and files are skipped via `DirEntry::file_type` (which does not follow links), so the
+    /// sweep can never escape the asset root onto the database or model files. Entries that vanish or
+    /// error mid-walk are skipped rather than aborting the sweep, since a concurrent capture or
+    /// retention pass can race directory listing. Returned candidates carry the BLAKE3 hash parsed
+    /// from each file name; the caller must drop any hash still referenced by the archive (see
+    /// `LibSqlArchive::referenced_asset_hashes_among`) before deleting. Inspecting only aged-out
+    /// files keeps memory bounded by the orphan count rather than the whole archive.
+    pub async fn collect_orphan_candidates(
         &self,
-        referenced: &HashSet<String>,
         grace: StdDuration,
-    ) -> Result<u64, PortError> {
+    ) -> Result<Vec<OrphanCandidate>, PortError> {
         let now = SystemTime::now();
-        let mut removed = 0_u64;
+        let mut candidates = Vec::new();
         let mut shards = match fs::read_dir(&self.root).await {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidates),
             Err(error) => return Err(io_error(error)),
         };
         while let Some(shard) = shards.next_entry().await.map_err(io_error)? {
-            let shard_path = shard.path();
-            if !fs::metadata(&shard_path).await.map_err(io_error)?.is_dir() {
-                continue;
+            // `file_type` does not follow symlinks, so a symlinked shard is not a directory here and
+            // is skipped — the walk never descends outside the asset root.
+            match shard.file_type().await {
+                Ok(file_type) if file_type.is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(io_error(error)),
             }
-            let mut files = fs::read_dir(&shard_path).await.map_err(io_error)?;
+            let mut files = match fs::read_dir(shard.path()).await {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(io_error(error)),
+            };
             while let Some(file) = files.next_entry().await.map_err(io_error)? {
-                let path = file.path();
-                let metadata = fs::metadata(&path).await.map_err(io_error)?;
-                if !metadata.is_file() {
-                    continue;
+                match file.file_type().await {
+                    Ok(file_type) if file_type.is_file() => {}
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(io_error(error)),
                 }
+                let metadata = match file.metadata().await {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(io_error(error)),
+                };
                 // Skip anything younger than the grace window so an in-flight write is never raced.
                 let aged_out = metadata
                     .modified()
@@ -103,19 +124,43 @@ impl FileAssetStore {
                 if !aged_out {
                     continue;
                 }
-                let stem = path
+                let path = file.path();
+                let Some(content_hash) = path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
-                    .unwrap_or_default();
-                if referenced.contains(stem) {
+                    .map(str::to_owned)
+                else {
                     continue;
-                }
-                fs::remove_file(&path).await.map_err(io_error)?;
+                };
+                candidates.push(OrphanCandidate { path, content_hash });
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Removes the supplied orphan files, tolerating entries that already vanished.
+    ///
+    /// Callers pass only paths whose content hash is unreferenced by the archive. A file that is
+    /// missing or briefly inaccessible is skipped so a single locked entry never blocks the rest of
+    /// the sweep; the next maintenance pass retries. Returns the number of files actually removed.
+    pub async fn remove_files(&self, paths: &[PathBuf]) -> Result<u64, PortError> {
+        let mut removed = 0_u64;
+        for path in paths {
+            if fs::remove_file(path).await.is_ok() {
                 removed += 1;
             }
         }
         Ok(removed)
     }
+}
+
+/// An asset file with no obvious owner, awaiting a database cross-check before deletion.
+#[derive(Clone, Debug)]
+pub struct OrphanCandidate {
+    /// Absolute path to the candidate file.
+    pub path: PathBuf,
+    /// BLAKE3 content hash parsed from the file name.
+    pub content_hash: String,
 }
 
 #[async_trait]
@@ -132,7 +177,12 @@ impl AssetStore for FileAssetStore {
         let target = self.root.join(&relative_path);
         fs::create_dir_all(&directory).await.map_err(io_error)?;
 
-        if !fs::try_exists(&target).await.map_err(io_error)? {
+        if fs::try_exists(&target).await.map_err(io_error)? {
+            // The bytes are already stored. Refresh the modification time so a reused file — e.g.
+            // re-captured bytes whose previous capture failed to commit — is protected by the
+            // orphan-sweep grace window until this capture's row commits.
+            refresh_modified_time(&target).await?;
+        } else {
             let temporary = directory.join(format!(".{}.{}.tmp", content_hash, Uuid::now_v7()));
             fs::write(&temporary, bytes).await.map_err(io_error)?;
             if let Err(error) = fs::rename(&temporary, &target).await {
@@ -216,21 +266,31 @@ impl LibSqlArchive {
         Ok(())
     }
 
-    /// Returns the content hashes still recorded in the asset table.
+    /// Returns which of the supplied content hashes are still recorded in the asset table.
     ///
-    /// Orphan cleanup uses this to tell files that back a live asset row apart from files left
-    /// behind by a capture whose database commit never landed.
-    pub async fn referenced_asset_hashes(&self) -> Result<HashSet<String>, PortError> {
-        let mut rows = self
-            .connection()
-            .query("SELECT content_hash FROM asset", ())
-            .await
-            .map_err(database_error)?;
-        let mut hashes = HashSet::new();
-        while let Some(row) = rows.next().await.map_err(database_error)? {
-            hashes.insert(row.get::<String>(0).map_err(database_error)?);
+    /// Orphan cleanup passes the hashes parsed from aged-out asset files and deletes only those the
+    /// archive no longer references. Querying by candidate (in bounded batches) keeps memory and the
+    /// query proportional to the orphan count rather than the whole archive, which matters at the
+    /// spec's ten-million-capture scale.
+    pub async fn referenced_asset_hashes_among(
+        &self,
+        hashes: &[String],
+    ) -> Result<HashSet<String>, PortError> {
+        let mut referenced = HashSet::new();
+        for chunk in hashes.chunks(ASSET_HASH_QUERY_BATCH) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql =
+                format!("SELECT content_hash FROM asset WHERE content_hash IN ({placeholders})");
+            let mut rows = self
+                .connection()
+                .query(&sql, params_from_iter(chunk.iter().cloned()))
+                .await
+                .map_err(database_error)?;
+            while let Some(row) = rows.next().await.map_err(database_error)? {
+                referenced.insert(row.get::<String>(0).map_err(database_error)?);
+            }
         }
-        Ok(hashes)
+        Ok(referenced)
     }
 
     /// Seeds capture metadata without image assets for the explicit scale benchmark.
@@ -2149,6 +2209,23 @@ fn io_error(error: std::io::Error) -> PortError {
     PortError::Internal(format!("asset storage: {error}"))
 }
 
+/// Refreshes a file's modification time to now.
+///
+/// `put` calls this when it reuses an already-stored content-addressed file so the orphan-sweep
+/// grace window protects the file until the new capture row commits.
+async fn refresh_modified_time(path: &Path) -> Result<(), PortError> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await
+        .map_err(io_error)?;
+    file.into_std()
+        .await
+        .set_modified(SystemTime::now())
+        .map_err(io_error)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2331,13 +2408,27 @@ mod tests {
             .unwrap();
         assert!(store.resolve(&orphan_asset).unwrap().exists());
 
-        // The daemon's orphan reconciliation: live hashes from the archive + a zero-grace sweep.
-        let referenced = repository.referenced_asset_hashes().await.unwrap();
-        assert!(referenced.contains(&referenced_asset.content_hash));
-        let removed = store
-            .sweep_orphans(&referenced, std::time::Duration::ZERO)
+        // The daemon's reconciliation: collect aged candidates, ask the archive which are still
+        // referenced, then delete only the rest.
+        let candidates = store
+            .collect_orphan_candidates(std::time::Duration::ZERO)
             .await
             .unwrap();
+        let hashes: Vec<String> = candidates.iter().map(|c| c.content_hash.clone()).collect();
+        assert!(hashes.contains(&referenced_asset.content_hash));
+        assert!(hashes.contains(&orphan_asset.content_hash));
+        let referenced = repository
+            .referenced_asset_hashes_among(&hashes)
+            .await
+            .unwrap();
+        assert!(referenced.contains(&referenced_asset.content_hash));
+        assert!(!referenced.contains(&orphan_asset.content_hash));
+        let orphan_paths: Vec<_> = candidates
+            .into_iter()
+            .filter(|candidate| !referenced.contains(&candidate.content_hash))
+            .map(|candidate| candidate.path)
+            .collect();
+        let removed = store.remove_files(&orphan_paths).await.unwrap();
 
         assert_eq!(removed, 1);
         assert!(store.resolve(&referenced_asset).unwrap().exists());
@@ -2350,21 +2441,52 @@ mod tests {
         let store = FileAssetStore::new(directory.path());
 
         // A freshly written, unreferenced file may still belong to an in-flight capture, so a
-        // non-zero grace window must leave it in place.
+        // non-zero grace window must not even surface it as a candidate.
         let recent = store
             .put(b"recent-unreferenced", "image/png")
             .await
             .unwrap();
-        let removed = store
-            .sweep_orphans(
-                &std::collections::HashSet::new(),
-                std::time::Duration::from_secs(3600),
-            )
+        let candidates = store
+            .collect_orphan_candidates(std::time::Duration::from_secs(3600))
             .await
             .unwrap();
 
-        assert_eq!(removed, 0);
+        assert!(candidates.is_empty());
         assert!(store.resolve(&recent).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn reused_asset_file_is_protected_by_a_refreshed_mtime() {
+        let directory = TempDir::new().unwrap();
+        let store = FileAssetStore::new(directory.path());
+
+        // An orphan file from a previous failed commit, aged well past the grace window.
+        let bytes = b"reused-content-addressed-bytes";
+        let asset = store.put(bytes, "image/png").await.unwrap();
+        let path = store.resolve(&asset).unwrap();
+        let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(aged)
+            .unwrap();
+
+        // Re-capturing the same bytes reuses the file; `put` must refresh its mtime so the grace
+        // window protects it until the new capture row commits (closes the put/enqueue race).
+        store.put(bytes, "image/png").await.unwrap();
+        let candidates = store
+            .collect_orphan_candidates(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.content_hash != asset.content_hash),
+            "a reused asset file must not be an orphan candidate within the grace window"
+        );
+        assert!(store.resolve(&asset).unwrap().exists());
     }
 
     fn capture(index: u32, age_days: i64, byte_length: u64) -> NewCapture {
