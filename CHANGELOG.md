@@ -38,6 +38,8 @@
 - Fixed OCR highlight overlays drifting off the screenshot text whenever a capture's aspect ratio differed from the inspector box (ultrawide, portrait/rotated monitors, or when the `max-height` clamp engaged): overlays are now measured against the actually-rendered `object-fit: contain` image rectangle (via a `ResizeObserver`) instead of the letterboxed container, in both the timeline thumbnail and the large detail view.
 - Fixed the guarded-automation dialog not trapping `Tab`/`Shift+Tab` focus (the settings dialog already did), and stopped `Home`/`End` from also moving the evidence timeline while a detail tab is focused; the dialog focus trap is now a single shared hook used by both dialogs.
 
+- Replaced the desktop preview/QA capture asset with a committed, self-contained synthetic SVG fixture so browser QA exercises overlay alignment on any clone without depending on a gitignored real screen capture, and hardened the dialog focus trap (filters non-focusable/hidden/non-rendered elements, traps `<summary>`, recovers escaped focus).
+
 ### Documentation
 
 - Recorded the P2 OCR-overlay alignment defect (missed by the original visual QA, which exercised synthetic bounds over blank space) and its fix in `docs/design/p2-shell.md`, including a new non-16:9 / portrait overlay-alignment check in the manual Windows runbook.

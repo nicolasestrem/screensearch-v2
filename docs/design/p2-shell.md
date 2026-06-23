@@ -155,11 +155,12 @@ preview drew **synthetic bounds over blank space** rather than over real OCR'd t
 
 The overlays are now measured against the actually-rendered image rectangle (`useContainedRect`:
 `useLayoutEffect` + `ResizeObserver` + `object-fit: contain` math) and positioned in pixels, in
-both the timeline thumbnail and the large detail view. The preview fixture (`api.ts`) now declares
-the true `qa-capture.png` dimensions (2600×1088) with bounds over real on-screen text, so browser
-QA exercises alignment. Verified with Playwright against the dev server: in the large detail view
-the box clamped to aspect 2.046 against the 2.39 fixture applies a 31.6 px top letterbox and the
-overlays land on the text; the thumbnail applies an 8.64 px letterbox; both track across window
+both the timeline thumbnail and the large detail view. The preview asset (`api.ts`) is a committed,
+self-contained synthetic SVG fixture (2600×1088 ultrawide, with text drawn under the citation
+bounds) rather than a gitignored real capture, so browser QA exercises alignment on any clone
+without shipping screen data. Verified with Playwright against the dev server: in the large detail
+view the box clamped to aspect 2.046 against the 2.39 fixture applies a 31.6 px top letterbox and
+the overlays land on the text; the thumbnail applies an 8.64 px letterbox; both track across window
 resizes.
 
 ### Manual Windows end-to-end runbook (required to close item 14)

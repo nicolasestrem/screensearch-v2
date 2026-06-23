@@ -596,6 +596,8 @@ function useContainedRect(
     // clientWidth/Height is the content box (excludes the 1px border, padding is 0).
     measure(element.clientWidth, element.clientHeight);
     return () => observer.disconnect();
+    // `ref` has a stable identity, so it never triggers a re-run on its own (it satisfies
+    // exhaustive-deps); the effect re-measures when the capture's natural dimensions change.
   }, [ref, naturalWidth, naturalHeight]);
   return rect;
 }
@@ -668,24 +670,33 @@ function useDialogFocusTrap(ref: RefObject<HTMLElement | null>) {
   useEffect(() => {
     const root = ref.current;
     if (!root) return;
-    const selector = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
-    const focusable = () => [...root.querySelectorAll<HTMLElement>(selector)]
-      .filter((element) => !element.hasAttribute("disabled"));
+    const selector = 'a[href], button, input, select, textarea, summary, [tabindex]';
+    // Keep only elements that can actually receive Tab focus: enabled, not tabindex="-1", not a
+    // hidden input, and currently rendered (display:none elements report no client rects).
+    const focusable = () => [...root.querySelectorAll<HTMLElement>(selector)].filter((element) =>
+      !element.hasAttribute("disabled")
+      && element.tabIndex !== -1
+      && (element as HTMLInputElement).type !== "hidden"
+      && element.getClientRects().length > 0);
     focusable()[0]?.focus();
-    function trap(event: KeyboardEvent) {
+    const trap = (event: KeyboardEvent) => {
       if (event.key !== "Tab") return;
       const items = focusable();
       if (!items.length) return;
       const first = items[0];
       const last = items[items.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
+      if (!root.contains(document.activeElement)) {
+        // Focus escaped the dialog; pull it back rather than letting Tab leave.
+        event.preventDefault();
+        first.focus();
+      } else if (event.shiftKey && document.activeElement === first) {
         event.preventDefault();
         last.focus();
       } else if (!event.shiftKey && document.activeElement === last) {
         event.preventDefault();
         first.focus();
       }
-    }
+    };
     root.addEventListener("keydown", trap);
     return () => root.removeEventListener("keydown", trap);
   }, [ref]);

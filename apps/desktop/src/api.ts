@@ -178,11 +178,10 @@ function previewCitation(
     capturedAt: new Date(Date.now() - hoursAgo * 3_600_000).toISOString(),
     application,
     windowTitle: title,
-    // The preview fixture (public/qa-capture.png) is a real 2600×1088 ultrawide capture.
-    // Declaring its true dimensions and placing bounds over actual on-screen text makes the
-    // dev-server / browser QA exercise OCR-overlay alignment: the CSS boxes are 16:9 (thumbnail)
-    // and ~16:8.1 (large), so this ultrawide image is letterboxed and overlays must track the
-    // rendered image rect, not the container box.
+    // The preview asset is a synthetic 2600×1088 ultrawide SVG fixture (see previewCaptureSvg),
+    // not a real capture. Its CSS boxes are 16:9 (thumbnail) and ~16:8.1 (large), so the ultrawide
+    // image is letterboxed and overlays must track the rendered image rect, not the container box.
+    // These bounds frame the text drawn in that fixture so browser QA verifies real alignment.
     width: 2600,
     height: 1088,
     bounds: [
@@ -194,6 +193,23 @@ function previewCitation(
     ocrModelId: "windows-media-ocr",
     embeddingModelId: "fastembed-all-minilm-l6-v2-q-384-v1",
   };
+}
+
+// A synthetic, self-contained 2600×1088 ultrawide fixture used only in browser/preview mode. It
+// replaces a real screen capture (those are gitignored and never shipped), so preview/QA never
+// 404s and the text is drawn under previewCitation's bounds to make OCR-overlay alignment visible.
+function previewCaptureSvg(): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="2600" height="1088" viewBox="0 0 2600 1088">
+  <rect width="2600" height="1088" fill="#0d0e0e"/>
+  <rect x="380" y="70" width="560" height="948" fill="#161717"/>
+  <rect x="1600" y="70" width="640" height="948" fill="#161717"/>
+  <text x="415" y="113" font-family="Segoe UI, Arial, sans-serif" font-size="22" fill="#e6e5df">Note Summary</text>
+  <text x="415" y="180" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#b5b4af">ScreenSearch captured live screenshots and ran</text>
+  <text x="415" y="206" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#b5b4af">durable OCR jobs over the focused monitor, then</text>
+  <text x="415" y="232" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#b5b4af">returned positioned text evidence for private</text>
+  <text x="415" y="258" font-family="Segoe UI, Arial, sans-serif" font-size="18" fill="#b5b4af">recall, fully offline on this device.</text>
+  <text x="1635" y="134" font-family="Segoe UI, Arial, sans-serif" font-size="24" fill="#e6e5df">Usage &amp; Limitations</text>
+</svg>`;
 }
 
 const previewCitations = [
@@ -229,8 +245,10 @@ export const api = {
   processJobs: (maximum = 10) => invoke<number>("process_jobs", { maximum }),
   captureAsset: async (captureId: string) => {
     if (isTauri) return invoke<CaptureAsset>("capture_asset", { captureId });
-    const content = [...new Uint8Array(await (await fetch("/qa-capture.png")).arrayBuffer())];
-    return { mediaType: "image/png", content };
+    // Self-contained synthetic fixture: no dependency on a gitignored real capture, so preview
+    // and browser QA never 404 and overlay alignment is verifiable on any clone.
+    const content = [...new TextEncoder().encode(previewCaptureSvg())];
+    return { mediaType: "image/svg+xml", content };
   },
   setCapturePaused: async (paused: boolean) => {
     if (isTauri) return invoke<boolean>("set_capture_paused", { paused });
