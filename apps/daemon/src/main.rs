@@ -267,10 +267,15 @@ impl TextGenerator for WorkerModelClient {
                 ))));
             }
         });
+        let last_generation = Arc::clone(&self.last_generation);
         Ok(Box::pin(try_stream! {
+            // Keep the idle clock fresh while tokens stream and once generation finishes, so the
+            // idle-timeout unload measures from the end of activity rather than its start.
             while let Some(token) = receive.recv().await {
+                last_generation.store(now_millis(), Ordering::Relaxed);
                 yield token?;
             }
+            last_generation.store(now_millis(), Ordering::Relaxed);
         }))
     }
 }
@@ -401,10 +406,15 @@ async fn idle_unload_loop(last_generation: Arc<AtomicU64>, mut shutdown: watch::
                     continue;
                 }
                 let idle_elapsed_millis = now_millis().saturating_sub(last);
-                let low_memory = memory_monitor
-                    .as_ref()
-                    .and_then(|monitor| monitor.is_low_memory().ok())
-                    .unwrap_or(false);
+                let low_memory = memory_monitor.as_ref().is_some_and(|monitor| {
+                    match monitor.is_low_memory() {
+                        Ok(low) => low,
+                        Err(error) => {
+                            warn!(error = %error, "memory-pressure query failed; treating as no pressure");
+                            false
+                        }
+                    }
+                });
                 // Avoid an IPC round trip when neither condition can fire this tick.
                 if !low_memory && idle_elapsed_millis < idle_timeout_millis {
                     continue;

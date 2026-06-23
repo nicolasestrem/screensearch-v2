@@ -19,6 +19,18 @@ A scrupulous Phase 3 ("constrained synthesis") review found the generation plumb
 - `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` — see the PR for verbatim output.
 - The live Windows memory-pressure probe (`cargo test -p screensearch-windows -- --ignored`) and the full GUI paths remain user-attested (they cannot run in CI).
 
+### PR #16 review follow-ups
+
+Addressed the Claude / Codex / Gemini review comments on the PR:
+
+- **Chat-template special-token escaping (Codex P2 — the important one).** `sanitize_untrusted_field` defanged newlines and `[`/`]` but left model special-token delimiters such as `<|im_end|><|im_start|>system` intact; the llama.cpp path tokenizes the assembled prompt with `parse_special = true` (`str_to_token`, `crates/model-runtime/src/lib.rs`), so captured text could be read as role/control tokens. The sanitizer now inserts a zero-width space after every `<`, breaking `<|…|>` / `<…>` special-token strings while preserving the visible characters. Covered by `sanitize_untrusted_field_breaks_chat_template_delimiters` and an extended `prompt_neutralizes_adversarial_metadata`.
+- **Observability of memory-pressure queries (Gemini + Claude).** `idle_unload_loop` previously discarded `is_low_memory()` errors with `.ok()`, so a permanently-broken `QueryMemoryResourceNotification` would silently disable the feature. It now logs a `warn!` on query failure and still falls back to "no pressure."
+- **Idle clock measured from generation start (Gemini).** `WorkerModelClient::generate` stamped `last_generation` only at the start of a request, so a long generation shortened the effective idle window. It now also refreshes the timestamp as tokens stream and once the stream completes, so the idle-timeout unload measures from the end of activity.
+- **Allocation in the sanitizer (Gemini).** Rewrote `sanitize_untrusted_field` as a single pass with one `String` allocation instead of an intermediate `String` plus a `Vec<&str>` join.
+- **Unicode bidi/format overrides (Claude, non-blocking).** Documented as a known limitation in the helper's doc comment: characters like U+202E are not neutralized because they do not change a local model's token-level reading; tracked under GAP-011 as display-hardening.
+
+Verified after the follow-ups: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (123 passed, 0 failed, 10 ignored gated) — all clean.
+
 ## 2026-06-23 — P2 product-shell review remediation
 
 ### Fixed
