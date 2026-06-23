@@ -1,6 +1,6 @@
 # ScreenSearch V2 Known Gaps
 
-Last updated: 2026-06-22
+Last updated: 2026-06-23
 
 This file contains decisions or external inputs that cannot be safely invented by an implementation agent.
 
@@ -13,10 +13,10 @@ This file contains decisions or external inputs that cannot be safely invented b
 | GAP-005 | Provide Windows code-signing identity and release ownership. | Product owner | Before public distribution | Open |
 | GAP-006 | Decide whether guarded automation belongs in the first public release or remains feature-disabled. | Product owner | Before release scope freeze | Resolved: included behind explicit default-off opt-in |
 | GAP-007 | Name the reference Windows hardware profile for latency and resource budgets. | Product owner / engineering | Before performance acceptance | Resolved for P1 engineering baseline: Ryzen 7 7800X3D, 32 GB RAM, Kingston NVMe, Windows 11 Pro |
-| GAP-008 | Choose the Windows memory-pressure signal that triggers an early generation-model unload (e.g. a memory-resource-notification or working-set threshold) and its policy. | Engineering | Before item 15 closes | Open; idle-timeout unload is implemented, the memory-pressure path is deferred |
+| GAP-008 | Choose the Windows memory-pressure signal that triggers an early generation-model unload (e.g. a memory-resource-notification or working-set threshold) and its policy. | Engineering | Before item 15 closes | Resolved: idle-timeout and OS low-memory-notification unload implemented (`MemoryPressureMonitor` over `CreateMemoryResourceNotification`; policy unit-tested as `should_unload_generation`); the live pressure path is pending manual Windows attestation |
 | GAP-009 | Expand the deterministic source-hint vocabulary beyond Telegram, GitHub, Codex, and Amazon without turning source extraction into model inference. | Engineering | Before broad app-specific answer planning | Open; current planner intentionally covers the four acceptance prompts |
 | GAP-010 | Carry the user-facing timezone/clock basis through `SearchRequest` instead of relying on the daemon's local clock. | Engineering | Before any split-user, VM, or remote-daemon deployment | Open; current supported topology is one Windows user session on one machine |
-| GAP-011 | Further harden generated-answer prompts against adversarial application/window-title metadata beyond the current untrusted-evidence instruction. | Engineering / security | Before release security review | Open; OCR and metadata are treated as untrusted in the prompt, but metadata escaping/audit is still a hardening task |
+| GAP-011 | Further harden generated-answer prompts against adversarial application/window-title metadata beyond the current untrusted-evidence instruction. | Engineering / security | Before release security review | Resolved: untrusted application/window-title/OCR metadata is structurally escaped before the prompt (control characters collapsed, `[`/`]` defanged) via `sanitize_untrusted_field`, covered by `prompt_neutralizes_adversarial_metadata`; deeper telemetry/audit remains optional |
 
 ## Current safe assumptions
 
@@ -25,7 +25,7 @@ This file contains decisions or external inputs that cannot be safely invented b
 - The legacy GGUF adapter path `models/generator/model.gguf` remains a compatibility fallback. New engineering work uses the generation-model catalog below the app data model root, with explicit local import or Hugging Face download.
 - Evidence-only search remains fully usable when generation models are absent.
 - Useful local-answer planning is deterministic and uses captured screenshot/OCR evidence only: relative time phrases use the Windows local clock, source/time filters apply before ranking, and the UI shows the interpreted plan/timezone. This does not close release model approval or qualitative answer scoring.
-- The model worker is daemon-supervised and live-validated with local GGUF candidates: crashes trigger sliding-window bounded restarts, a parent lifeline pipe ties the worker's lifetime to the daemon, and the resident generation model unloads after an idle timeout (a code constant) while keeping the catalog selection for lazy reload. Memory-pressure-triggered unload is deferred to GAP-008.
+- The model worker is daemon-supervised and live-validated with local GGUF candidates: crashes trigger sliding-window bounded restarts, a parent lifeline pipe ties the worker's lifetime to the daemon, and the resident generation model unloads after an idle timeout (a code constant) or when Windows raises a low-memory resource notification, while keeping the catalog selection for lazy reload. The live memory-pressure path is pending manual Windows attestation (GAP-008).
 - GGUF generation can use opt-in Vulkan GPU offload in the model worker. The runtime asks llama.cpp whether offload is supported and otherwise uses CPU; release packaging still needs the final model/acquisition decision in GAP-002/GAP-003.
 - Guarded automation is included only behind explicit default-off opt-in. It is manual, keeps persistence/audit records content-free, requires a live abort heartbeat and exact target/plan approval, and never accepts model-generated plans, mouse coordinates, clipboard actions, shell commands, elevation bypass, or Windows-key chords.
 - Development backpressure uses daemon-owned high/low-water marks of 100/50 active jobs. The P1 baseline is accepted on the named GAP-007 engineering machine; release-hardware soak budgets remain a separate hardening task.

@@ -1,8 +1,10 @@
 //! Windows-facing capture, OCR, and automation adapters.
 
 mod automation;
+mod memory_pressure;
 
 pub use automation::WindowsAutomationPlatform;
+pub use memory_pressure::MemoryPressureMonitor;
 
 #[cfg(test)]
 use automation::{

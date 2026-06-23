@@ -50,7 +50,9 @@ use screensearch_persistence::{FileAssetStore, LibSqlArchive};
 use screensearch_ports::{
     ArchiveRepository, EmbeddingEngine, OcrEngine, PortError, TextGenerator, TokenStream,
 };
-use screensearch_windows::{WindowsAutomationPlatform, WindowsGraphicsCaptureSource};
+use screensearch_windows::{
+    MemoryPressureMonitor, WindowsAutomationPlatform, WindowsGraphicsCaptureSource,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
@@ -265,10 +267,15 @@ impl TextGenerator for WorkerModelClient {
                 ))));
             }
         });
+        let last_generation = Arc::clone(&self.last_generation);
         Ok(Box::pin(try_stream! {
+            // Keep the idle clock fresh while tokens stream and once generation finishes, so the
+            // idle-timeout unload measures from the end of activity rather than its start.
             while let Some(token) = receive.recv().await {
+                last_generation.store(now_millis(), Ordering::Relaxed);
                 yield token?;
             }
+            last_generation.store(now_millis(), Ordering::Relaxed);
         }))
     }
 }
@@ -356,7 +363,22 @@ async fn worker_generation_loaded() -> Result<bool, anyhow::Error> {
     anyhow::bail!("model worker returned no health response")
 }
 
-/// Unloads the resident generation model after it has been idle past the timeout.
+/// Decides whether the resident generation model should be unloaded.
+///
+/// Spec §11 / ADR 0003: the model unloads on an idle timeout **or** a memory-pressure signal.
+/// Kept pure so the decision is unit-tested deterministically; [`idle_unload_loop`] performs the
+/// IPC unload.
+fn should_unload_generation(
+    generation_loaded: bool,
+    idle_elapsed_millis: u64,
+    idle_timeout_millis: u64,
+    low_memory: bool,
+) -> bool {
+    generation_loaded && (low_memory || idle_elapsed_millis >= idle_timeout_millis)
+}
+
+/// Unloads the resident generation model after it has been idle past the timeout or once Windows
+/// signals memory pressure.
 ///
 /// Sends a raw worker unload (not the daemon `UnloadGenerationModel` handler, which also
 /// clears the catalog selection): the active model stays selected so the next query
@@ -366,19 +388,54 @@ async fn idle_unload_loop(last_generation: Arc<AtomicU64>, mut shutdown: watch::
     cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let idle_timeout_millis =
         u64::try_from(GENERATION_IDLE_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+    let memory_monitor = match MemoryPressureMonitor::new() {
+        Ok(monitor) => Some(monitor),
+        Err(error) => {
+            warn!(
+                error = %error,
+                "memory-pressure monitor unavailable; unloading on idle timeout only"
+            );
+            None
+        }
+    };
     loop {
         tokio::select! {
             _ = cadence.tick() => {
                 let last = last_generation.load(Ordering::Relaxed);
-                if last == 0 || now_millis().saturating_sub(last) < idle_timeout_millis {
+                if last == 0 {
+                    continue;
+                }
+                let idle_elapsed_millis = now_millis().saturating_sub(last);
+                let low_memory = memory_monitor.as_ref().is_some_and(|monitor| {
+                    match monitor.is_low_memory() {
+                        Ok(low) => low,
+                        Err(error) => {
+                            warn!(error = %error, "memory-pressure query failed; treating as no pressure");
+                            false
+                        }
+                    }
+                });
+                // Avoid an IPC round trip when neither condition can fire this tick.
+                if !low_memory && idle_elapsed_millis < idle_timeout_millis {
                     continue;
                 }
                 match worker_generation_loaded().await {
-                    Ok(true) => match unload_model_worker().await {
-                        Ok(()) => info!("unloaded idle generation model"),
-                        Err(error) => warn!(error = %error, "idle generation-model unload failed"),
-                    },
-                    Ok(false) => {}
+                    Ok(loaded) => {
+                        if should_unload_generation(
+                            loaded,
+                            idle_elapsed_millis,
+                            idle_timeout_millis,
+                            low_memory,
+                        ) {
+                            let reason = if low_memory { "memory_pressure" } else { "idle" };
+                            match unload_model_worker().await {
+                                Ok(()) => info!(reason, "unloaded generation model"),
+                                Err(error) => {
+                                    warn!(error = %error, reason, "generation-model unload failed");
+                                }
+                            }
+                        }
+                    }
                     Err(error) => warn!(error = %error, "idle-unload health probe failed"),
                 }
             }
@@ -388,6 +445,48 @@ async fn idle_unload_loop(last_generation: Arc<AtomicU64>, mut shutdown: watch::
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_unload_tests {
+    use super::should_unload_generation;
+
+    const IDLE_TIMEOUT_MILLIS: u64 = 300_000;
+
+    #[test]
+    fn resident_and_memory_pressure_unloads_even_when_not_idle() {
+        assert!(should_unload_generation(true, 0, IDLE_TIMEOUT_MILLIS, true));
+    }
+
+    #[test]
+    fn resident_and_idle_timeout_unloads() {
+        assert!(should_unload_generation(
+            true,
+            IDLE_TIMEOUT_MILLIS,
+            IDLE_TIMEOUT_MILLIS,
+            false
+        ));
+    }
+
+    #[test]
+    fn resident_without_pressure_or_idle_keeps_model() {
+        assert!(!should_unload_generation(
+            true,
+            1_000,
+            IDLE_TIMEOUT_MILLIS,
+            false
+        ));
+    }
+
+    #[test]
+    fn unloaded_model_never_unloads_again() {
+        assert!(!should_unload_generation(
+            false,
+            IDLE_TIMEOUT_MILLIS * 10,
+            IDLE_TIMEOUT_MILLIS,
+            true
+        ));
     }
 }
 
