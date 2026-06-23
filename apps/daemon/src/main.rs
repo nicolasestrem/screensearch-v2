@@ -1794,6 +1794,8 @@ async fn main() -> anyhow::Result<()> {
     let analysis_task = tokio::spawn(analysis_loop(handler.analysis.clone(), shutdown_rx.clone()));
     let maintenance_task = tokio::spawn(maintenance_loop(
         handler.ingest.clone(),
+        handler.repository.clone(),
+        handler.assets.clone(),
         shutdown_rx.clone(),
     ));
     let idle_task = tokio::spawn(idle_unload_loop(last_generation, shutdown_rx.clone()));
@@ -1865,7 +1867,15 @@ async fn analysis_loop(analysis: Arc<AnalysisService>, mut shutdown: watch::Rece
     }
 }
 
-async fn maintenance_loop(ingest: Arc<IngestService>, mut shutdown: watch::Receiver<bool>) {
+/// Grace window before an unreferenced asset file is treated as an orphan and removed.
+const ORPHAN_ASSET_GRACE: Duration = Duration::from_secs(3600);
+
+async fn maintenance_loop(
+    ingest: Arc<IngestService>,
+    repository: Arc<LibSqlArchive>,
+    assets: Arc<FileAssetStore>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut cadence = tokio::time::interval(Duration::from_secs(60));
     cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1882,6 +1892,16 @@ async fn maintenance_loop(ingest: Arc<IngestService>, mut shutdown: watch::Recei
                     Ok(_) => {}
                     Err(error) => warn!(error = %error, "archive retention failed"),
                 }
+                // Reconcile the filesystem against the archive: a frame whose file was written
+                // before its capture row failed to commit leaves an orphan that retention's
+                // database-driven cleanup never sees (spec §5).
+                match sweep_orphan_assets(&repository, &assets).await {
+                    Ok(removed) if removed > 0 => {
+                        info!(orphan_assets_removed = removed, "orphan asset sweep completed");
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(error = %error, "orphan asset sweep failed"),
+                }
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1890,6 +1910,14 @@ async fn maintenance_loop(ingest: Arc<IngestService>, mut shutdown: watch::Recei
             }
         }
     }
+}
+
+async fn sweep_orphan_assets(
+    repository: &LibSqlArchive,
+    assets: &FileAssetStore,
+) -> Result<u64, PortError> {
+    let referenced = repository.referenced_asset_hashes().await?;
+    assets.sweep_orphans(&referenced, ORPHAN_ASSET_GRACE).await
 }
 
 #[cfg(test)]
