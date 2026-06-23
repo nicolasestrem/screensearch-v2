@@ -40,6 +40,10 @@ use tauri_plugin_notification::NotificationExt;
 
 const ABORT_SHORTCUT: &str = "Ctrl+Alt+Shift+Esc";
 
+/// How long to keep the shell hidden so the external target window settles back into the
+/// foreground before the daemon runs its foreground-identity checks (capture, approve, execute).
+const FOREGROUND_YIELD_DELAY: Duration = Duration::from_millis(200);
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HealthStatus {
@@ -173,6 +177,8 @@ struct AutomationStatus {
     abort_available: bool,
     abort_active: bool,
     running: bool,
+    heartbeat_fresh: bool,
+    abort_registered: bool,
 }
 
 #[derive(Serialize)]
@@ -298,81 +304,13 @@ fn map_automation_action(
 }
 
 fn map_automation_modifier(value: &str) -> Result<AutomationKeyModifier, AutomationCommandError> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "control" => Ok(AutomationKeyModifier::Control),
-        "alt" => Ok(AutomationKeyModifier::Alt),
-        "shift" => Ok(AutomationKeyModifier::Shift),
-        _ => Err(AutomationCommandError::invalid(
-            "unknown automation key modifier",
-        )),
-    }
+    screensearch_ipc::convert::modifier_from_token(value)
+        .map_err(|error| AutomationCommandError::invalid(error.to_string()))
 }
 
-#[allow(clippy::too_many_lines)]
 fn map_automation_key(value: &str) -> Result<IpcAutomationKey, AutomationCommandError> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "a" => Ok(IpcAutomationKey::A),
-        "b" => Ok(IpcAutomationKey::B),
-        "c" => Ok(IpcAutomationKey::C),
-        "d" => Ok(IpcAutomationKey::D),
-        "e" => Ok(IpcAutomationKey::E),
-        "f" => Ok(IpcAutomationKey::F),
-        "g" => Ok(IpcAutomationKey::G),
-        "h" => Ok(IpcAutomationKey::H),
-        "i" => Ok(IpcAutomationKey::I),
-        "j" => Ok(IpcAutomationKey::J),
-        "k" => Ok(IpcAutomationKey::K),
-        "l" => Ok(IpcAutomationKey::L),
-        "m" => Ok(IpcAutomationKey::M),
-        "n" => Ok(IpcAutomationKey::N),
-        "o" => Ok(IpcAutomationKey::O),
-        "p" => Ok(IpcAutomationKey::P),
-        "q" => Ok(IpcAutomationKey::Q),
-        "r" => Ok(IpcAutomationKey::R),
-        "s" => Ok(IpcAutomationKey::S),
-        "t" => Ok(IpcAutomationKey::T),
-        "u" => Ok(IpcAutomationKey::U),
-        "v" => Ok(IpcAutomationKey::V),
-        "w" => Ok(IpcAutomationKey::W),
-        "x" => Ok(IpcAutomationKey::X),
-        "y" => Ok(IpcAutomationKey::Y),
-        "z" => Ok(IpcAutomationKey::Z),
-        "0" => Ok(IpcAutomationKey::Digit0),
-        "1" => Ok(IpcAutomationKey::Digit1),
-        "2" => Ok(IpcAutomationKey::Digit2),
-        "3" => Ok(IpcAutomationKey::Digit3),
-        "4" => Ok(IpcAutomationKey::Digit4),
-        "5" => Ok(IpcAutomationKey::Digit5),
-        "6" => Ok(IpcAutomationKey::Digit6),
-        "7" => Ok(IpcAutomationKey::Digit7),
-        "8" => Ok(IpcAutomationKey::Digit8),
-        "9" => Ok(IpcAutomationKey::Digit9),
-        "enter" => Ok(IpcAutomationKey::Enter),
-        "escape" | "esc" => Ok(IpcAutomationKey::Escape),
-        "tab" => Ok(IpcAutomationKey::Tab),
-        "space" => Ok(IpcAutomationKey::Space),
-        "backspace" => Ok(IpcAutomationKey::Backspace),
-        "delete" => Ok(IpcAutomationKey::Delete),
-        "arrowleft" => Ok(IpcAutomationKey::ArrowLeft),
-        "arrowright" => Ok(IpcAutomationKey::ArrowRight),
-        "arrowup" => Ok(IpcAutomationKey::ArrowUp),
-        "arrowdown" => Ok(IpcAutomationKey::ArrowDown),
-        "home" => Ok(IpcAutomationKey::Home),
-        "end" => Ok(IpcAutomationKey::End),
-        "f1" => Ok(IpcAutomationKey::F1),
-        "f2" => Ok(IpcAutomationKey::F2),
-        "f3" => Ok(IpcAutomationKey::F3),
-        "f4" => Ok(IpcAutomationKey::F4),
-        "f5" => Ok(IpcAutomationKey::F5),
-        "f6" => Ok(IpcAutomationKey::F6),
-        "f7" => Ok(IpcAutomationKey::F7),
-        "f8" => Ok(IpcAutomationKey::F8),
-        "f9" => Ok(IpcAutomationKey::F9),
-        "f10" => Ok(IpcAutomationKey::F10),
-        "f11" => Ok(IpcAutomationKey::F11),
-        "f12" => Ok(IpcAutomationKey::F12),
-        _ => Err(AutomationCommandError::invalid("unknown automation key")),
-    }
+    screensearch_ipc::convert::key_from_token(value)
+        .map_err(|error| AutomationCommandError::invalid(error.to_string()))
 }
 
 fn automation_command_error(error: screensearch_ipc::v1::ErrorResponse) -> AutomationCommandError {
@@ -390,6 +328,8 @@ fn map_automation_status_response(
         abort_available: status.abort_available,
         abort_active: status.abort_active,
         running: status.running,
+        heartbeat_fresh: status.heartbeat_fresh,
+        abort_registered: status.abort_registered,
     }
 }
 
@@ -453,18 +393,49 @@ async fn set_automation_enabled(enabled: bool) -> Result<AutomationStatus, Autom
     ))
 }
 
+/// Hides the main window so the previously focused application regains the foreground, runs
+/// `operation` against the daemon, then restores and refocuses the window.
+///
+/// Capturing a target, approving a plan, and executing a plan all require the *external* target —
+/// not ScreenSearch — to be the foreground window during the daemon's identity checks, so they
+/// share this choreography. Forgetting it on approve previously made every approval fail with
+/// `target_changed`.
+async fn with_foreground_yielded<F, T>(app: &AppHandle, operation: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let window = app.get_webview_window("main");
+    if let Some(window) = &window {
+        let _ = window.hide();
+    }
+    // Restore on Drop so a cancelled future (dropped at an `.await`) or a panic during the
+    // operation can never leave the window hidden indefinitely.
+    let _restore = WindowRestoreGuard { window };
+    tokio::time::sleep(FOREGROUND_YIELD_DELAY).await;
+    operation.await
+}
+
+/// Restores and refocuses the main window when dropped, including on async cancellation or unwind.
+struct WindowRestoreGuard {
+    window: Option<tauri::WebviewWindow>,
+}
+
+impl Drop for WindowRestoreGuard {
+    fn drop(&mut self) {
+        if let Some(window) = &self.window {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }
+}
+
 /// Captures the current foreground window as an automation target (hides the shell briefly first).
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 async fn automation_foreground_target(
     app: AppHandle,
 ) -> Result<AutomationTarget, AutomationCommandError> {
-    let window = app.get_webview_window("main");
-    if let Some(window) = &window {
-        let _ = window.hide();
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let result = async {
+    with_foreground_yielded(&app, async {
         let responses = request(request_envelope::Body::GetAutomationForegroundTarget(
             GetAutomationForegroundTargetRequest {},
         ))
@@ -487,45 +458,49 @@ async fn automation_foreground_target(
         Err(AutomationCommandError::daemon(
             "daemon returned no automation target",
         ))
-    }
-    .await;
-    if let Some(window) = window {
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
-    result
+    })
+    .await
 }
 
 /// Validates and approves an automation plan, returning a time-limited approval token.
+///
+/// Hides the shell first so the captured target is foreground when the daemon re-checks foreground
+/// identity as an approval precondition.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 async fn approve_automation(
+    app: AppHandle,
     plan: AutomationPlan,
 ) -> Result<AutomationApproval, AutomationCommandError> {
-    let responses = request(request_envelope::Body::ApproveAutomation(
-        ApproveAutomationRequest {
-            plan: Some(map_automation_plan(plan)?),
-        },
-    ))
-    .await
-    .map_err(AutomationCommandError::daemon)?;
-    for response in responses {
-        match response.body {
-            Some(response_envelope::Body::ApproveAutomation(result)) => {
-                return Ok(AutomationApproval {
-                    approval_id: result.approval_id,
-                    expires_at: result.expires_at,
-                    action_count: result.action_count,
-                });
+    let ipc_plan = map_automation_plan(plan)?;
+    with_foreground_yielded(&app, async {
+        let responses = request(request_envelope::Body::ApproveAutomation(
+            ApproveAutomationRequest {
+                plan: Some(ipc_plan),
+            },
+        ))
+        .await
+        .map_err(AutomationCommandError::daemon)?;
+        for response in responses {
+            match response.body {
+                Some(response_envelope::Body::ApproveAutomation(result)) => {
+                    return Ok(AutomationApproval {
+                        approval_id: result.approval_id,
+                        expires_at: result.expires_at,
+                        action_count: result.action_count,
+                    });
+                }
+                Some(response_envelope::Body::Error(error)) => {
+                    return Err(automation_command_error(error));
+                }
+                _ => {}
             }
-            Some(response_envelope::Body::Error(error)) => {
-                return Err(automation_command_error(error));
-            }
-            _ => {}
         }
-    }
-    Err(AutomationCommandError::daemon(
-        "daemon returned no automation approval",
-    ))
+        Err(AutomationCommandError::daemon(
+            "daemon returned no automation approval",
+        ))
+    })
+    .await
 }
 
 /// Executes a previously approved automation plan against its captured foreground target.
@@ -537,12 +512,7 @@ async fn execute_automation(
     plan: AutomationPlan,
 ) -> Result<String, AutomationCommandError> {
     let ipc_plan = map_automation_plan(plan)?;
-    let window = app.get_webview_window("main");
-    if let Some(window) = &window {
-        let _ = window.hide();
-    }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let result = async {
+    with_foreground_yielded(&app, async {
         let responses = request(request_envelope::Body::ExecuteAutomation(
             ExecuteAutomationRequest {
                 approval_id,
@@ -565,13 +535,8 @@ async fn execute_automation(
         Err(AutomationCommandError::daemon(
             "daemon returned no automation execution result",
         ))
-    }
-    .await;
-    if let Some(window) = window {
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
-    result
+    })
+    .await
 }
 
 /// Latches the emergency automation abort, stopping any in-flight execution.
@@ -1133,7 +1098,11 @@ struct ActiveShortcut(Mutex<Option<Shortcut>>);
 /// Fixed emergency-abort registration state reported to the daemon heartbeat.
 struct AbortShortcutState {
     shortcut: Shortcut,
+    /// Live OS registration state, re-asserted on every heartbeat tick.
     registered: AtomicBool,
+    /// Whether the user was already notified that the abort shortcut became unavailable, so the
+    /// loss is announced once per transition rather than every heartbeat.
+    notified_loss: AtomicBool,
 }
 
 /// Brings the main window to the foreground (used by the tray, hotkey, and menu).
@@ -1257,13 +1226,49 @@ fn spawn_health_poll(app: AppHandle) {
     });
 }
 
+/// Re-asserts at the OS level that the shell still owns the fixed emergency-abort shortcut, and
+/// refreshes the live registration state shared with the daemon heartbeat.
+///
+/// `is_registered` only consults the plugin's internal cache, not the OS, so it cannot detect a
+/// hotkey the OS silently reclaimed — trusting it would let the heartbeat keep reporting the abort
+/// shortcut live while `Ctrl+Alt+Shift+Esc` no longer fires. Instead this drops any existing
+/// binding and registers again: `register` performs the real `RegisterHotKey`, so its result is
+/// OS truth. (Registering an already-OS-registered hotkey fails, which is why the prior
+/// `unregister` is required.) The re-registered shortcut keeps dispatching through the plugin's
+/// global handler, so the abort path is unchanged.
+///
+/// Returns the current registration truth. On the first detection of unavailability the user is
+/// notified once so a silently-lost abort shortcut — which keeps guarded automation disabled — is
+/// diagnosable rather than indistinguishable from a lagging daemon link.
+fn ensure_abort_registered(app: &AppHandle) -> bool {
+    let Some(state) = app.try_state::<AbortShortcutState>() else {
+        return false;
+    };
+    let manager = app.global_shortcut();
+    let _ = manager.unregister(state.shortcut);
+    let live = manager.register(state.shortcut).is_ok();
+    state.registered.store(live, Ordering::SeqCst);
+    if live {
+        state.notified_loss.store(false, Ordering::SeqCst);
+    } else if !state.notified_loss.swap(true, Ordering::SeqCst) {
+        let _ = app
+            .notification()
+            .builder()
+            .title("Emergency abort unavailable")
+            .body(
+                "ScreenSearch could not hold the Ctrl+Alt+Shift+Esc abort shortcut. Guarded \
+                 automation stays disabled until it is restored.",
+            )
+            .show();
+    }
+    live
+}
+
 /// Keeps the daemon informed that the shell still owns the fixed emergency-abort shortcut.
 fn spawn_automation_heartbeat(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
-            let registered = app
-                .try_state::<AbortShortcutState>()
-                .is_some_and(|state| state.registered.load(Ordering::SeqCst));
+            let registered = ensure_abort_registered(&app);
             let _ = send_automation_heartbeat(registered).await;
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
@@ -1338,6 +1343,7 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     app.manage(AbortShortcutState {
         shortcut: abort_shortcut,
         registered: AtomicBool::new(abort_registered),
+        notified_loss: AtomicBool::new(false),
     });
 
     spawn_health_poll(handle);
@@ -1528,5 +1534,20 @@ mod tests {
                 .parse::<tauri_plugin_global_shortcut::Shortcut>()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn abort_shortcut_differs_from_default_summon_hotkey() {
+        use tauri_plugin_global_shortcut::Shortcut;
+        // If the summon hotkey and the abort shortcut ever coincided, registering one would
+        // shadow the other and the abort heartbeat could silently report a hotkey it no longer
+        // owns. Keep them distinct.
+        let abort = ABORT_SHORTCUT
+            .parse::<Shortcut>()
+            .expect("abort shortcut parses");
+        let summon = crate::shell_settings::DEFAULT_HOTKEY
+            .parse::<Shortcut>()
+            .expect("default summon hotkey parses");
+        assert_ne!(abort, summon);
     }
 }

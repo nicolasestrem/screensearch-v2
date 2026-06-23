@@ -4648,6 +4648,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protoc-bin-vendored",
+ "screensearch-domain",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

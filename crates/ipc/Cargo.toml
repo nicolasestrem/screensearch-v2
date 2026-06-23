@@ -11,6 +11,7 @@ async-trait.workspace = true
 bytes = "1.11"
 futures.workspace = true
 prost.workspace = true
+screensearch-domain = { path = "../domain" }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

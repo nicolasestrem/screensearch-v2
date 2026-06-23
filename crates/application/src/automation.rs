@@ -47,12 +47,25 @@ impl Default for AutomationServiceConfig {
 pub struct AutomationServiceStatus {
     /// Durable daemon-owned enablement.
     pub enabled: bool,
-    /// Whether the shell abort registration has a fresh heartbeat.
+    /// Whether a fresh heartbeat reports the abort shortcut registered (the authoritative gate).
     pub abort_available: bool,
+    /// Whether a shell heartbeat arrived within the staleness window, regardless of registration.
+    pub heartbeat_fresh: bool,
+    /// The last shell-reported abort-shortcut registration state (meaningful only when fresh).
+    pub abort_registered: bool,
     /// Whether emergency abort is latched.
     pub abort_active: bool,
     /// Whether one plan currently owns the single-flight gate.
     pub running: bool,
+}
+
+/// Last content-free safety heartbeat reported by the desktop shell.
+#[derive(Clone, Copy, Debug)]
+struct HeartbeatState {
+    /// Daemon-clock time the heartbeat was recorded.
+    at: DateTime<Utc>,
+    /// Whether the shell reported it currently owns the fixed abort shortcut.
+    registered: bool,
 }
 
 /// Daemon-owned approval, safety, and execution orchestration.
@@ -60,7 +73,7 @@ pub struct AutomationService {
     repository: Arc<dyn AutomationRepository>,
     platform: Arc<dyn AutomationPlatform>,
     config: AutomationServiceConfig,
-    heartbeat: Mutex<Option<DateTime<Utc>>>,
+    heartbeat: Mutex<Option<HeartbeatState>>,
     abort_latched: AtomicBool,
     active_abort_signal: StdMutex<Option<AutomationAbortSignal>>,
     executing: AtomicBool,
@@ -98,8 +111,14 @@ impl AutomationService {
     }
 
     /// Records whether the desktop shell currently owns the fixed abort shortcut.
+    ///
+    /// The heartbeat is stored on every report (not only when registered) so a fresh-but-
+    /// unregistered shell is distinguishable from a silent one, which the status surfaces.
     pub async fn safety_heartbeat(&self, abort_registered: bool, at: DateTime<Utc>) {
-        *self.heartbeat.lock().await = abort_registered.then_some(at);
+        *self.heartbeat.lock().await = Some(HeartbeatState {
+            at,
+            registered: abort_registered,
+        });
     }
 
     /// Enables or disables automation; enabling requires a live abort registration.
@@ -117,9 +136,12 @@ impl AutomationService {
 
     /// Returns content-free live guarded automation state.
     pub async fn status(&self, now: DateTime<Utc>) -> Result<AutomationServiceStatus, PortError> {
+        let (heartbeat_fresh, abort_registered) = self.heartbeat_snapshot(now).await;
         Ok(AutomationServiceStatus {
             enabled: self.repository.automation_settings().await?.enabled,
-            abort_available: self.abort_available(now).await,
+            abort_available: heartbeat_fresh && abort_registered,
+            heartbeat_fresh,
+            abort_registered,
             abort_active: self.abort_latched.load(Ordering::SeqCst),
             running: self.executing.load(Ordering::SeqCst),
         })
@@ -305,12 +327,20 @@ impl AutomationService {
     }
 
     async fn abort_available(&self, now: DateTime<Utc>) -> bool {
-        let Some(heartbeat) = *self.heartbeat.lock().await else {
-            return false;
+        let (fresh, registered) = self.heartbeat_snapshot(now).await;
+        fresh && registered
+    }
+
+    /// Returns `(heartbeat_fresh, abort_registered)` for the last recorded shell heartbeat.
+    async fn heartbeat_snapshot(&self, now: DateTime<Utc>) -> (bool, bool) {
+        let Some(state) = *self.heartbeat.lock().await else {
+            return (false, false);
         };
-        now.signed_duration_since(heartbeat)
+        let fresh = now
+            .signed_duration_since(state.at)
             .to_std()
-            .is_ok_and(|age| age <= self.config.heartbeat_stale_after)
+            .is_ok_and(|age| age <= self.config.heartbeat_stale_after);
+        (fresh, state.registered)
     }
 
     fn set_active_abort_signal(&self, signal: Option<AutomationAbortSignal>) {

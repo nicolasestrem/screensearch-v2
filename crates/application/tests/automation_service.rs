@@ -412,3 +412,74 @@ async fn timeout_cancels_late_blocking_platform_emission() {
     tokio::time::sleep(StdDuration::from_millis(150)).await;
     assert_eq!(emitted.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn approval_requires_the_target_to_be_foreground_not_the_shell() {
+    // The daemon's approval-time foreground check compares the captured target against whatever is
+    // foreground *now*. If the desktop shell were foreground (a different window) at approve time,
+    // approval must fail closed — which is why the shell hides itself before approving, exactly as
+    // it does before capture and execute.
+    let platform = Arc::new(FakePlatform::new(target()));
+    let (_, service, now) = ready_service(platform.clone()).await;
+    *platform.target.lock().await = AutomationTarget {
+        process_id: 4321,
+        window_handle: 5555,
+        executable_name: "screensearch.exe".to_owned(),
+        display_title: "ScreenSearch".to_owned(),
+    };
+    assert_eq!(
+        service.approve(plan(), now).await,
+        Err(PortError::Automation(AutomationFailureCode::TargetChanged))
+    );
+}
+
+#[tokio::test]
+async fn execution_accepts_title_only_changes() {
+    // A window may legitimately retitle itself between approve and execute. Because the canonical
+    // digest excludes the volatile display title, a title-only difference must not be rejected as a
+    // plan mismatch.
+    let platform = Arc::new(FakePlatform::new(target()));
+    let (repository, service, now) = ready_service(platform).await;
+    let approval = service.approve(plan(), now).await.unwrap();
+
+    let mut retitled = plan();
+    retitled.target.display_title = "A new window title".to_owned();
+    service.execute(approval.id, retitled).await.unwrap();
+
+    assert_eq!(
+        repository
+            .automation_run(approval.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        AutomationRunStatus::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn status_distinguishes_unregistered_from_stale_heartbeat() {
+    let repository = Arc::new(MemoryAutomationRepository::default());
+    let platform = Arc::new(FakePlatform::new(target()));
+    let service = AutomationService::with_config(repository, platform, fast_config());
+    let now = Utc::now();
+
+    // No heartbeat yet: nothing is fresh.
+    let status = service.status(now).await.unwrap();
+    assert!(!status.heartbeat_fresh && !status.abort_registered && !status.abort_available);
+
+    // Fresh heartbeat that reports the shortcut unregistered: fresh, but not available.
+    service.safety_heartbeat(false, now).await;
+    let status = service.status(now).await.unwrap();
+    assert!(status.heartbeat_fresh && !status.abort_registered && !status.abort_available);
+
+    // Fresh and registered: available.
+    service.safety_heartbeat(true, now).await;
+    let status = service.status(now).await.unwrap();
+    assert!(status.heartbeat_fresh && status.abort_registered && status.abort_available);
+
+    // A heartbeat older than the staleness window is no longer fresh, so abort is unavailable.
+    let stale = now + Duration::milliseconds(200);
+    let status = service.status(stale).await.unwrap();
+    assert!(!status.heartbeat_fresh && !status.abort_available);
+}

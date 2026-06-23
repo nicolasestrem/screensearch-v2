@@ -12,6 +12,8 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/screensearch.v1.rs"));
 }
 
+pub mod convert;
+
 /// Stream of response envelopes for one request.
 pub type ResponseStream =
     Pin<Box<dyn Stream<Item = Result<v1::ResponseEnvelope, IpcError>> + Send>>;

@@ -33,6 +33,7 @@ import {
   type ArchiveSettings,
   type AutomationAction,
   type AutomationPlan,
+  type AutomationStatus,
   type AutomationTarget,
   type GenerationModel,
   type SearchEvent,
@@ -784,7 +785,7 @@ function AutomationModal({ onClose }: { onClose: () => void }) {
             <button type="button" className="secondary" onClick={() => resetAbort.mutate()} disabled={busy || !status.data?.abortActive}>Reset abort</button>
           </div>
           <div className="automation-safety-grid">
-            <span><strong>{status.data?.abortAvailable ? "Live" : "Unavailable"}</strong><small>Abort shortcut</small></span>
+            <span title={abortShortcutPill(status.data).hint}><strong>{abortShortcutPill(status.data).label}</strong><small>Abort shortcut</small></span>
             <span><strong>{status.data?.abortActive ? "Latched" : "Clear"}</strong><small>Abort state</small></span>
             <span><strong>{status.data?.running ? "Running" : "Idle"}</strong><small>Execution gate</small></span>
           </div>
@@ -889,6 +890,20 @@ function defaultAutomationAction(kind: string): AutomationAction {
   if (kind === "uia_set_value") return { kind: "uia_set_value", automationId: "", value: "" };
   if (kind === "key_chord") return { kind: "key_chord", modifiers: ["control"], key: "enter" };
   return { kind: "type_text", text: "" };
+}
+
+function abortShortcutPill(status?: AutomationStatus): { label: string; hint: string } {
+  if (!status) return { label: "—", hint: "Waiting for automation status." };
+  if (status.abortAvailable) {
+    return { label: "Live", hint: "Ctrl Alt Shift Esc is registered and the daemon link is live." };
+  }
+  if (status.heartbeatFresh) {
+    return {
+      label: "Unavailable",
+      hint: "ScreenSearch could not hold Ctrl Alt Shift Esc (another app may own it). Guarded automation stays disabled until it is free.",
+    };
+  }
+  return { label: "Reconnecting", hint: "Waiting for the daemon heartbeat." };
 }
 
 function errorText(error: unknown) {

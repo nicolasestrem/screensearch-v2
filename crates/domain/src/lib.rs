@@ -152,6 +152,26 @@ pub enum KeyModifier {
     Shift,
 }
 
+impl KeyModifier {
+    /// Every modifier variant, used for exhaustive key-mapping round-trip coverage.
+    pub fn all() -> [Self; 3] {
+        [Self::Control, Self::Alt, Self::Shift]
+    }
+
+    /// Stable lowercase token shared by the desktop UI and the IPC key-mapping conversion.
+    ///
+    /// This is an exhaustive match (no wildcard): adding a modifier variant fails to compile here
+    /// until a token is assigned, which keeps the UI vocabulary from silently drifting from the
+    /// contract.
+    pub fn ui_token(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Alt => "alt",
+            Self::Shift => "shift",
+        }
+    }
+}
+
 /// Bounded non-modifier key accepted by an explicit chord action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -278,6 +298,144 @@ pub enum AutomationKey {
     F12,
 }
 
+impl AutomationKey {
+    /// Every key variant, used for exhaustive key-mapping round-trip coverage.
+    pub fn all() -> [Self; 60] {
+        [
+            Self::A,
+            Self::B,
+            Self::C,
+            Self::D,
+            Self::E,
+            Self::F,
+            Self::G,
+            Self::H,
+            Self::I,
+            Self::J,
+            Self::K,
+            Self::L,
+            Self::M,
+            Self::N,
+            Self::O,
+            Self::P,
+            Self::Q,
+            Self::R,
+            Self::S,
+            Self::T,
+            Self::U,
+            Self::V,
+            Self::W,
+            Self::X,
+            Self::Y,
+            Self::Z,
+            Self::Digit0,
+            Self::Digit1,
+            Self::Digit2,
+            Self::Digit3,
+            Self::Digit4,
+            Self::Digit5,
+            Self::Digit6,
+            Self::Digit7,
+            Self::Digit8,
+            Self::Digit9,
+            Self::Enter,
+            Self::Escape,
+            Self::Tab,
+            Self::Space,
+            Self::Backspace,
+            Self::Delete,
+            Self::ArrowLeft,
+            Self::ArrowRight,
+            Self::ArrowUp,
+            Self::ArrowDown,
+            Self::Home,
+            Self::End,
+            Self::F1,
+            Self::F2,
+            Self::F3,
+            Self::F4,
+            Self::F5,
+            Self::F6,
+            Self::F7,
+            Self::F8,
+            Self::F9,
+            Self::F10,
+            Self::F11,
+            Self::F12,
+        ]
+    }
+
+    /// Stable lowercase token shared by the desktop UI and the IPC key-mapping conversion.
+    ///
+    /// This is an exhaustive match (no wildcard): adding a key variant fails to compile here until
+    /// a token is assigned, which keeps the UI vocabulary from silently drifting from the contract.
+    #[allow(clippy::too_many_lines)]
+    pub fn ui_token(self) -> &'static str {
+        match self {
+            Self::A => "a",
+            Self::B => "b",
+            Self::C => "c",
+            Self::D => "d",
+            Self::E => "e",
+            Self::F => "f",
+            Self::G => "g",
+            Self::H => "h",
+            Self::I => "i",
+            Self::J => "j",
+            Self::K => "k",
+            Self::L => "l",
+            Self::M => "m",
+            Self::N => "n",
+            Self::O => "o",
+            Self::P => "p",
+            Self::Q => "q",
+            Self::R => "r",
+            Self::S => "s",
+            Self::T => "t",
+            Self::U => "u",
+            Self::V => "v",
+            Self::W => "w",
+            Self::X => "x",
+            Self::Y => "y",
+            Self::Z => "z",
+            Self::Digit0 => "0",
+            Self::Digit1 => "1",
+            Self::Digit2 => "2",
+            Self::Digit3 => "3",
+            Self::Digit4 => "4",
+            Self::Digit5 => "5",
+            Self::Digit6 => "6",
+            Self::Digit7 => "7",
+            Self::Digit8 => "8",
+            Self::Digit9 => "9",
+            Self::Enter => "enter",
+            Self::Escape => "escape",
+            Self::Tab => "tab",
+            Self::Space => "space",
+            Self::Backspace => "backspace",
+            Self::Delete => "delete",
+            Self::ArrowLeft => "arrowleft",
+            Self::ArrowRight => "arrowright",
+            Self::ArrowUp => "arrowup",
+            Self::ArrowDown => "arrowdown",
+            Self::Home => "home",
+            Self::End => "end",
+            Self::F1 => "f1",
+            Self::F2 => "f2",
+            Self::F3 => "f3",
+            Self::F4 => "f4",
+            Self::F5 => "f5",
+            Self::F6 => "f6",
+            Self::F7 => "f7",
+            Self::F8 => "f8",
+            Self::F9 => "f9",
+            Self::F10 => "f10",
+            Self::F11 => "f11",
+            Self::F12 => "f12",
+        }
+    }
+}
+
 /// One deterministic automation operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -377,12 +535,68 @@ impl AutomationPlanV1 {
     }
 
     /// Computes the stable lowercase BLAKE3 digest of the versioned plan encoding.
+    ///
+    /// The digest binds the approval to the target *identity* (process id, window handle, and
+    /// executable name) and the ordered actions only. `display_title` is deliberately excluded —
+    /// it is volatile review context that [`AutomationTarget::matches_identity`] also ignores, so
+    /// binding the approval to it would spuriously reject execution when a window legitimately
+    /// retitles itself. The executable name is lowercased so the digest matches the
+    /// case-insensitive identity comparison.
     pub fn canonical_digest(&self) -> Result<String, DomainError> {
         self.validate()?;
-        let encoded = serde_json::to_vec(&("screensearch.automation.v1", self))
+        // A key chord's modifiers are a set (Ctrl+Shift == Shift+Ctrl), so normalize their order
+        // for the digest. Otherwise a non-UI caller that listed modifiers in a different order at
+        // execute time than at approval would hit a spurious `plan_mismatch`. The stored/displayed
+        // plan keeps the reviewed order; only the hashed view is normalized.
+        let actions: Vec<AutomationAction> = self
+            .actions
+            .iter()
+            .map(normalize_action_for_digest)
+            .collect();
+        let canonical = CanonicalPlan {
+            target: CanonicalTarget {
+                process_id: self.target.process_id,
+                window_handle: self.target.window_handle,
+                executable_name: self.target.executable_name.to_ascii_lowercase(),
+            },
+            actions: &actions,
+        };
+        let encoded = serde_json::to_vec(&("screensearch.automation.v1", &canonical))
             .map_err(|error| DomainError::InvalidAutomation(error.to_string()))?;
         Ok(blake3::hash(&encoded).to_hex().to_string())
     }
+}
+
+/// Returns a copy of `action` with key-chord modifiers sorted, so the canonical digest treats a
+/// chord's modifiers as an unordered set.
+fn normalize_action_for_digest(action: &AutomationAction) -> AutomationAction {
+    match action {
+        AutomationAction::KeyChord { modifiers, key } => {
+            let mut modifiers = modifiers.clone();
+            modifiers.sort_unstable();
+            AutomationAction::KeyChord {
+                modifiers,
+                key: *key,
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// Identity-only target view hashed by [`AutomationPlanV1::canonical_digest`]; excludes the
+/// volatile `display_title`.
+#[derive(Serialize)]
+struct CanonicalTarget {
+    process_id: u32,
+    window_handle: u64,
+    executable_name: String,
+}
+
+/// Canonical plan view hashed by [`AutomationPlanV1::canonical_digest`].
+#[derive(Serialize)]
+struct CanonicalPlan<'a> {
+    target: CanonicalTarget,
+    actions: &'a [AutomationAction],
 }
 
 fn validate_automation_text(
@@ -1357,5 +1571,84 @@ mod tests {
             first.canonical_digest().unwrap(),
             second.canonical_digest().unwrap()
         );
+    }
+
+    #[test]
+    fn automation_digest_ignores_title_and_executable_case() {
+        let plan = automation_plan(vec![AutomationAction::TypeText {
+            text: "Ready".to_owned(),
+        }]);
+
+        // The title is volatile review context excluded from `matches_identity`; the digest must
+        // not bind to it, or a window retitling itself between approve and execute would falsely
+        // be rejected as a plan mismatch.
+        let mut retitled = plan.clone();
+        retitled.target.display_title = "Renamed window".to_owned();
+        assert_eq!(
+            plan.canonical_digest().unwrap(),
+            retitled.canonical_digest().unwrap()
+        );
+
+        // The executable name is compared case-insensitively in identity, so the digest lowercases
+        // it for the same equivalence.
+        let mut recased = plan.clone();
+        recased.target.executable_name = "NOTEPAD.EXE".to_owned();
+        assert_eq!(
+            plan.canonical_digest().unwrap(),
+            recased.canonical_digest().unwrap()
+        );
+
+        // Identity-relevant fields still change the digest.
+        let mut other_window = plan.clone();
+        other_window.target.window_handle = 7;
+        assert_ne!(
+            plan.canonical_digest().unwrap(),
+            other_window.canonical_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn automation_digest_ignores_modifier_order() {
+        // A chord's modifiers are an unordered set, so modifier order must not change the digest;
+        // otherwise a non-UI caller could trigger a spurious plan mismatch at execute time.
+        let control_shift = automation_plan(vec![AutomationAction::KeyChord {
+            modifiers: vec![KeyModifier::Control, KeyModifier::Shift],
+            key: AutomationKey::S,
+        }]);
+        let shift_control = automation_plan(vec![AutomationAction::KeyChord {
+            modifiers: vec![KeyModifier::Shift, KeyModifier::Control],
+            key: AutomationKey::S,
+        }]);
+        assert_eq!(
+            control_shift.canonical_digest().unwrap(),
+            shift_control.canonical_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn automation_key_tokens_are_unique_and_cover_every_variant() {
+        let keys = AutomationKey::all();
+        assert_eq!(keys.len(), 60);
+        let mut tokens: Vec<&str> = keys.iter().map(|key| key.ui_token()).collect();
+        assert!(tokens.iter().all(|token| !token.is_empty()));
+        tokens.sort_unstable();
+        let unique = tokens.len();
+        tokens.dedup();
+        assert_eq!(tokens.len(), unique, "automation key tokens must be unique");
+    }
+
+    #[test]
+    fn key_modifier_tokens_are_unique_and_cover_every_variant() {
+        let modifiers = KeyModifier::all();
+        assert_eq!(modifiers.len(), 3);
+        let mut tokens: Vec<&str> = modifiers
+            .iter()
+            .map(|modifier| modifier.ui_token())
+            .collect();
+        assert!(tokens.iter().all(|token| !token.is_empty()));
+        tokens.sort_unstable();
+        let unique = tokens.len();
+        tokens.dedup();
+        assert_eq!(tokens.len(), unique, "key modifier tokens must be unique");
     }
 }

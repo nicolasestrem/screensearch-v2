@@ -1,5 +1,19 @@
 #![allow(unsafe_code)]
 
+//! Native Windows automation emission (UI Automation invoke/set-value and `SendInput` key/text).
+//!
+//! Cancellation is cooperative and checked *between* native operations via
+//! [`ensure_not_cancelled`], matching the spec/ADR 0004 contract that abort and the execution
+//! deadline stop the run *between actions*. A single action is one native syscall (`Invoke`,
+//! `SetValue`, or one `SendInput` batch) and cannot be interrupted mid-call, so an abort or
+//! timeout that lands while a syscall is already in flight lets that one syscall finish before the
+//! run stops — a bounded residual of at most one in-flight action, never the rest of the plan.
+//!
+//! COM for the UI Automation client is initialized single-threaded-apartment per `spawn_blocking`
+//! thread and balanced by [`ComApartment`]'s `Drop`. UIA calls here are synchronous and pump no
+//! message loop; if a future Windows attestation surfaces STA re-entrancy issues, switching the
+//! client to a multithreaded apartment is the documented escape hatch.
+
 use std::{
     ffi::c_void,
     mem::{ManuallyDrop, size_of},
