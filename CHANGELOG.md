@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Documentation
+
+- Made `AGENTS.md` a thin pointer to `CLAUDE.md` (the single source of truth) instead of a parallel summary, so the two guides cannot drift.
+- Corrected `CLAUDE.md` drift against the current code and ADRs: the `model-worker` is now the supervised owner of OCR/embedding/generation (not "reserved / no inference"), the daemon delegates inference via `WorkerModelClient` while wiring only capture and automation in-process, the `ports` automation traits are `AutomationRepository`/`AutomationPlatform` (not `AutomationExecutor`), and the automation invariant now matches ADR 0004 (model output cannot create/approve/execute a plan; five fail-closed pre-action checks). Added build prerequisites (Rust 1.88, Node 22, WebView2), the required `cargo build -p screensearch-model-worker` step, and pointers to the `ipc::convert` module, the desktop hooks, and `docs/performance/`/`design-qa.md`/`AGENTS.md`.
+
 ### Added
 
 - Closed P0/P1 spec-deviation gaps found in a scrupulous Phase 0→1 review: persisted the full embedding manifest (provider, model name, revision/hash, tokenizer revision, pooling, normalization, license, source URL) via migration `0008` and a matching `FastEmbedEngine::manifest()` accessor (spec §8.1).
