@@ -408,13 +408,25 @@ where
     if let Some(window) = &window {
         let _ = window.hide();
     }
+    // Restore on Drop so a cancelled future (dropped at an `.await`) or a panic during the
+    // operation can never leave the window hidden indefinitely.
+    let _restore = WindowRestoreGuard { window };
     tokio::time::sleep(FOREGROUND_YIELD_DELAY).await;
-    let result = operation.await;
-    if let Some(window) = window {
-        let _ = window.show();
-        let _ = window.set_focus();
+    operation.await
+}
+
+/// Restores and refocuses the main window when dropped, including on async cancellation or unwind.
+struct WindowRestoreGuard {
+    window: Option<tauri::WebviewWindow>,
+}
+
+impl Drop for WindowRestoreGuard {
+    fn drop(&mut self) {
+        if let Some(window) = &self.window {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
     }
-    result
 }
 
 /// Captures the current foreground window as an automation target (hides the shell briefly first).
@@ -1214,8 +1226,16 @@ fn spawn_health_poll(app: AppHandle) {
     });
 }
 
-/// Re-asserts that the shell still owns the fixed emergency-abort shortcut, re-registering it if
-/// the OS dropped it, and refreshes the live registration state shared with the daemon heartbeat.
+/// Re-asserts at the OS level that the shell still owns the fixed emergency-abort shortcut, and
+/// refreshes the live registration state shared with the daemon heartbeat.
+///
+/// `is_registered` only consults the plugin's internal cache, not the OS, so it cannot detect a
+/// hotkey the OS silently reclaimed — trusting it would let the heartbeat keep reporting the abort
+/// shortcut live while `Ctrl+Alt+Shift+Esc` no longer fires. Instead this drops any existing
+/// binding and registers again: `register` performs the real `RegisterHotKey`, so its result is
+/// OS truth. (Registering an already-OS-registered hotkey fails, which is why the prior
+/// `unregister` is required.) The re-registered shortcut keeps dispatching through the plugin's
+/// global handler, so the abort path is unchanged.
 ///
 /// Returns the current registration truth. On the first detection of unavailability the user is
 /// notified once so a silently-lost abort shortcut — which keeps guarded automation disabled — is
@@ -1225,7 +1245,8 @@ fn ensure_abort_registered(app: &AppHandle) -> bool {
         return false;
     };
     let manager = app.global_shortcut();
-    let live = manager.is_registered(state.shortcut) || manager.register(state.shortcut).is_ok();
+    let _ = manager.unregister(state.shortcut);
+    let live = manager.register(state.shortcut).is_ok();
     state.registered.store(live, Ordering::SeqCst);
     if live {
         state.notified_loss.store(false, Ordering::SeqCst);

@@ -24,6 +24,17 @@ A scrupulous Phase 4 ("guarded automation") re-review of the closed feature foun
 - `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (all pass; gated native/scale tests remain `#[ignore]`), `npm run lint`, `npm run build` — verbatim output in the PR.
 - The end-to-end approve→execute path and the abort-pill tri-state remain user-attested on Windows (they cannot run in CI); the runbook step is in `docs/design/p4-guarded-automation.md`.
 
+### PR #17 review follow-ups
+
+Addressed the Gemini / Codex / Claude review comments on the PR:
+
+- **Window left hidden on cancellation/panic (Gemini, high).** `with_foreground_yielded` restored the window with explicit `show()`/`set_focus()` after the operation, so a future dropped at an `.await` (task cancellation) or a panic could leave the window hidden indefinitely. Restoration now runs from a `WindowRestoreGuard`'s `Drop`, guaranteeing it across normal completion, cancellation, and unwind.
+- **Abort re-registration trusted a cache, not the OS (Codex, P1 — the important one).** `ensure_abort_registered` short-circuited on `manager.is_registered(...)`, but in `tauri-plugin-global-shortcut` 2.3.2 `is_registered` only consults the plugin's internal `shortcuts` map, not the OS — so a hotkey the OS silently reclaimed (while the cache entry remained) was never re-registered and the heartbeat kept reporting `abort_registered=true`. It now `unregister`s then `register`s each tick; `register` performs the real `RegisterHotKey`, so its result is OS truth (registering an already-OS-held hotkey fails, which is why the prior `unregister` is needed). The re-registered shortcut keeps dispatching through the plugin's global handler, so abort behavior is unchanged.
+- **Digest was modifier-order-sensitive (Claude, optional).** A key chord's modifiers are a set, but the digest hashed them in caller order, so a non-UI caller listing `[Shift, Control]` at execute after `[Control, Shift]` at approval would hit `plan_mismatch`. The canonical digest now sorts a chord's modifiers; the stored/displayed plan keeps the reviewed order. Covered by `automation_digest_ignores_modifier_order`.
+- Reviewers confirmed F1–F4 otherwise correct and fail-closed. The `Future` trait bound compiles via the Rust 2024 prelude (no explicit import needed); `AutomationKey::all()` remaining a hand-maintained array is an accepted, test-guarded trade-off.
+
+Verified after the follow-ups: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` — all pass.
+
 ## 2026-06-23 — P3 constrained-synthesis hardening
 
 ### Fixed

@@ -544,17 +544,42 @@ impl AutomationPlanV1 {
     /// case-insensitive identity comparison.
     pub fn canonical_digest(&self) -> Result<String, DomainError> {
         self.validate()?;
+        // A key chord's modifiers are a set (Ctrl+Shift == Shift+Ctrl), so normalize their order
+        // for the digest. Otherwise a non-UI caller that listed modifiers in a different order at
+        // execute time than at approval would hit a spurious `plan_mismatch`. The stored/displayed
+        // plan keeps the reviewed order; only the hashed view is normalized.
+        let actions: Vec<AutomationAction> = self
+            .actions
+            .iter()
+            .map(normalize_action_for_digest)
+            .collect();
         let canonical = CanonicalPlan {
             target: CanonicalTarget {
                 process_id: self.target.process_id,
                 window_handle: self.target.window_handle,
                 executable_name: self.target.executable_name.to_ascii_lowercase(),
             },
-            actions: &self.actions,
+            actions: &actions,
         };
         let encoded = serde_json::to_vec(&("screensearch.automation.v1", &canonical))
             .map_err(|error| DomainError::InvalidAutomation(error.to_string()))?;
         Ok(blake3::hash(&encoded).to_hex().to_string())
+    }
+}
+
+/// Returns a copy of `action` with key-chord modifiers sorted, so the canonical digest treats a
+/// chord's modifiers as an unordered set.
+fn normalize_action_for_digest(action: &AutomationAction) -> AutomationAction {
+    match action {
+        AutomationAction::KeyChord { modifiers, key } => {
+            let mut modifiers = modifiers.clone();
+            modifiers.sort_unstable();
+            AutomationAction::KeyChord {
+                modifiers,
+                key: *key,
+            }
+        }
+        other => other.clone(),
     }
 }
 
@@ -1579,6 +1604,24 @@ mod tests {
         assert_ne!(
             plan.canonical_digest().unwrap(),
             other_window.canonical_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn automation_digest_ignores_modifier_order() {
+        // A chord's modifiers are an unordered set, so modifier order must not change the digest;
+        // otherwise a non-UI caller could trigger a spurious plan mismatch at execute time.
+        let control_shift = automation_plan(vec![AutomationAction::KeyChord {
+            modifiers: vec![KeyModifier::Control, KeyModifier::Shift],
+            key: AutomationKey::S,
+        }]);
+        let shift_control = automation_plan(vec![AutomationAction::KeyChord {
+            modifiers: vec![KeyModifier::Shift, KeyModifier::Control],
+            key: AutomationKey::S,
+        }]);
+        assert_eq!(
+            control_shift.canonical_digest().unwrap(),
+            shift_control.canonical_digest().unwrap()
         );
     }
 
