@@ -37,7 +37,7 @@ Build reviewed: completed P0 truthful evidence loop and P1 semantic-retrieval/sc
 
 ## Deliberately skipped
 
-- An approved and installed default GGUF generation model, qualitative groundedness scoring, and memory-pressure-triggered model unload.
+- An approved and installed default GGUF generation model and qualitative groundedness scoring. (Memory-pressure-triggered model unload is now implemented; see "Risks found" #5.)
 - Model acquisition/release selection, signing, factory reset of database/model files, capture-side locked-session privacy handling, and release-hardening item 18.
 
 ## Placeholder behavior that must not be mistaken for product behavior
@@ -58,7 +58,7 @@ Build reviewed: completed P0 truthful evidence loop and P1 semantic-retrieval/sc
 2. Capture and analysis share one daemon; queue backpressure is implemented, but model process isolation remains necessary for release resilience.
 3. First model acquisition currently depends on Hugging Face connectivity and lacks a signed manifest flow.
 4. The fixed 384-dimensional vector table is correct for MiniLM but requires a new migration for future dimensions.
-5. The native model-worker boundary is now supervised (bounded restarts + parent lifeline) and exercised by gated integration tests with local GGUF candidates; GAP-002/GAP-003 model decisions, qualitative answer scoring, and GAP-008 memory-pressure unload remain before item 15 can close.
+5. The native model-worker boundary is now supervised (bounded restarts + parent lifeline) and exercised by gated integration tests with local GGUF candidates; GAP-002/GAP-003 model decisions and qualitative answer scoring remain before item 15 can close. GAP-008 memory-pressure unload is now implemented (OS low-memory resource notification; live pressure path pending manual Windows attestation).
 6. Current logging review has not yet proven that all future native errors are content-free.
 7. Long-duration capture CPU/storage growth and perceptual-threshold tuning remain release-hardening work beyond the completed P1 engineering baseline.
 8. Guarded automation is intentionally default-off and narrowly scoped. Support policy, packaging/signing, and broader release-hardening remain before public release.

@@ -2,6 +2,23 @@
 
 This log records meaningful AI-assisted repository changes and their reasons. It is not a substitute for Git history.
 
+## 2026-06-23 — P3 constrained-synthesis hardening
+
+### Fixed
+
+- **Memory-pressure model unload (GAP-008, spec §11).** The resident generation model previously unloaded only on an idle timeout, but spec §11 requires unload on "an idle timeout **or** a memory-pressure signal." Added a safe `MemoryPressureMonitor` in `crates/windows` wrapping `CreateMemoryResourceNotification(LowMemoryResourceNotification)` + `QueryMemoryResourceNotification` (all `unsafe` FFI confined to that crate, exposed as `Result<bool, PortError>`). The daemon's existing `idle_unload_loop` now queries it each tick and unloads via the same raw worker-unload path when Windows signals low memory, logging `reason = "memory_pressure" | "idle"`. The decision is a pure, unit-tested `should_unload_generation`; no new env vars (the OS notification is the threshold). The live low-memory path is gated (`#[ignore]`) and needs manual Windows attestation.
+- **Prompt injection hardening (GAP-011).** `assemble_prompt` wrote untrusted `application`, `window_title`, and OCR text into the answer prompt with raw `writeln!`, guarded only by a textual "untrusted evidence" instruction. Added `sanitize_untrusted_field`: control characters (including CR/LF/Tab) collapse to single spaces and `[`/`]` are rewritten to fullwidth U+FF3B/U+FF3D, so an adversarial window title can neither start its own prompt line (a forged field or instruction) nor forge a `[capture-id]` citation. Genuine citation lines use the daemon-emitted `capture_id` and are untouched. Covered by `prompt_neutralizes_adversarial_metadata` and a direct helper test.
+- **Stale documentation.** `06_PATCH_PLAN.md` claimed the stored `context_tokens` was 2048; the live constant is `GENERATION_CONTEXT_TOKENS = 4096`, which the daemon stamps on download. Corrected the note and updated the GAP-008/GAP-011 status in `07_KNOWN_GAPS.md`.
+
+### Why
+
+A scrupulous Phase 3 ("constrained synthesis") review found the generation plumbing, worker supervision, idle unload, citations, and no-evidence path genuinely implemented, but two engineering gaps the specs themselves flagged open (GAP-008 memory-pressure unload, GAP-011 metadata prompt hardening) were unaddressed, plus a documentation-truthfulness drift. Model approval/acquisition (GAP-002/GAP-003), code signing (GAP-005), qualitative groundedness scoring, and release hardening (item 18) remain product/legal decisions and are out of scope. The model-revision-isolation invariant was confirmed already covered by `hybrid_ranking_boosts_exact_text_and_excludes_other_model_revisions`, so no duplicate test was added.
+
+### Verification
+
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` — see the PR for verbatim output.
+- The live Windows memory-pressure probe (`cargo test -p screensearch-windows -- --ignored`) and the full GUI paths remain user-attested (they cannot run in CI).
+
 ## 2026-06-23 — P2 product-shell review remediation
 
 ### Fixed

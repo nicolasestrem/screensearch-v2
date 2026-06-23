@@ -17,9 +17,12 @@
 - Implemented Guarded Automation V1 behind explicit default-off opt-in.
 - Added domain validation, content-free persistence, daemon orchestration, typed IPC/Tauri commands, native Windows UIA/keyboard emission, and the manual approval UI.
 - Added a gated synthetic Windows automation fixture for opt-in native verification.
+- Unloaded the resident generation model on a Windows low-memory resource notification in addition to the idle timeout (GAP-008, spec §11): a safe `MemoryPressureMonitor` wraps `CreateMemoryResourceNotification`, the existing idle-unload loop queries it each tick, and a pure `should_unload_generation` policy is unit-tested. The live pressure path is pending manual Windows attestation.
 
 ### Changed
 
+- Hardened answer prompts against adversarial capture metadata (GAP-011): the untrusted application, window title, and OCR excerpt are sanitized before entering the prompt — control characters and newlines collapse to single spaces and `[`/`]` are rewritten to their fullwidth forms — so a hostile window title can neither begin its own prompt line nor forge a `[capture-id]` citation; covered by `prompt_neutralizes_adversarial_metadata`.
+- Corrected a stale patch-plan note: the fixed generation evaluation context is `GENERATION_CONTEXT_TOKENS` (4096), not 2048.
 - Hardened the orphan asset sweep after PR review: candidate-first walk that skips symlinked entries (root-confinement) and tolerates files vanishing mid-walk, bounded `IN (...)` reconciliation instead of loading every asset hash, an mtime refresh on reused files to close a capture/sweep race, and once-per-hour throttling.
 - Clarified embedding-manifest provenance: `revision_hash` is the advertised upstream revision (fastembed downloads `main` unpinned); within-archive isolation is enforced by `model_id`, with hard pinning tracked under GAP-002/GAP-003.
 - Added deterministic "equal jitter" to the analysis-job retry backoff (`base/2 + hash(job, attempt) mod base/2`) so retries de-correlate while staying reproducible and bounded by the exponential cap (spec §6).
