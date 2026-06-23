@@ -178,9 +178,18 @@ function previewCitation(
     capturedAt: new Date(Date.now() - hoursAgo * 3_600_000).toISOString(),
     application,
     windowTitle: title,
-    width: 2560,
-    height: 1080,
-    bounds: [{ x: 0.64, y: 0.19, width: 0.22, height: 0.22 }],
+    // The preview fixture (public/qa-capture.png) is a real 2600×1088 ultrawide capture.
+    // Declaring its true dimensions and placing bounds over actual on-screen text makes the
+    // dev-server / browser QA exercise OCR-overlay alignment: the CSS boxes are 16:9 (thumbnail)
+    // and ~16:8.1 (large), so this ultrawide image is letterboxed and overlays must track the
+    // rendered image rect, not the container box.
+    width: 2600,
+    height: 1088,
+    bounds: [
+      { x: 0.1585, y: 0.083, width: 0.073, height: 0.026 },
+      { x: 0.1585, y: 0.142, width: 0.192, height: 0.123 },
+      { x: 0.6275, y: 0.10, width: 0.125, height: 0.03 },
+    ],
     matchKind: index % 3 === 0 ? "hybrid" : index % 2 === 0 ? "semantic" : "lexical",
     ocrModelId: "windows-media-ocr",
     embeddingModelId: "fastembed-all-minilm-l6-v2-q-384-v1",

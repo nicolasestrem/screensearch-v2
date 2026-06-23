@@ -33,8 +33,14 @@
 - Fixed llama.cpp sidecar stdout decoding so generated answers stream visible tokens, and made the evidence rail buttons select/focus recent or visual evidence instead of becoming no-ops.
 - Incrementally sanitized llama.cpp sidecar stdout before displaying answers, added content-free sidecar lifecycle logs, disabled sidecar reasoning output where supported, pinned deterministic sampler flags, capped sidecar downloads before extraction, and made release overrides reinstall when the installed sidecar tag differs.
 
+### Fixed
+
+- Fixed OCR highlight overlays drifting off the screenshot text whenever a capture's aspect ratio differed from the inspector box (ultrawide, portrait/rotated monitors, or when the `max-height` clamp engaged): overlays are now measured against the actually-rendered `object-fit: contain` image rectangle (via a `ResizeObserver`) instead of the letterboxed container, in both the timeline thumbnail and the large detail view.
+- Fixed the guarded-automation dialog not trapping `Tab`/`Shift+Tab` focus (the settings dialog already did), and stopped `Home`/`End` from also moving the evidence timeline while a detail tab is focused; the dialog focus trap is now a single shared hook used by both dialogs.
+
 ### Documentation
 
+- Recorded the P2 OCR-overlay alignment defect (missed by the original visual QA, which exercised synthetic bounds over blank space) and its fix in `docs/design/p2-shell.md`, including a new non-16:9 / portrait overlay-alignment check in the manual Windows runbook.
 - Recorded known gaps for source-vocabulary expansion, client timezone propagation, and further prompt hardening for application/window-title metadata.
 - Added `docs/design/useful-local-answers.md` and narrowed the remaining patch plan to genuine item-15 and item-18 release gaps.
 - Addressed PR #10 review feedback by making the GGUF full-GPU-offload sentinel explicit and correcting stale Claude changelog guidance.

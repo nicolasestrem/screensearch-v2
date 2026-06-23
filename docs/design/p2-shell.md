@@ -143,6 +143,25 @@ field is focused; the detail tablist responds to arrow keys; the settings dialog
 control, traps `Tab`, and restores focus on `Escape`; the hotkey-capture control records
 `Ctrl+Shift+J` → `Ctrl Shift J`; and `Ctrl+K` focuses and selects the search field.
 
+### OCR overlay alignment (review fix, 2026-06-23)
+
+A scrupulous P2 review found that the OCR highlight overlays were positioned by **percentage of
+the `.capture-image` container**, but the screenshot is rendered with `object-fit: contain` inside
+fixed-aspect CSS boxes (thumbnail 16:9, large ~16:8.1 with a `max-height: 49vh` clamp). On any
+capture whose aspect ratio differs from the box — ultrawide, portrait/rotated monitors, or once
+the clamp engages — the image letterboxes but the overlays stayed anchored to the full container,
+so the green boxes drifted off the text. This escaped the original visual QA because the dev-server
+preview drew **synthetic bounds over blank space** rather than over real OCR'd text.
+
+The overlays are now measured against the actually-rendered image rectangle (`useContainedRect`:
+`useLayoutEffect` + `ResizeObserver` + `object-fit: contain` math) and positioned in pixels, in
+both the timeline thumbnail and the large detail view. The preview fixture (`api.ts`) now declares
+the true `qa-capture.png` dimensions (2600×1088) with bounds over real on-screen text, so browser
+QA exercises alignment. Verified with Playwright against the dev server: in the large detail view
+the box clamped to aspect 2.046 against the 2.39 fixture applies a 31.6 px top letterbox and the
+overlays land on the text; the thumbnail applies an 8.64 px letterbox; both track across window
+resizes.
+
 ### Manual Windows end-to-end runbook (required to close item 14)
 
 The native tray, global hotkey, and hide-to-tray runtime can only be confirmed on a real Windows
@@ -183,12 +202,19 @@ Checklist (tick each; expected result in parentheses):
       the app stays stable with the previous hotkey active.
 - [x] Stop the daemon (Ctrl+C in terminal 1): the tray tooltip becomes
       `ScreenSearch V2 — Daemon offline`; the shell stays alive and the window still opens.
+- [ ] (Added 2026-06-23) Open a capture taken on a **non-16:9 monitor** — ideally an ultrawide
+      (21:9/32:9) and a portrait/rotated display — and inspect it. The green OCR highlight boxes
+      must frame the actual on-screen text with no drift, in both the timeline thumbnail and the
+      large detail view, and must stay aligned as you resize the window.
 
-Record the outcome below when complete:
+The tray/hotkey/hide-to-tray items below were attested on 2026-06-22. The 2026-06-23 overlay
+check is new and awaits user attestation on real non-16:9 captures (browser QA against the preview
+fixture already confirmed the alignment math).
 
 ```
-manual windows e2e result: passed
+manual windows e2e result: passed (tray/hotkey/hide-to-tray)
 tested by: user-attested   date: 2026-06-22   build: 1d88405
+overlay alignment (non-16:9): pending user attestation   added: 2026-06-23
 ```
 
 ## Troubleshooting
