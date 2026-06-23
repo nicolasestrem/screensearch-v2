@@ -266,9 +266,14 @@ message AutomationStatusRequest {}
 
 message AutomationStatusResponse {
   bool enabled = 1;
+  // True only when a fresh shell heartbeat reports the emergency-abort shortcut is registered.
   bool abort_available = 2;
   bool abort_active = 3;
   bool running = 4;
+  // True when a shell heartbeat arrived within the staleness window, regardless of registration.
+  bool heartbeat_fresh = 5;
+  // The last shell-reported abort-shortcut registration state (meaningful only when fresh).
+  bool abort_registered = 6;
 }
 
 message SetAutomationEnabledRequest {

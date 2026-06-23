@@ -111,3 +111,28 @@ cargo test -p screensearch-windows guarded_windows_automation_fixture_exercises_
 
 The committed fixture verifies UIA set-value, UIA invoke, UTF-16 text input, key-chord fallback,
 and foreground rejection against its owned synthetic Win32 window.
+
+The fixture drives the native adapter directly and therefore does **not** exercise the daemon
+approval/execute flow. The end-to-end approval path can only be confirmed manually:
+
+1. Run `npm run tauri dev` against a running daemon, open Guarded automation, accept the warning,
+   and Enable.
+2. Capture a target (e.g. Notepad), build a `type_text` action, and **Approve** — this must
+   succeed (before the 2026-06-23 fix it always failed with `target_changed` because the shell did
+   not yield the foreground during approval).
+3. **Execute approved** and confirm the text reaches the target application.
+4. Press `Ctrl+Alt+Shift+Esc` during a run and confirm the abort latches.
+5. With the abort shortcut held by another application, confirm the abort pill reads
+   "Unavailable" (not merely a blank/"Reconnecting" state) and that automation cannot be enabled.
+
+## Review follow-ups (2026-06-23)
+
+- The shell hides its window for capture, **approve**, and execute (a shared helper) so the
+  external target is foreground during the daemon's identity checks.
+- The canonical plan digest binds to target identity (PID/HWND/lowercased executable) and the
+  ordered actions only; `display_title` is excluded so a retitle does not cause `plan_mismatch`.
+- The abort shortcut registration is re-asserted on every heartbeat; the status reports
+  `heartbeat_fresh` and `abort_registered` so the UI can tell "hotkey unavailable" from "daemon
+  reconnecting".
+- Abort and the execution deadline stop the run *between actions*; a single native action is one
+  syscall and finishes before the run stops (a bounded one-in-flight residual).

@@ -2,6 +2,28 @@
 
 This log records meaningful AI-assisted repository changes and their reasons. It is not a substitute for Git history.
 
+## 2026-06-23 — P4 guarded-automation review hardening
+
+### Fixed
+
+- **Approval was unreachable through the UI (feature-breaking).** The daemon's `AutomationService::approve` runs the spec-mandated approval-time foreground-identity check (`check_target` → `matches_identity`). The capture and execute Tauri commands hide the ScreenSearch window so the external target is foreground during the daemon's checks, but `approve_automation` did not — so ScreenSearch was the foreground window when the user clicked Approve and every approval returned `target_changed`. Extracted the shared `with_foreground_yielded(app, fut)` helper (hide → 200 ms settle → request → show + focus) and routed capture, approve, and execute through it. Added a daemon-layer regression test `approval_requires_the_target_to_be_foreground_not_the_shell`.
+- **Abort-shortcut fail-open.** The shell stored a one-time startup `register(...).is_ok()` snapshot in an `AtomicBool` that was never refreshed and only read by the heartbeat, so a later loss of the `Ctrl+Alt+Shift+Esc` registration (e.g. a summon-hotkey rebind, or OS reclaim) could still be reported to the daemon as live. `spawn_automation_heartbeat` now calls `ensure_abort_registered` each tick, which queries `is_registered` and re-registers if needed, stores the live truth, and notifies once on a transition to unavailable.
+- **Digest bound a volatile field.** `AutomationPlanV1::canonical_digest` hashed the whole plan including `AutomationTarget.display_title`, which `matches_identity` deliberately excludes as volatile — so a window retitling itself between approve and execute would yield `plan_mismatch`. The digest now hashes an identity-only view (PID, HWND, lowercased executable) plus the ordered actions. Added `execution_accepts_title_only_changes` and a domain digest test.
+
+### Changed
+
+- **Diagnosable abort status.** `AutomationStatusResponse` gained `heartbeat_fresh` and `abort_registered` (additive proto fields, recomputed in `AutomationService::status` from a heartbeat snapshot that now stores the reported registration bit on every beat). The desktop renders a three-state pill — Live / Unavailable / Reconnecting — instead of one ambiguous "Unavailable".
+- **Centralized key mapping (drift tripwire).** UI-token ↔ wire ↔ domain key/modifier conversion moved into `screensearch-ipc::convert`, shared by the daemon (`parse_automation_*`) and shell (`map_automation_*`). The token vocabulary is single-sourced in the domain (`AutomationKey::all`/`ui_token`, `KeyModifier::all`/`ui_token`) and the domain↔wire mappings are exhaustive, so a new key fails to compile until handled. A new `crates/ipc/tests/automation_keymap.rs` round-trips every variant.
+
+### Why
+
+A scrupulous Phase 4 ("guarded automation") re-review of the closed feature found that, despite faithful domain/persistence/IPC/native layers, the approval workflow was broken end-to-end (no test exercised the real approve→daemon foreground path), plus three correctness/robustness gaps. The user approved the fullest remediation scope (all findings, including the proto status fields and the IPC-crate conversion relocation). No production safety invariant was weakened; the daemon still fails closed on every gate.
+
+### Verification
+
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (all pass; gated native/scale tests remain `#[ignore]`), `npm run lint`, `npm run build` — verbatim output in the PR.
+- The end-to-end approve→execute path and the abort-pill tri-state remain user-attested on Windows (they cannot run in CI); the runbook step is in `docs/design/p4-guarded-automation.md`.
+
 ## 2026-06-23 — P3 constrained-synthesis hardening
 
 ### Fixed

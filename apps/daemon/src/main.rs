@@ -32,7 +32,6 @@ use screensearch_ipc::{
     v1::{
         AbortAutomationResponse, ApproveAutomationResponse, ArchiveSettingsResponse,
         AutomationAction as IpcAutomationAction, AutomationForegroundTargetResponse,
-        AutomationKey as IpcAutomationKey, AutomationKeyModifier as IpcAutomationKeyModifier,
         AutomationPlanV1 as IpcAutomationPlan, AutomationSafetyHeartbeatResponse,
         AutomationStatusResponse, AutomationTarget as IpcAutomationTarget, CaptureAssetResponse,
         CaptureResponse, Citation, DeleteCapturesResponse, DeleteGenerationModelResponse,
@@ -1180,6 +1179,8 @@ fn map_automation_status(
         abort_available: status.abort_available,
         abort_active: status.abort_active,
         running: status.running,
+        heartbeat_fresh: status.heartbeat_fresh,
+        abort_registered: status.abort_registered,
     }
 }
 
@@ -1241,87 +1242,13 @@ fn parse_automation_action(action: IpcAutomationAction) -> Result<AutomationActi
 }
 
 fn parse_automation_modifier(value: i32) -> Result<KeyModifier, PortError> {
-    match IpcAutomationKeyModifier::try_from(value)
-        .map_err(|_| PortError::InvalidData("unknown automation key modifier".to_owned()))?
-    {
-        IpcAutomationKeyModifier::Control => Ok(KeyModifier::Control),
-        IpcAutomationKeyModifier::Alt => Ok(KeyModifier::Alt),
-        IpcAutomationKeyModifier::Shift => Ok(KeyModifier::Shift),
-        IpcAutomationKeyModifier::Unspecified => Err(PortError::InvalidData(
-            "automation key modifier is unspecified".to_owned(),
-        )),
-    }
+    screensearch_ipc::convert::modifier_to_domain(value)
+        .map_err(|error| PortError::InvalidData(error.to_string()))
 }
 
-#[allow(clippy::too_many_lines)]
 fn parse_automation_key(value: i32) -> Result<AutomationKey, PortError> {
-    let key = IpcAutomationKey::try_from(value)
-        .map_err(|_| PortError::InvalidData("unknown automation key".to_owned()))?;
-    match key {
-        IpcAutomationKey::Unspecified => Err(PortError::InvalidData(
-            "automation key is unspecified".to_owned(),
-        )),
-        IpcAutomationKey::A => Ok(AutomationKey::A),
-        IpcAutomationKey::B => Ok(AutomationKey::B),
-        IpcAutomationKey::C => Ok(AutomationKey::C),
-        IpcAutomationKey::D => Ok(AutomationKey::D),
-        IpcAutomationKey::E => Ok(AutomationKey::E),
-        IpcAutomationKey::F => Ok(AutomationKey::F),
-        IpcAutomationKey::G => Ok(AutomationKey::G),
-        IpcAutomationKey::H => Ok(AutomationKey::H),
-        IpcAutomationKey::I => Ok(AutomationKey::I),
-        IpcAutomationKey::J => Ok(AutomationKey::J),
-        IpcAutomationKey::K => Ok(AutomationKey::K),
-        IpcAutomationKey::L => Ok(AutomationKey::L),
-        IpcAutomationKey::M => Ok(AutomationKey::M),
-        IpcAutomationKey::N => Ok(AutomationKey::N),
-        IpcAutomationKey::O => Ok(AutomationKey::O),
-        IpcAutomationKey::P => Ok(AutomationKey::P),
-        IpcAutomationKey::Q => Ok(AutomationKey::Q),
-        IpcAutomationKey::R => Ok(AutomationKey::R),
-        IpcAutomationKey::S => Ok(AutomationKey::S),
-        IpcAutomationKey::T => Ok(AutomationKey::T),
-        IpcAutomationKey::U => Ok(AutomationKey::U),
-        IpcAutomationKey::V => Ok(AutomationKey::V),
-        IpcAutomationKey::W => Ok(AutomationKey::W),
-        IpcAutomationKey::X => Ok(AutomationKey::X),
-        IpcAutomationKey::Y => Ok(AutomationKey::Y),
-        IpcAutomationKey::Z => Ok(AutomationKey::Z),
-        IpcAutomationKey::Digit0 => Ok(AutomationKey::Digit0),
-        IpcAutomationKey::Digit1 => Ok(AutomationKey::Digit1),
-        IpcAutomationKey::Digit2 => Ok(AutomationKey::Digit2),
-        IpcAutomationKey::Digit3 => Ok(AutomationKey::Digit3),
-        IpcAutomationKey::Digit4 => Ok(AutomationKey::Digit4),
-        IpcAutomationKey::Digit5 => Ok(AutomationKey::Digit5),
-        IpcAutomationKey::Digit6 => Ok(AutomationKey::Digit6),
-        IpcAutomationKey::Digit7 => Ok(AutomationKey::Digit7),
-        IpcAutomationKey::Digit8 => Ok(AutomationKey::Digit8),
-        IpcAutomationKey::Digit9 => Ok(AutomationKey::Digit9),
-        IpcAutomationKey::Enter => Ok(AutomationKey::Enter),
-        IpcAutomationKey::Escape => Ok(AutomationKey::Escape),
-        IpcAutomationKey::Tab => Ok(AutomationKey::Tab),
-        IpcAutomationKey::Space => Ok(AutomationKey::Space),
-        IpcAutomationKey::Backspace => Ok(AutomationKey::Backspace),
-        IpcAutomationKey::Delete => Ok(AutomationKey::Delete),
-        IpcAutomationKey::ArrowLeft => Ok(AutomationKey::ArrowLeft),
-        IpcAutomationKey::ArrowRight => Ok(AutomationKey::ArrowRight),
-        IpcAutomationKey::ArrowUp => Ok(AutomationKey::ArrowUp),
-        IpcAutomationKey::ArrowDown => Ok(AutomationKey::ArrowDown),
-        IpcAutomationKey::Home => Ok(AutomationKey::Home),
-        IpcAutomationKey::End => Ok(AutomationKey::End),
-        IpcAutomationKey::F1 => Ok(AutomationKey::F1),
-        IpcAutomationKey::F2 => Ok(AutomationKey::F2),
-        IpcAutomationKey::F3 => Ok(AutomationKey::F3),
-        IpcAutomationKey::F4 => Ok(AutomationKey::F4),
-        IpcAutomationKey::F5 => Ok(AutomationKey::F5),
-        IpcAutomationKey::F6 => Ok(AutomationKey::F6),
-        IpcAutomationKey::F7 => Ok(AutomationKey::F7),
-        IpcAutomationKey::F8 => Ok(AutomationKey::F8),
-        IpcAutomationKey::F9 => Ok(AutomationKey::F9),
-        IpcAutomationKey::F10 => Ok(AutomationKey::F10),
-        IpcAutomationKey::F11 => Ok(AutomationKey::F11),
-        IpcAutomationKey::F12 => Ok(AutomationKey::F12),
-    }
+    screensearch_ipc::convert::key_to_domain(value)
+        .map_err(|error| PortError::InvalidData(error.to_string()))
 }
 
 fn automation_error_response(request_id: String, error: &PortError) -> ResponseEnvelope {

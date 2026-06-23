@@ -81,6 +81,8 @@ export interface AutomationStatus {
   abortAvailable: boolean;
   abortActive: boolean;
   running: boolean;
+  heartbeatFresh: boolean;
+  abortRegistered: boolean;
 }
 
 export interface AutomationTarget {
@@ -150,6 +152,8 @@ let previewAutomationStatus: AutomationStatus = {
   abortAvailable: true,
   abortActive: false,
   running: false,
+  heartbeatFresh: true,
+  abortRegistered: true,
 };
 let previewAutomationApproval: AutomationApproval | null = null;
 let previewSettings: ArchiveSettings = {
