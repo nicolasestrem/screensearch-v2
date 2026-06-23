@@ -2,6 +2,39 @@
 
 This log records meaningful AI-assisted repository changes and their reasons. It is not a substitute for Git history.
 
+## 2026-06-23 — P2 product-shell review remediation
+
+### Fixed
+
+- **OCR overlay alignment (P1, core evidence feature).** OCR highlight overlays were positioned by percentage of the `.capture-image` container, but the `<img>` uses `object-fit: contain` inside fixed-aspect CSS boxes (thumbnail 16:9, large ~16:8.1 with a `max-height: 49vh` clamp). For any capture whose aspect ratio differed from the box (ultrawide, portrait/rotated monitors, or once the clamp engaged) the image letterboxed but the overlays stayed anchored to the full container, so the boxes drifted off the text. Added a `useContainedRect` hook (`useLayoutEffect` + `ResizeObserver`, content-box measurement, `object-fit: contain` math) and positioned overlays in pixels relative to the actually-rendered image rect. Verified live in the browser: the large detail box clamped to aspect 2.046 against the 2.39 fixture applies a 31.6 px top letterbox and overlays land on text; the thumbnail applies an 8.64 px letterbox; both track across viewport resizes.
+- **Dialog focus trap + keyboard conflict (a11y).** The guarded-automation dialog focused its first control but never trapped `Tab` (the settings dialog already trapped it), so `Tab` could escape to the page behind — contrary to the documented "dialogs trap Tab focus." Extracted the trap into a shared `useDialogFocusTrap` hook used by both dialogs. Also added `event.stopPropagation()` to the detail-tab `onKeyDown` so the global window handler no longer also moves the timeline selection on `Home`/`End`, and `event.preventDefault()` to the Escape-to-blur branch. Made `aria-current` explicit (`"true"`).
+
+### Changed
+
+- Reworked the desktop preview fixture (`api.ts`): the synthetic citation now declares a 2600×1088 ultrawide asset with bounds over real text, so `npm run dev` / browser QA exercises overlay alignment instead of drawing boxes on blank space (the gap that let the original defect ship). The preview asset is a committed self-contained SVG (see the PR #15 review follow-up below) rather than a gitignored real capture.
+- Added concise `///` doc comments to the desktop Tauri command boundary in `apps/desktop/src-tauri/src/main.rs` (maintainability; the binary crate does not trip `missing_docs`).
+
+### Why
+
+A scrupulous re-review of the closed P2 product shell against the specs found the shell solid but caught one real defect in the screenshot-grounded evidence feature — OCR overlays misaligned on non-16:9 captures — which escaped QA because the browser QA used synthetic bounds unrelated to text and the manual runbook never checked alignment. Two agent-flagged items were rejected after verification: `aria-current={selected || undefined}` is valid (React stringifies `true`), and "missing docs on Tauri commands fails clippy" is false (the desktop crate is a binary, so `missing_docs` never fires).
+
+### Verification
+
+- `npm run lint`, `npm run build` (apps/desktop) — clean.
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (52 passed, 7 gated `#[ignore]`d) — clean.
+- Live browser QA (Playwright against the dev server): overlay alignment on the large detail and thumbnail with the letterbox offset applied; `Home`/`End` on a focused detail tab moved the tab but not the timeline selection; `Tab` wrapped inside the automation dialog.
+- Native Windows tray/hotkey and the new non-16:9 / portrait overlay check remain user-attested (the Tauri GUI cannot run in CI).
+
+### PR #15 review follow-up
+
+Addressed the Claude / Codex / Gemini review comments on the PR:
+
+- **Codex (P2) — preview asset was missing.** The preview fetched `/qa-capture.png`, but that file is **gitignored** (it is a real screen capture, which the project must never commit), so on any other clone the fetch 404s and the new bounds never exercise alignment. Replaced the fetch with a committed, self-contained **synthetic SVG fixture** (`previewCaptureSvg` in `api.ts`, 2600×1088 ultrawide with text drawn under the citation bounds), returned as `image/svg+xml`. No binary asset, no user screen data, and preview/QA never 404s.
+- **Gemini (medium) + Claude — focus-trap robustness.** Hardened `useDialogFocusTrap`: the focusable query now adds `summary` (so `<details>` boundaries are trapped), and filters to elements that can actually receive Tab focus — enabled, `tabIndex !== -1`, non-hidden inputs, and currently rendered (`getClientRects().length > 0`, which drops `display:none` elements). Added escaped-focus recovery (`!root.contains(activeElement)` → focus first). Verified the settings dialog (which contains a `<details>`) and automation dialog still trap and wrap `Tab` first↔last.
+- **Claude (cosmetic).** Documented why `ref` stays in the `useContainedRect` dependency array (stable identity; satisfies exhaustive-deps without causing re-runs).
+
+Re-verified: `npm run lint` / `npm run build` clean; live Playwright browser QA re-confirmed overlay alignment against the new SVG fixture (large + thumbnail, letterbox offset applied) and the settings/automation dialog focus traps. Rust gates unchanged (no Rust edits in this follow-up).
+
 ## 2026-06-23 — Phase 0→1 review remediation
 
 ### Changed

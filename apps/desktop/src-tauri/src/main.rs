@@ -402,6 +402,7 @@ fn map_automation_target_response(target: IpcAutomationTarget) -> AutomationTarg
     }
 }
 
+/// Returns the current guarded-automation status (enabled flag, abort availability/state, running).
 #[tauri::command]
 async fn automation_status() -> Result<AutomationStatus, AutomationCommandError> {
     let responses = request(request_envelope::Body::AutomationStatus(
@@ -425,6 +426,7 @@ async fn automation_status() -> Result<AutomationStatus, AutomationCommandError>
     ))
 }
 
+/// Enables or disables guarded automation and returns the updated status.
 #[tauri::command]
 async fn set_automation_enabled(enabled: bool) -> Result<AutomationStatus, AutomationCommandError> {
     let responses = request(request_envelope::Body::SetAutomationEnabled(
@@ -451,6 +453,7 @@ async fn set_automation_enabled(enabled: bool) -> Result<AutomationStatus, Autom
     ))
 }
 
+/// Captures the current foreground window as an automation target (hides the shell briefly first).
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 async fn automation_foreground_target(
@@ -493,6 +496,7 @@ async fn automation_foreground_target(
     result
 }
 
+/// Validates and approves an automation plan, returning a time-limited approval token.
 #[tauri::command]
 async fn approve_automation(
     plan: AutomationPlan,
@@ -524,6 +528,7 @@ async fn approve_automation(
     ))
 }
 
+/// Executes a previously approved automation plan against its captured foreground target.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 async fn execute_automation(
@@ -569,6 +574,7 @@ async fn execute_automation(
     result
 }
 
+/// Latches the emergency automation abort, stopping any in-flight execution.
 #[tauri::command]
 async fn abort_automation() -> Result<bool, AutomationCommandError> {
     let responses = request(request_envelope::Body::AbortAutomation(
@@ -592,6 +598,7 @@ async fn abort_automation() -> Result<bool, AutomationCommandError> {
     ))
 }
 
+/// Clears a latched automation abort so a plan can be approved and executed again.
 #[tauri::command]
 async fn reset_automation_abort() -> Result<bool, AutomationCommandError> {
     let responses = request(request_envelope::Body::ResetAutomationAbort(
@@ -637,6 +644,7 @@ async fn send_automation_heartbeat(abort_registered: bool) -> Result<(), Automat
     ))
 }
 
+/// Returns daemon health: capture state, queue depth, and index/asset counts.
 #[tauri::command]
 async fn health() -> Result<HealthStatus, String> {
     fetch_health().await
@@ -699,6 +707,7 @@ fn set_shell_settings(
     Ok(settings)
 }
 
+/// Returns the persisted archive settings (retention, disk budget, exclusions) and storage totals.
 #[tauri::command]
 async fn archive_settings() -> Result<ArchiveSettings, String> {
     let responses = request(request_envelope::Body::GetArchiveSettings(
@@ -717,6 +726,7 @@ async fn archive_settings() -> Result<ArchiveSettings, String> {
     Err("daemon returned no archive settings".to_owned())
 }
 
+/// Updates retention, disk budget, and capture exclusions, applying them to the live daemon policy.
 #[tauri::command]
 async fn update_archive_settings(
     retention_days: Option<u32>,
@@ -752,6 +762,7 @@ async fn update_archive_settings(
     Err("daemon returned no settings update".to_owned())
 }
 
+/// Pauses capture and permanently deletes all captures, OCR, and search indexes (models kept).
 #[tauri::command]
 async fn delete_all_captures(confirmed: bool) -> Result<DeleteResult, String> {
     let responses = request(request_envelope::Body::DeleteCaptures(
@@ -791,6 +802,7 @@ fn map_archive_settings(
     }
 }
 
+/// Pauses or resumes automatic capture and returns the new paused state.
 #[tauri::command]
 async fn set_capture_paused(paused: bool) -> Result<bool, String> {
     let responses = request(request_envelope::Body::SetCapturePaused(
@@ -809,6 +821,7 @@ async fn set_capture_paused(paused: bool) -> Result<bool, String> {
     Err("daemon returned no capture state response".to_owned())
 }
 
+/// Queues a single immediate capture of the focused monitor without changing the cadence.
 #[tauri::command]
 async fn capture_once() -> Result<CaptureResult, String> {
     let responses = request(request_envelope::Body::Capture(CaptureRequest {})).await?;
@@ -828,6 +841,7 @@ async fn capture_once() -> Result<CaptureResult, String> {
     Err("daemon returned no capture response".to_owned())
 }
 
+/// Drains up to `maximum` pending analysis jobs and returns how many were processed.
 #[tauri::command]
 async fn process_jobs(maximum: u32) -> Result<u32, String> {
     let responses = request(request_envelope::Body::ProcessJobs(ProcessJobsRequest {
@@ -844,6 +858,7 @@ async fn process_jobs(maximum: u32) -> Result<u32, String> {
     Err("daemon returned no job response".to_owned())
 }
 
+/// Fetches the screenshot bytes for a capture id (subject to the daemon's preview size cap).
 #[tauri::command]
 async fn capture_asset(capture_id: String) -> Result<CaptureAsset, String> {
     let responses = request(request_envelope::Body::GetCaptureAsset(
@@ -865,6 +880,7 @@ async fn capture_asset(capture_id: String) -> Result<CaptureAsset, String> {
     Err("daemon returned no capture asset".to_owned())
 }
 
+/// Lists the installed local generation (answer) models and which one is active.
 #[tauri::command]
 async fn generation_models() -> Result<Vec<GenerationModel>, String> {
     let responses = request(request_envelope::Body::ListGenerationModels(
@@ -887,6 +903,7 @@ async fn generation_models() -> Result<Vec<GenerationModel>, String> {
     Err("daemon returned no generation model list".to_owned())
 }
 
+/// Imports a local GGUF file into the model catalog, optionally selecting it as active.
 #[tauri::command]
 async fn import_local_generation_model(
     source_path: String,
@@ -903,6 +920,7 @@ async fn import_local_generation_model(
     .await
 }
 
+/// Downloads a named GGUF from a Hugging Face repository into the catalog, optionally selecting it.
 #[tauri::command]
 async fn download_generation_model(
     repository: String,
@@ -921,6 +939,7 @@ async fn download_generation_model(
     .await
 }
 
+/// Marks an installed generation model as the active answer model.
 #[tauri::command]
 async fn select_generation_model(model_id: String) -> Result<GenerationModel, String> {
     generation_model_command(request_envelope::Body::SelectGenerationModel(
@@ -929,6 +948,7 @@ async fn select_generation_model(model_id: String) -> Result<GenerationModel, St
     .await
 }
 
+/// Deletes an installed generation model and its files; the active model cannot be deleted.
 #[tauri::command]
 async fn delete_generation_model(model_id: String) -> Result<bool, String> {
     let responses = request(request_envelope::Body::DeleteGenerationModel(
@@ -947,6 +967,7 @@ async fn delete_generation_model(model_id: String) -> Result<bool, String> {
     Err("daemon returned no model deletion result".to_owned())
 }
 
+/// Unloads the resident generation model from memory while keeping the catalog selection.
 #[tauri::command]
 async fn unload_generation_model() -> Result<bool, String> {
     let responses = request(request_envelope::Body::UnloadGenerationModel(
@@ -1000,6 +1021,7 @@ fn map_generation_model(model: screensearch_ipc::v1::GenerationModel) -> Generat
     }
 }
 
+/// Runs a hybrid search, streaming the query plan, citations, and optional answer tokens over a channel.
 #[tauri::command]
 async fn search(
     query: String,

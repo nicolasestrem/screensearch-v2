@@ -1,7 +1,9 @@
 import {
   type FormEvent,
   type ReactNode,
+  type RefObject,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -143,6 +145,7 @@ export function App() {
           setModal(null);
           lastFocus.current?.focus();
         } else if (document.activeElement === searchInput.current) {
+          event.preventDefault();
           searchInput.current?.blur();
         }
         return;
@@ -449,6 +452,9 @@ function EvidenceDetail({
               else if (event.key === "End") next = tabOrder.length - 1;
               else return;
               event.preventDefault();
+              // Stop the global window keydown handler from also moving the timeline
+              // selection on Home/End while a detail tab is focused.
+              event.stopPropagation();
               onTabChange(tabOrder[next]);
               tabRefs.current[tabOrder[next]]?.focus();
             }}
@@ -520,7 +526,7 @@ function TimelineItem({ citation, selected, itemRef, onSelect }: { citation: Cit
       className={`timeline-item ${selected ? "selected" : ""}`}
       type="button"
       tabIndex={selected ? 0 : -1}
-      aria-current={selected || undefined}
+      aria-current={selected ? "true" : undefined}
       onClick={onSelect}
     >
       <CaptureImage citation={citation} />
@@ -534,7 +540,70 @@ function TimelineItem({ citation, selected, itemRef, onSelect }: { citation: Cit
   );
 }
 
+interface ContainedRect {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+// Compute where an `object-fit: contain` image actually renders inside its (possibly
+// differently shaped) box. OCR bounds are normalized to the full capture, so without this
+// the highlight boxes drift into the letterbox bands whenever the capture's aspect ratio
+// differs from the CSS box (ultrawide, portrait/rotated monitors, the max-height clamp).
+// Returns null until measured or for degenerate input (caller then renders no overlays).
+function useContainedRect(
+  ref: RefObject<HTMLElement | null>,
+  naturalWidth: number,
+  naturalHeight: number,
+): ContainedRect | null {
+  const [rect, setRect] = useState<ContainedRect | null>(null);
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (!element || naturalWidth <= 0 || naturalHeight <= 0) {
+      setRect(null);
+      return;
+    }
+    function measure(boxWidth: number, boxHeight: number) {
+      if (boxWidth <= 0 || boxHeight <= 0) return;
+      const scale = Math.min(boxWidth / naturalWidth, boxHeight / naturalHeight);
+      const width = naturalWidth * scale;
+      const height = naturalHeight * scale;
+      const next: ContainedRect = {
+        left: (boxWidth - width) / 2,
+        top: (boxHeight - height) / 2,
+        width,
+        height,
+      };
+      // Skip redundant renders during continuous resizes (sub-pixel deltas are noise).
+      setRect((current) => current
+        && Math.abs(current.left - next.left) < 0.5
+        && Math.abs(current.top - next.top) < 0.5
+        && Math.abs(current.width - next.width) < 0.5
+        && Math.abs(current.height - next.height) < 0.5
+        ? current
+        : next);
+    }
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      const size = entry.contentBoxSize?.[0];
+      if (size) measure(size.inlineSize, size.blockSize);
+      else measure(entry.contentRect.width, entry.contentRect.height);
+    });
+    observer.observe(element);
+    // Measure synchronously before paint so overlays are correct on the first frame.
+    // clientWidth/Height is the content box (excludes the 1px border, padding is 0).
+    measure(element.clientWidth, element.clientHeight);
+    return () => observer.disconnect();
+    // `ref` has a stable identity, so it never triggers a re-run on its own (it satisfies
+    // exhaustive-deps); the effect re-measures when the capture's natural dimensions change.
+  }, [ref, naturalWidth, naturalHeight]);
+  return rect;
+}
+
 function CaptureImage({ citation, large = false }: { citation: Citation; large?: boolean }) {
+  const containerRef = useRef<HTMLSpanElement>(null);
   const image = useQuery({
     queryKey: ["capture-image", citation.captureId],
     queryFn: async () => {
@@ -547,21 +616,25 @@ function CaptureImage({ citation, large = false }: { citation: Citation; large?:
     staleTime: Number.POSITIVE_INFINITY,
   });
   const imageUrl = image.data;
+  // Bounds are normalized to the capture's pixel rect (citation.width × citation.height);
+  // map them onto the actually-rendered image rectangle, not the letterboxed container.
+  const rect = useContainedRect(containerRef, citation.width, citation.height);
 
   return (
-    <span className={`capture-image ${large ? "large" : "thumbnail"}`}>
+    <span ref={containerRef} className={`capture-image ${large ? "large" : "thumbnail"}`}>
       {imageUrl
         ? <img src={imageUrl} alt={`Screen captured from ${citation.application}`} />
         : <span className="image-loading">{image.error ? "Preview unavailable" : "Loading evidence…"}</span>}
-      {imageUrl && citation.bounds.map((bounds, index) => (
+      {imageUrl && rect && citation.bounds.map((bounds, index) => (
         <i
           className="ocr-highlight"
+          aria-hidden="true"
           key={`${citation.chunkId}-${index}`}
           style={{
-            left: `${bounds.x * 100}%`,
-            top: `${bounds.y * 100}%`,
-            width: `${bounds.width * 100}%`,
-            height: `${bounds.height * 100}%`,
+            left: `${rect.left + bounds.x * rect.width}px`,
+            top: `${rect.top + bounds.y * rect.height}px`,
+            width: `${bounds.width * rect.width}px`,
+            height: `${bounds.height * rect.height}px`,
           }}
         />
       ))}
@@ -589,6 +662,44 @@ function SelectControl({ label, value, onChange, children }: { label: string; va
 
 function IconButton({ label, active = false, onClick, children }: { label: string; active?: boolean; onClick: () => void; children: ReactNode }) {
   return <button className={`icon-button ${active ? "active" : ""}`} type="button" aria-label={label} title={label} onClick={onClick}>{children}</button>;
+}
+
+// Focus the dialog's first control on open and trap Tab/Shift+Tab within it (the WAI-ARIA
+// dialog pattern). Focus restoration to the opener stays in App's openModal/closeModal.
+function useDialogFocusTrap(ref: RefObject<HTMLElement | null>) {
+  useEffect(() => {
+    const root = ref.current;
+    if (!root) return;
+    const selector = 'a[href], button, input, select, textarea, summary, [tabindex]';
+    // Keep only elements that can actually receive Tab focus: enabled, not tabindex="-1", not a
+    // hidden input, and currently rendered (display:none elements report no client rects).
+    const focusable = () => [...root.querySelectorAll<HTMLElement>(selector)].filter((element) =>
+      !element.hasAttribute("disabled")
+      && element.tabIndex !== -1
+      && (element as HTMLInputElement).type !== "hidden"
+      && element.getClientRects().length > 0);
+    focusable()[0]?.focus();
+    const trap = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      const items = focusable();
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (!root.contains(document.activeElement)) {
+        // Focus escaped the dialog; pull it back rather than letting Tab leave.
+        event.preventDefault();
+        first.focus();
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    root.addEventListener("keydown", trap);
+    return () => root.removeEventListener("keydown", trap);
+  }, [ref]);
 }
 
 function AutomationModal({ onClose }: { onClose: () => void }) {
@@ -636,9 +747,7 @@ function AutomationModal({ onClose }: { onClose: () => void }) {
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["automation-status"] }),
   });
 
-  useEffect(() => {
-    dialogRef.current?.querySelector<HTMLElement>("button, input, select, textarea")?.focus();
-  }, []);
+  useDialogFocusTrap(dialogRef);
 
   const plan = target ? { target, actions } : null;
   const planReady = Boolean(plan && actions.length > 0 && actions.length <= 10);
@@ -808,30 +917,7 @@ function SettingsModal({ name, paused, onClose, onCapture }: { name: Exclude<Mod
   const activeModel = models.data?.find((model) => model.active);
   const localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "Local time";
 
-  useEffect(() => {
-    const root = dialogRef.current;
-    if (!root) return;
-    const selector = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
-    const focusable = () => [...root.querySelectorAll<HTMLElement>(selector)]
-      .filter((element) => !element.hasAttribute("disabled"));
-    focusable()[0]?.focus();
-    function trap(event: KeyboardEvent) {
-      if (event.key !== "Tab") return;
-      const items = focusable();
-      if (!items.length) return;
-      const first = items[0];
-      const last = items[items.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    }
-    root.addEventListener("keydown", trap);
-    return () => root.removeEventListener("keydown", trap);
-  }, []);
+  useDialogFocusTrap(dialogRef);
 
   const save = useMutation({
     mutationFn: () => api.updateArchiveSettings({
